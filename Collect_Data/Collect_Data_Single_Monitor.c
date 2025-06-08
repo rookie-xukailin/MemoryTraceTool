@@ -9,7 +9,11 @@
 VOID *Collect_Data_Monitor(IN VOID *pArg)
 {
 
-    MEMORY_TRACE_ERROR("Yan jing yu da sb");
+    if (NULL == pArg)
+    {
+        MEMORY_TRACE_ERROR("pArg is NULL");
+        return NULL;
+    }
     
 
 

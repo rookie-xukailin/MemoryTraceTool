@@ -79,6 +79,14 @@ STATIC INT Collect_Data_Params_Opt_Validation(IN CONST INT argc, IN CONST CHAR *
     return MEM_TRACE_TOOL_SUCCESS;
 }
 
+/**
+ * @brief: Check whether the PID is valid
+ * @param[in]: IN CONST INT argc
+ * @param[in]: IN CONST CHAR **ppcArgv
+ * @param[out]: OUT INT *piPid
+ * @return: Error Code
+ * @note:
+ */
 STATIC INT Collect_Data_Check_Pid_Is_Valid(IN CONST CHAR *pcPid, OUT INT *piPid)
 {
     INT iTmpPid = -1;
@@ -167,6 +175,13 @@ STATIC INT Collect_Data_Params_Validation(IN CONST INT argc, IN CONST CHAR CONST
     return MEM_TRACE_TOOL_SUCCESS;
 }
 
+/**
+ * @brief: Collect_Data_Create_Task_Thread
+ * @param[in]: IN INT *piTargetPid
+ * @param[out]:OUT pthread_t *pulThreadId
+ * @return:
+ * @note:
+ */
 STATIC INT Collect_Data_Create_Task_Thread(IN INT *piTargetPid, OUT pthread_t *pulThreadId)
 {
     INT iRet = MEM_TRACE_TOOL_SUCCESS;
