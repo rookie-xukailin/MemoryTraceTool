@@ -13,11 +13,15 @@
 #include <pthread.h>
 
 /* IPC 协议常量 */
-#define MTT_SOCK_PATH      "/tmp/mttd.sock"  /* Unix Domain Socket 路径 */
-#define MTT_MAX_PROCS      64                 /* 守护进程最大监控进程数（嵌入式可降至 16） */
-#define MTT_MAX_LEAKS      128                /* 每个进程最大泄漏记录数（嵌入式可降至 32） */
-#define MTT_SYMBOL_MAX     256                /* 单帧符号字符串最大长度 */
-#define MTT_MAX_STACK      8                  /* 每个泄漏记录保留的栈帧数 */
+#define MTT_SOCK_PATH        "/tmp/mttd.sock"  /* Unix Domain Socket 路径 */
+#define MTT_MAX_PROCS        128               /* 守护进程最大监控进程数（高负载场景上调） */
+#define MTT_MAX_LEAKS        256               /* 每个进程最大泄漏记录数 */
+#define MTT_SYMBOL_MAX       256               /* 单帧符号字符串最大长度 */
+#define MTT_MAX_STACK        8                 /* 每个泄漏记录保留的栈帧数 */
+
+/* 连接管理常量 */
+#define MTT_CLIENT_TIMEOUT_S 30                /* 客户端空闲超时（秒） */
+#define MTT_UNIX_BUF_SZ      16384             /* Unix socket 缓冲区大小 */
 
 /* ---- 守护进程端泄漏记录 ---- */
 
@@ -39,7 +43,7 @@ typedef struct {
     int     active;                          /* 是否仍在运行（BYE 消息后设为 0） */
     size_t  total_leaked;                    /* 该进程总计泄漏字节数 */
     int     leak_count;                      /* 当前泄漏条数 */
-    int     leak_cap;                        /* leaks 数组容量（= MTT_MAX_LEAKS） */
+    int     leak_cap;                        /* leaks 数组容量 */
     time_t  last_seen;                       /* 最后一次收到报告的时间戳 */
 
     mttd_leak_t* leaks;                      /* 动态分配的泄漏记录数组 */

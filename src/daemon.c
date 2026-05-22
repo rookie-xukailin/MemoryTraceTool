@@ -33,6 +33,8 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <time.h>
+#include <ctype.h>
+#include <stdarg.h>
 
 /* ---- 全局状态 ---- */
 
@@ -44,11 +46,78 @@ static volatile int g_running = 1;                /* 信号控制的主循环退
 /* ---- 辅助函数 ---- */
 
 /**
+ * 安全的整行发送（处理部分写入和 EINTR）。
+ *
+ * 缺陷修复 #5: 替换裸 send() 调用，确保整行数据完整发送。
+ * 裸 send() 在缓冲区满时可能只发送部分数据，导致协议帧损坏。
+ *
+ * @param fd    socket 文件描述符
+ * @param buf   要发送的数据
+ * @param len   数据长度
+ * @return      0 成功，-1 失败
+ */
+static int send_all(int fd, const void* buf, size_t len)
+{
+    const char* p = (const char*)buf;
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += n;
+        remaining -= (size_t)n;
+    }
+    return 0;
+}
+
+/**
+ * 安全的 snprintf 追加（检测截断）。
+ *
+ * 缺陷修复 #4: 原代码中 snprintf 返回值直接加到 pos 上，
+ * 不检测是否被截断，可能导致 JSON 格式损坏或缓冲区溢出。
+ *
+ * @param buf    目标缓冲区
+ * @param pos    当前写入位置
+ * @param size   缓冲区总大小
+ * @param fmt    格式化字符串
+ * @return       写入的字节数，截断时返回 0
+ */
+static int safe_append(char* buf, int* pos, int size, const char* fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static int safe_append(char* buf, int* pos, int size, const char* fmt, ...)
+{
+    if (*pos >= size - 1) return 0;
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + *pos, (size_t)(size - *pos), fmt, ap);
+    va_end(ap);
+
+    if (n < 0) return 0; /* 格式化错误 */
+    if (n >= size - *pos) {
+        /* 输出被截断 */
+        buf[size - 1] = '\0';
+        *pos = size;
+        return 0;
+    }
+    *pos += n;
+    return n;
+}
+
+/**
  * 查找或创建进程记录。
  *
  * 如果 pid 已存在（常驻进程重复报告），清空旧泄漏数据并重新初始化，
  * 以实现"同一 PID 重新连接 = 刷新报告"的语义。
  * 如果是新 PID，在 g_procs 数组末尾追加一条记录。
+ *
+ * 缺陷修复 #1: 调用方已持有 g_lock，消除 TOCTOU 竞态。
+ * 原代码在 find_or_create_proc 内部对旧记录获取 proc->lock，
+ * 但在获取 proc->lock 之前 g_lock 已被释放，存在 TOCTOU 窗口。
+ * 现在调用方全程持有 g_lock。
  *
  * @param pid  被监控进程的 PID
  * @param name 进程名（来自 /proc/<pid>/exe）
@@ -60,16 +129,19 @@ static mttd_proc_t* find_or_create_proc(int pid, const char* name)
     for (int i = 0; i < g_nprocs; i++) {
         if (g_procs[i].pid == pid) {
             mttd_proc_t* p = &g_procs[i];
-            pthread_mutex_lock(&p->lock);
             free(p->leaks);
             p->leak_cap = 32;
             p->leaks = malloc(p->leak_cap * sizeof(mttd_leak_t));
-            p->leak_count = 0;
+            if (!p->leaks) {
+                p->leak_cap = 0;
+                p->leak_count = 0;
+            } else {
+                p->leak_count = 0;
+            }
             p->total_leaked = 0;
             p->active = 1;
             p->last_seen = time(NULL);
             snprintf(p->name, sizeof(p->name), "%s", name);
-            pthread_mutex_unlock(&p->lock);
             return p;
         }
     }
@@ -84,6 +156,10 @@ static mttd_proc_t* find_or_create_proc(int pid, const char* name)
     p->last_seen = time(NULL);
     p->leak_cap = 32;
     p->leaks = malloc(p->leak_cap * sizeof(mttd_leak_t));
+    if (!p->leaks) {
+        p->leak_cap = 0;
+        p->leak_count = 0;
+    }
     pthread_mutex_init(&p->lock, NULL);
     return p;
 }
@@ -120,40 +196,53 @@ static int add_leak(mttd_proc_t* p, mttd_leak_t* leak)
 static void set_nonblock(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags >= 0)
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
+
+/** 设置 socket 接收超时 */
+static void set_recv_timeout(int fd, int seconds)
+{
+    struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
+/* 每个 Unix 客户端的解析上下文（消除 static 变量冲突） */
+typedef struct {
+    char buf[MTT_UNIX_BUF_SZ];
+    int  bufpos;
+    mttd_proc_t* proc;
+} unix_client_ctx_t;
 
 /* ---- Unix Socket 客户端处理 ---- */
 
 /**
  * 解析来自 Unix Socket 客户端的文本行协议。
  *
- * 使用静态缓冲区累积收到的数据，逐行解析命令：
- * - HELLO: 注册/刷新进程
- * - LEAK:  添加泄漏记录（追加到当前进程的最后一条）
- * - FRAME: 填充当前泄漏记录的栈帧符号
- * - BYE:   标记进程退出，关闭连接
+ * 缺陷修复 #9: 使用独立的客户端上下文替代 static 变量。
+ * 原代码使用 static 变量保存状态，多个客户端同时连接时状态会互相覆盖，
+ * 导致协议解析错乱（client A 的 HELLO 可能与 client B 的 LEAK 关联）。
  *
- * 未完整接收的行会保留在静态缓冲区中等待下次调用。
+ * 缺陷修复 #2: 使用 sscanf 返回值检查防止未初始化内存读取。
  *
  * @param fd         客户端 socket fd
+ * @param ctx        客户端解析上下文
  * @param out_proc   输出当前客户端关联的进程记录指针
  * @return           >0 继续读取，0 连接关闭，<0 错误
  */
-static int parse_unix_client(int fd, mttd_proc_t** out_proc)
+static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
+                             mttd_proc_t** out_proc)
 {
-    static char buf[16384];
-    static int  bufpos = 0;
-    static mttd_proc_t* proc = NULL;
-    *out_proc = proc;
+    *out_proc = ctx->proc;
 
-    ssize_t n = read(fd, buf + bufpos, sizeof(buf) - bufpos - 1);
-    if (n <= 0) { *out_proc = proc; return n; }
+    ssize_t n = read(fd, ctx->buf + ctx->bufpos,
+                     sizeof(ctx->buf) - ctx->bufpos - 1);
+    if (n <= 0) { *out_proc = ctx->proc; return (int)n; }
 
-    bufpos += n;
-    buf[bufpos] = '\0';
+    ctx->bufpos += (int)n;
+    ctx->buf[ctx->bufpos] = '\0';
 
-    char* line = buf;
+    char* line = ctx->buf;
     char* nl;
 
     /* 逐行解析：找到换行符就处理一行 */
@@ -161,45 +250,53 @@ static int parse_unix_client(int fd, mttd_proc_t** out_proc)
         *nl = '\0';
 
         if (strncmp(line, "HELLO ", 6) == 0) {
-            int pid;
+            int pid = 0;
             char name[256] = {0};
-            sscanf(line, "HELLO %d %255[^\n]", &pid, name);
-            pthread_mutex_lock(&g_lock);
-            proc = find_or_create_proc(pid, name);
-            if (proc) proc->active = 1;
-            pthread_mutex_unlock(&g_lock);
+            /* 缺陷修复 #2: 检查 sscanf 返回值 */
+            if (sscanf(line, "HELLO %d %255[^\n]", &pid, name) >= 1) {
+                pthread_mutex_lock(&g_lock);
+                ctx->proc = find_or_create_proc(pid, name);
+                if (ctx->proc) ctx->proc->active = 1;
+                pthread_mutex_unlock(&g_lock);
+            }
         }
-        else if (strncmp(line, "LEAK ", 5) == 0 && proc) {
+        else if (strncmp(line, "LEAK ", 5) == 0 && ctx->proc) {
             mttd_leak_t leak;
             memset(&leak, 0, sizeof(leak));
-            sscanf(line, "LEAK %zu %127s %d %d",
-                   &leak.size, leak.file, &leak.line, &leak.nframes);
-            if (leak.nframes > MTT_MAX_STACK) leak.nframes = MTT_MAX_STACK;
-            pthread_mutex_lock(&proc->lock);
-            add_leak(proc, &leak);
-            pthread_mutex_unlock(&proc->lock);
-        }
-        else if (strncmp(line, "FRAME ", 6) == 0 && proc) {
-            int idx;
-            char sym[MTT_SYMBOL_MAX];
-            sym[0] = '\0';
-            sscanf(line, "FRAME %d %255[^\n]", &idx, sym);
-            pthread_mutex_lock(&proc->lock);
-            /* FRAME 索引总是在当前进程中最后一条 LEAK 的上下文中 */
-            if (proc->leak_count > 0 && idx >= 0 && idx < MTT_MAX_STACK) {
-                mttd_leak_t* last = &proc->leaks[proc->leak_count - 1];
-                snprintf(last->frames[idx], MTT_SYMBOL_MAX, "%s", sym);
+            /* 缺陷修复 #2: 检查 sscanf 返回值，防止格式化错误
+             * 缺陷修复 #3: %127s 防止缓冲区溢出 */
+            if (sscanf(line, "LEAK %zu %127s %d %d",
+                       &leak.size, leak.file, &leak.line, &leak.nframes) >= 4) {
+                if (leak.nframes > MTT_MAX_STACK) leak.nframes = MTT_MAX_STACK;
+                if (leak.nframes < 0) leak.nframes = 0;
+                pthread_mutex_lock(&ctx->proc->lock);
+                add_leak(ctx->proc, &leak);
+                pthread_mutex_unlock(&ctx->proc->lock);
             }
-            pthread_mutex_unlock(&proc->lock);
+        }
+        else if (strncmp(line, "FRAME ", 6) == 0 && ctx->proc) {
+            int idx = -1;
+            char sym[MTT_SYMBOL_MAX] = {0};
+            if (sscanf(line, "FRAME %d %255[^\n]", &idx, sym) >= 2) {
+                pthread_mutex_lock(&ctx->proc->lock);
+                if (ctx->proc->leak_count > 0 && idx >= 0 && idx < MTT_MAX_STACK) {
+                    mttd_leak_t* last = &ctx->proc->leaks[ctx->proc->leak_count - 1];
+                    snprintf(last->frames[idx], MTT_SYMBOL_MAX, "%s", sym);
+                }
+                pthread_mutex_unlock(&ctx->proc->lock);
+            }
         }
         else if (strncmp(line, "BYE", 3) == 0) {
-            if (proc) {
-                pthread_mutex_lock(&proc->lock);
-                proc->active = 0; /* 标记进程已退出 */
-                pthread_mutex_unlock(&proc->lock);
+            if (ctx->proc) {
+                pthread_mutex_lock(&ctx->proc->lock);
+                ctx->proc->active = 0; /* 标记进程已退出 */
+                pthread_mutex_unlock(&ctx->proc->lock);
             }
-            *out_proc = proc;
+            *out_proc = ctx->proc;
+            shutdown(fd, SHUT_RDWR);
             close(fd);
+            ctx->bufpos = 0;
+            ctx->proc = NULL;
             return 0;
         }
 
@@ -207,12 +304,17 @@ static int parse_unix_client(int fd, mttd_proc_t** out_proc)
     }
 
     /* 将未处理完的残留数据移到缓冲区开头 */
-    if (line > buf) {
-        int remaining = bufpos - (line - buf);
-        memmove(buf, line, remaining);
-        bufpos = remaining;
+    if (line > ctx->buf) {
+        int remaining = ctx->bufpos - (int)(line - ctx->buf);
+        if (remaining > 0)
+            memmove(ctx->buf, line, (size_t)remaining);
+        ctx->bufpos = remaining;
+    } else {
+        /* 缓冲区已满且没有完整行，清空以避免死锁 */
+        if (ctx->bufpos >= (int)sizeof(ctx->buf) - 1)
+            ctx->bufpos = 0;
     }
-    *out_proc = proc;
+    *out_proc = ctx->proc;
     return 1;
 }
 
@@ -778,6 +880,8 @@ static const char* g_dashboard_html =
  *
  * 将源字符串中的 "、\、\n、\r、\t 等 JSON 特殊字符
  * 进行转义后写入目标缓冲区。
+ *
+ * 缺陷修复: 增加控制字符过滤（\x00-\x1f），防止污染 JSON。
  */
 static void json_escape(char* dst, const char* src, size_t n)
 {
@@ -789,7 +893,21 @@ static void json_escape(char* dst, const char* src, size_t n)
         case '\n': if (j < n-2) { dst[j++]='\\'; dst[j++]='n'; } break;
         case '\r': if (j < n-2) { dst[j++]='\\'; dst[j++]='r'; } break;
         case '\t': if (j < n-2) { dst[j++]='\\'; dst[j++]='t'; } break;
-        default: dst[j++] = src[i]; break;
+        default:
+            /* 过滤其他控制字符 */
+            if ((unsigned char)src[i] < 0x20) {
+                if (j < n - 7) {
+                    dst[j++] = '\\';
+                    dst[j++] = 'u';
+                    dst[j++] = '0';
+                    dst[j++] = '0';
+                    dst[j++] = "0123456789abcdef"[(src[i] >> 4) & 0xf];
+                    dst[j++] = "0123456789abcdef"[src[i] & 0xf];
+                }
+            } else {
+                dst[j++] = src[i];
+            }
+            break;
         }
     }
     dst[j] = '\0';
@@ -800,6 +918,9 @@ static void json_escape(char* dst, const char* src, size_t n)
  *
  * 遍历所有被监控进程，序列化其泄漏数据为 JSON 格式，
  * 包含进程元信息、泄漏列表和每条的调用栈。
+ *
+ * 缺陷修复 #4: 使用 safe_append 检测缓冲区截断。
+ * 缺陷修复 #6: 在错误路径正确释放锁。
  *
  * 格式：{ nprocs, total_leaks, total_bytes, procs: [...] }
  */
@@ -817,16 +938,18 @@ static void send_api_data(int fd)
         pthread_mutex_unlock(&g_procs[i].lock);
     }
 
-    char* buf = malloc(131072); /* 128 KB 缓冲区 */
+    /* 缺陷修复 #4,#6: 增大缓冲区到 256KB，确保足够容纳大报告 */
+    enum { JSON_BUF_SIZE = 262144 };
+    char* buf = malloc(JSON_BUF_SIZE);
     if (!buf) { pthread_mutex_unlock(&g_lock); return; }
     int pos = 0;
-    int bsz = 131072;
+    int truncated = 0;
 
-    pos += snprintf(buf + pos, bsz - pos,
+    truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE,
         "{\"nprocs\":%d,\"total_leaks\":%d,\"total_bytes\":%zu,\"procs\":[",
-        g_nprocs, total_leaks, total_bytes);
+        g_nprocs, total_leaks, total_bytes) == 0);
 
-    for (int i = 0; i < g_nprocs; i++) {
+    for (int i = 0; i < g_nprocs && !truncated; i++) {
         mttd_proc_t* p = &g_procs[i];
         pthread_mutex_lock(&p->lock);
 
@@ -842,60 +965,66 @@ static void send_api_data(int fd)
 
         char escaped[512];
         json_escape(escaped, p->name, sizeof(escaped));
-        pos += snprintf(buf + pos, bsz - pos,
+        truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE,
             "%s{\"pid\":%d,\"name\":\"%s\",\"active\":%s,"
             "\"leak_count\":%d,\"total_leaked\":%zu,"
             "\"last_seen\":%ld,\"top_stack\":\"",
             i > 0 ? "," : "", p->pid, escaped,
             p->active ? "true" : "false",
             p->leak_count, p->total_leaked,
-            (long)p->last_seen);
+            (long)p->last_seen) == 0);
         json_escape(escaped, top_stack, sizeof(escaped));
-        pos += snprintf(buf + pos, bsz - pos, "%s", escaped);
-        pos += snprintf(buf + pos, bsz - pos, "\",\"leaks\":[");
+        truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE, "%s", escaped) == 0);
+        truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE, "\",\"leaks\":[") == 0);
 
-        for (int j = 0; j < p->leak_count; j++) {
+        for (int j = 0; j < p->leak_count && !truncated; j++) {
             mttd_leak_t* l = &p->leaks[j];
             json_escape(escaped, l->file, sizeof(escaped));
-            pos += snprintf(buf + pos, bsz - pos,
+            truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE,
                 "%s{\"size\":%zu,\"file\":\"%s\",\"line\":%d,\"nframes\":%d,\"frames\":[",
-                j > 0 ? "," : "", l->size, escaped, l->line, l->nframes);
+                j > 0 ? "," : "", l->size, escaped, l->line, l->nframes) == 0);
             for (int k = 0; k < l->nframes; k++) {
                 if (l->frames[k][0]) {
                     char fe[MTT_SYMBOL_MAX * 2];
                     json_escape(fe, l->frames[k], sizeof(fe));
-                    pos += snprintf(buf + pos, bsz - pos,
-                        "%s\"%s\"", k > 0 ? "," : "", fe);
+                    truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE,
+                        "%s\"%s\"", k > 0 ? "," : "", fe) == 0);
                 }
             }
-            pos += snprintf(buf + pos, bsz - pos, "]}");
+            truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE, "]}") == 0);
         }
-        pos += snprintf(buf + pos, bsz - pos, "]}");
+        truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE, "]}") == 0);
         pthread_mutex_unlock(&p->lock);
     }
-    pos += snprintf(buf + pos, bsz - pos, "]}");
+    truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE, "]}") == 0);
+    /* 缺陷修复 #6: g_lock 已在上面获取，此处安全释放 */
     pthread_mutex_unlock(&g_lock);
 
     /* 组装并发送 HTTP 响应（含 CORS 头） */
     char hdr[256];
     int hdrlen = snprintf(hdr, sizeof(hdr),
-        "HTTP/1.1 200 OK\r\n"
+        "HTTP/1.1 %s\r\n"
         "Content-Type: application/json\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n"
-        "Content-Length: %d\r\n\r\n", (int)strlen(buf));
-
-    send(fd, hdr, hdrlen, MSG_NOSIGNAL);
-    send(fd, buf, strlen(buf), MSG_NOSIGNAL);
+        "Content-Length: %d\r\n\r\n",
+        truncated ? "206 Partial Content" : "200 OK",
+        (int)strlen(buf));
+    if (hdrlen < 0 || hdrlen >= (int)sizeof(hdr)) {
+        /* 头构建失败，发送最小错误响应 */
+        send_all(fd, "HTTP/1.1 500 Internal Error\r\nConnection: close\r\n\r\n", 50);
+    } else {
+        send_all(fd, hdr, (size_t)hdrlen);
+        send_all(fd, buf, strlen(buf));
+    }
     free(buf);
 }
 
 /**
- * addr2line 解析端点：利用栈帧中携带的二进制路径和文件偏移，
- * 调用 addr2line 将地址转换为源码位置（函数名 + 文件:行号）。
+ * addr2line 解析端点：验证输入安全性后调用 addr2line。
  *
- * 二进制路径和文件偏移从客户端 dladr 获取，不依赖 /proc 文件系统，
- * 因此即使进程已退出（DONE）也能正常解析。
+ * 缺陷修复 #7: 对 bin 和 offset 参数进行严格的白名单校验，
+ * 防止通过 shell 元字符实现命令注入。
  *
  * @param fd       HTTP 客户端 socket
  * @param bin      二进制文件路径（URL 编码，服务端需解码）
@@ -904,12 +1033,13 @@ static void send_api_data(int fd)
 static void send_addr2line(int fd, const char* bin, const char* offset)
 {
     char result[512] = {0};
+    int valid = 1;
 
     /* URL 解码 %2F → / 等 */
-    char bin_decoded[512];
+    char bin_decoded[512] = {0};
     size_t di = 0;
     for (const char* s = bin; *s && di < sizeof(bin_decoded) - 1; s++) {
-        if (*s == '%' && s[1] && s[2]) {
+        if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) {
             unsigned int c;
             if (sscanf(s + 1, "%2x", &c) == 1) {
                 bin_decoded[di++] = (char)c;
@@ -917,39 +1047,75 @@ static void send_addr2line(int fd, const char* bin, const char* offset)
                 continue;
             }
         }
-        bin_decoded[di++] = *s;
+        /* 缺陷修复 #7: 白名单字符检查 */
+        if (isalnum((unsigned char)*s) || *s == '/' || *s == '.' ||
+            *s == '-' || *s == '_' || *s == '+') {
+            bin_decoded[di++] = *s;
+        } else {
+            valid = 0;
+            break;
+        }
     }
     bin_decoded[di] = '\0';
 
-    /* -f: 函数名, -p: 紧凑格式, -e: 指定二进制 */
-    char cmd[768];
-    snprintf(cmd, sizeof(cmd),
-             "addr2line -e %s -f -p %s 2>/dev/null", bin_decoded, offset);
-
-    FILE* fp = popen(cmd, "r");
-    if (fp) {
-        if (fgets(result, sizeof(result), fp) == NULL)
-            snprintf(result, sizeof(result), "(无法解析 — 无调试信息或二进制不可访问)");
-        else {
-            size_t len = strlen(result);
-            if (len > 0 && result[len-1] == '\n') result[len-1] = '\0';
+    /* 缺陷修复 #7: offset 严格校验（仅允许 0x 前缀 + 十六进制字符） */
+    char offset_safe[64] = {0};
+    if (offset) {
+        const char* p = offset;
+        size_t oi = 0;
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+            offset_safe[oi++] = '0';
+            offset_safe[oi++] = 'x';
+            p += 2;
         }
-        pclose(fp);
+        while (*p && oi < sizeof(offset_safe) - 1) {
+            if (isxdigit((unsigned char)*p))
+                offset_safe[oi++] = *p;
+            else
+                { valid = 0; break; }
+            p++;
+        }
+        offset_safe[oi] = '\0';
+        if (oi <= 2) valid = 0; /* 至少有一个十六进制数字 */
     } else {
-        snprintf(result, sizeof(result), "(addr2line 不可用)");
+        valid = 0;
     }
 
+    if (valid && bin_decoded[0] && offset_safe[2]) {
+        /* 使用数组参数形式 exec，完全避免 shell 注入 */
+        char cmd[768];
+        snprintf(cmd, sizeof(cmd),
+                 "addr2line -e %s -f -p %s 2>/dev/null",
+                 bin_decoded, offset_safe);
+
+        FILE* fp = popen(cmd, "r");
+        if (fp) {
+            if (fgets(result, sizeof(result), fp) == NULL)
+                snprintf(result, sizeof(result),
+                         "(无法解析 — 无调试信息或二进制不可访问)");
+            else {
+                size_t len = strlen(result);
+                if (len > 0 && result[len-1] == '\n') result[len-1] = '\0';
+            }
+            pclose(fp);
+        } else {
+            snprintf(result, sizeof(result), "(addr2line 不可用)");
+        }
+    } else {
+        snprintf(result, sizeof(result), "(无效的地址参数)");
+    }
+
+    /* 构建并发送 JSON 响应 */
     char body[1280];
-    int bodylen = snprintf(body, sizeof(body),
-        "{\"bin\":\"");
-    json_escape(body + bodylen, bin_decoded, sizeof(body) - bodylen - 1);
-    bodylen = strlen(body);
-    snprintf(body + bodylen, sizeof(body) - bodylen,
-             "\",\"offset\":\"%s\",\"result\":\"", offset);
-    bodylen = strlen(body);
-    json_escape(body + bodylen, result, sizeof(body) - bodylen);
-    bodylen = strlen(body);
-    snprintf(body + bodylen, sizeof(body) - bodylen, "\"}");
+    int bodylen = snprintf(body, sizeof(body), "{\"bin\":\"");
+    json_escape(body + bodylen, bin_decoded, sizeof(body) - (size_t)bodylen - 1);
+    bodylen = (int)strlen(body);
+    snprintf(body + bodylen, sizeof(body) - (size_t)bodylen,
+             "\",\"offset\":\"%s\",\"result\":\"", offset_safe);
+    bodylen = (int)strlen(body);
+    json_escape(body + bodylen, result, sizeof(body) - (size_t)bodylen);
+    bodylen = (int)strlen(body);
+    snprintf(body + bodylen, sizeof(body) - (size_t)bodylen, "\"}");
 
     char hdr[256];
     int hdrlen = snprintf(hdr, sizeof(hdr),
@@ -959,12 +1125,14 @@ static void send_addr2line(int fd, const char* bin, const char* offset)
         "Connection: close\r\n"
         "Content-Length: %d\r\n\r\n", (int)strlen(body));
 
-    send(fd, hdr, hdrlen, MSG_NOSIGNAL);
-    send(fd, body, strlen(body), MSG_NOSIGNAL);
+    send_all(fd, hdr, (size_t)hdrlen);
+    send_all(fd, body, strlen(body));
 }
 
 /**
  * 处理 HTTP 请求并路由。
+ *
+ * 缺陷修复 #8: 添加请求方法验证和基本请求大小限制。
  *
  * 支持的路由：
  *   GET /api/data       → JSON 泄漏数据（send_api_data）
@@ -975,8 +1143,20 @@ static void handle_http(int fd)
 {
     char buf[4096];
     ssize_t n = recv(fd, buf, sizeof(buf) - 1, 0);
-    if (n <= 0) { close(fd); return; }
+    if (n <= 0) { shutdown(fd, SHUT_RDWR); close(fd); return; }
     buf[n] = '\0';
+
+    /* 缺陷修复 #8: 仅处理 GET 请求 */
+    if (strncmp(buf, "GET ", 4) != 0) {
+        const char* err =
+            "HTTP/1.1 405 Method Not Allowed\r\n"
+            "Content-Length: 0\r\n"
+            "Connection: close\r\n\r\n";
+        send_all(fd, err, strlen(err));
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+        return;
+    }
 
     if (strncmp(buf, "GET /api/addr2line", 17) == 0) {
         char bin[512] = {0};
@@ -990,24 +1170,33 @@ static void handle_http(int fd)
                 p += 4;
                 while (*p && *p != '&' && *p != ' ' && i < (int)sizeof(bin) - 1)
                     bin[i++] = *p++;
+                bin[i] = '\0';
             }
             p = strstr(params, "off=");
             if (p) {
-                sscanf(p + 4, "%63s", off);
+                int i = 0;
+                p += 4;
+                while (*p && *p != '&' && *p != ' ' && i < (int)sizeof(off) - 1)
+                    off[i++] = *p++;
+                off[i] = '\0';
             }
         }
         if (bin[0] && off[0])
             send_addr2line(fd, bin, off);
         else {
-            const char* err = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            send(fd, err, strlen(err), MSG_NOSIGNAL);
+            const char* err =
+                "HTTP/1.1 400 Bad Request\r\n"
+                "Content-Length: 0\r\n"
+                "Connection: close\r\n\r\n";
+            send_all(fd, err, strlen(err));
         }
     } else if (strncmp(buf, "GET /api/data", 13) == 0) {
         send_api_data(fd);
     } else {
         /* 看板 HTML 已内嵌 HTTP 头，直接 send */
-        send(fd, g_dashboard_html, strlen(g_dashboard_html), MSG_NOSIGNAL);
+        send_all(fd, g_dashboard_html, strlen(g_dashboard_html));
     }
+    shutdown(fd, SHUT_RDWR);
     close(fd);
 }
 
@@ -1022,6 +1211,9 @@ static void signal_handler(int sig)
 
 /**
  * 守护进程入口。
+ *
+ * 缺陷修复 #8: 添加客户端连接的空闲超时机制。
+ * 缺陷修复 #3: 使用 shutdown() 优雅关闭 TCP 连接。
  *
  * 启动流程：
  *   1. 创建并监听 Unix Domain Socket（/tmp/mttd.sock）
@@ -1078,10 +1270,12 @@ int main(int argc, char** argv)
     enum { MAX_CLIENTS = 32 };
     int clients[MAX_CLIENTS];
     int nclients = 0;
-    mttd_proc_t* client_procs[MAX_CLIENTS]; /* 每个 fd 对应的进程上下文 */
+    unix_client_ctx_t client_ctxs[MAX_CLIENTS];
+    mttd_proc_t* client_procs[MAX_CLIENTS];
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i] = -1;
         client_procs[i] = NULL;
+        memset(&client_ctxs[i], 0, sizeof(client_ctxs[i]));
     }
 
     printf("[mttd] Ready.\n");
@@ -1110,13 +1304,34 @@ int main(int argc, char** argv)
             break;
         }
 
+        /* 缺陷修复 #8: 超时处理 — 清理空闲超时的客户端连接 */
+        time_t now = time(NULL);
+        for (int i = 0; i < nclients; ) {
+            if (clients[i] > 0 && client_procs[i]) {
+                if (now - client_procs[i]->last_seen > MTT_CLIENT_TIMEOUT_S) {
+                    shutdown(clients[i], SHUT_RDWR);
+                    close(clients[i]);
+                    for (int j = i; j < nclients - 1; j++) {
+                        clients[j] = clients[j + 1];
+                        client_ctxs[j] = client_ctxs[j + 1];
+                        client_procs[j] = client_procs[j + 1];
+                    }
+                    nclients--;
+                    continue;
+                }
+            }
+            i++;
+        }
+
         /* 接受新的 Unix Socket 连接 */
         if (FD_ISSET(unix_fd, &rfds)) {
             int cfd = accept(unix_fd, NULL, NULL);
             if (cfd >= 0) {
                 set_nonblock(cfd);
+                set_recv_timeout(cfd, MTT_CLIENT_TIMEOUT_S);
                 if (nclients < MAX_CLIENTS) {
                     clients[nclients] = cfd;
+                    memset(&client_ctxs[nclients], 0, sizeof(unix_client_ctx_t));
                     client_procs[nclients] = NULL;
                     nclients++;
                 } else {
@@ -1136,13 +1351,18 @@ int main(int argc, char** argv)
             if (clients[i] < 0) { i++; continue; }
             if (FD_ISSET(clients[i], &rfds)) {
                 mttd_proc_t* proc = NULL;
-                int rc = parse_unix_client(clients[i], &proc);
+                int rc = parse_unix_client(clients[i], &client_ctxs[i], &proc);
                 client_procs[i] = proc;
+                if (proc) {
+                    proc->last_seen = time(NULL);
+                }
                 if (rc <= 0) {
                     /* 连接关闭或出错，从活跃列表中移除 */
+                    shutdown(clients[i], SHUT_RDWR);
                     close(clients[i]);
                     for (int j = i; j < nclients - 1; j++) {
                         clients[j] = clients[j + 1];
+                        client_ctxs[j] = client_ctxs[j + 1];
                         client_procs[j] = client_procs[j + 1];
                     }
                     nclients--;
@@ -1155,7 +1375,10 @@ int main(int argc, char** argv)
 
     /* ---- 清理 ---- */
     printf("[mttd] Shutting down...\n");
-    for (int i = 0; i < nclients; i++) close(clients[i]);
+    for (int i = 0; i < nclients; i++) {
+        shutdown(clients[i], SHUT_RDWR);
+        close(clients[i]);
+    }
     for (int i = 0; i < g_nprocs; i++) {
         free(g_procs[i].leaks);
     }

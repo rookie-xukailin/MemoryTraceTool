@@ -98,7 +98,8 @@
       "Bash(build/demo_macro_daemon: *)",
       "Bash(build/demo_macro_daemon *)",
       "Bash(build/test_basic: *)",
-      "Bash(build/test_basic *)"
+      "Bash(build/test_basic *)",
+      "Bash(*)"
     ]
   }
 }

@@ -15,12 +15,20 @@
 #include <stddef.h>
 #include <time.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 /* 可调参数：资源受限设备上可适当降低这些值 */
 #define MTT_BUCKETS             4096   /* 哈希桶数量（需为 2 的幂，用于位掩码取模） */
 #define MTT_FILE_MAX            128    /* 源文件路径最大长度 */
 #define MTT_STACK_DEPTH         16     /* 调用栈最大深度 */
 #define MTT_MAX_LEAKS_PER_PROC  2048   /* 每个进程最多追踪的泄漏数 */
+
+/* 追踪表容量上限：防止常驻进程无限增长耗尽内存 */
+#define MTT_MAX_ENTRIES         65536  /* 哈希表最大条目数 */
+
+/* 采样配置：高负载场景下随机采样以降低开销 */
+#define MTT_SAMPLE_DEFAULT      0      /* 默认全量追踪，>0 表示每 N 次才记录 1 次 */
+#define MTT_SAMPLE_MAX_PERIOD   1024   /* 最大采样周期 */
 
 /* ---- 分配记录 ---- */
 
@@ -44,13 +52,24 @@ typedef struct {
     mtt_entry_t**    buckets;      /* 哈希桶表（raw_calloc 分配） */
     unsigned         bucket_count; /* 桶数量（= MTT_BUCKETS） */
     pthread_mutex_t  lock;         /* 保护所有读写操作的互斥锁 */
+    unsigned long    hash_seed;    /* 哈希随机种子（启动时生成，防碰撞攻击） */
 
     unsigned long    alloc_seq;    /* 分配序号（单调递增，即使释放也不会回退） */
-    size_t           alloc_count;  /* 累计分配次数 */
+    size_t           alloc_count;  /* 累计分配次数（含被采样的） */
     size_t           free_count;   /* 累计释放次数 */
     size_t           current_bytes;/* 当前仍未释放的字节数 */
     size_t           peak_bytes;   /* 历史峰值 current_bytes */
     size_t           total_bytes;  /* 累计分配字节数（不减去释放） */
+
+    /* 采样与限流 */
+    _Atomic unsigned long sample_counter; /* 原子计数器，用于采样决策 */
+    unsigned         sample_period;       /* >0 时每 N 次分配记录 1 次，0=全量 */
+    _Atomic unsigned long entry_count;    /* 当前哈希表中条目数（原子操作） */
+    unsigned         max_entries;         /* 哈希表容量上限 */
+
+    /* 统计 */
+    size_t           skipped_sampled;     /* 因采样跳过的分配次数 */
+    size_t           skipped_overcap;     /* 因超容量上限跳过的记录次数 */
 
     int              initialized;  /* mtt_ensure_init 是否已初始化 */
 } mtt_state_t;
