@@ -1,0 +1,8 @@
+build/
+lib/
+*.o
+*.so
+*.a
+demo
+demo_preload
+test_basic

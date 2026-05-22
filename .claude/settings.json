@@ -1,0 +1,53 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make clean *)",
+      "Bash(make)",
+      "Bash(make test *)",
+      "Bash(git commit -m ' *)"
+    ],
+    "Bash": {
+      "allow": true
+    },
+    "Edit": {
+      "allow": true
+    },
+    "Write": {
+      "allow": true
+    },
+    "Read": {
+      "allow": true
+    },
+    "WebFetch": {
+      "allow": true
+    },
+    "WebSearch": {
+      "allow": true
+    },
+    "Agent": {
+      "allow": true
+    }
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "make -C /home/rookie/memguard"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "make -C /home/rookie/memguard"
+          }
+        ]
+      }
+    ]
+  }
+}
