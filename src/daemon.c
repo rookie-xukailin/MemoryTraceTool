@@ -678,7 +678,7 @@ static const char* g_dashboard_html =
 "            var cls = j === 0 ? 'call-node leak-site' : (j === l.nframes - 1 ? 'call-node entry' : 'call-node');\n"
 "            var parsed = parseFrame(l.frames[j] || '?');\n"
 "            html += '<div class=\"' + cls + '\"';\n"
-"            if (parsed.bin && parsed.off) html += ' onclick=\"resolveFrame(this,\\'' + escAttr(parsed.bin) + '\\',\\'' + escAttr(parsed.off) + '\\')\" style=\"cursor:pointer\" title=\"点击解析源码位置\"';\n"
+"            if (parsed.bin && parsed.off) html += ' onclick=\"event.stopPropagation();resolveFrame(this,\\'' + escAttr(parsed.bin) + '\\',\\'' + escAttr(parsed.off) + '\\')\" style=\"cursor:pointer\" title=\"点击解析源码位置\"';\n"
 "            html += '>';\n"
 "            html += '<span class=\"fn\">' + esc(parsed.fn) + '</span>';\n"
 "            if (parsed.lib) html += '<span class=\"lib\">' + esc(parsed.lib) + '</span>';\n"

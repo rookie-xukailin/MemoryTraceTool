@@ -82,7 +82,23 @@
       "Bash(python3: *)",
       "Bash(python3 *)",
       "Bash(ulimit: *)",
-      "Bash(ulimit *)"
+      "Bash(ulimit *)",
+      "Bash(build/mttd: *)",
+      "Bash(build/mttd *)",
+      "Bash(build/demo: *)",
+      "Bash(build/demo *)",
+      "Bash(build/demo_preload: *)",
+      "Bash(build/demo_preload *)",
+      "Bash(build/demo_daemon: *)",
+      "Bash(build/demo_daemon *)",
+      "Bash(build/demo_long_running: *)",
+      "Bash(build/demo_long_running *)",
+      "Bash(build/demo_long_running_preload: *)",
+      "Bash(build/demo_long_running_preload *)",
+      "Bash(build/demo_macro_daemon: *)",
+      "Bash(build/demo_macro_daemon *)",
+      "Bash(build/test_basic: *)",
+      "Bash(build/test_basic *)"
     ]
   }
 }
