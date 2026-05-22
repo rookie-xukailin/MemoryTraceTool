@@ -32,6 +32,84 @@
 static int g_sock_fd = -1;
 
 /**
+ * 使用 dladdr 将栈帧地址解析为人类可读的符号名称。
+ *
+ * 格式: "显示名|二进制路径|文件偏移"
+ * - 显示名用于前端展示（如 "main (myapp)"）
+ * - 二进制路径和文件偏移用于 addr2line 源码解析
+ * dladdr 失败时退化为 backtrace_symbols 的输出。
+ *
+ * @param addr      backtrace 返回的原始栈帧地址
+ * @param out       输出缓冲区
+ * @param out_size  输出缓冲区大小
+ */
+static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
+{
+    Dl_info info;
+    if (dladdr(addr, &info)) {
+        const char* fullpath = info.dli_fname ? info.dli_fname : "??";
+        const char* basename = strrchr(fullpath, '/');
+        if (basename) basename++; else basename = fullpath;
+
+        /* 计算文件内偏移（运行时地址 - 加载基地址） */
+        ptrdiff_t file_off = (char*)addr - (char*)info.dli_fbase;
+
+        if (info.dli_sname) {
+            /* 有符号名：计算函数内偏移 */
+            ptrdiff_t func_off = (char*)addr - (char*)info.dli_saddr;
+            if (func_off > 0)
+                snprintf(out, out_size, "%s+%#tx (%s)|%s|%#tx",
+                         info.dli_sname, func_off, basename, fullpath, file_off);
+            else
+                snprintf(out, out_size, "%s (%s)|%s|%#tx",
+                         info.dli_sname, basename, fullpath, file_off);
+        } else {
+            /* 无符号名但有文件信息，尝试 backtrace_symbols 补充符号名 */
+            char* fallback = NULL;
+            char** syms = backtrace_symbols(&addr, 1);
+            if (syms && syms[0]) {
+                /* 尝试从 backtrace_symbols 输出中提取函数名
+                 * 格式通常为: path(func+off) [addr] 或 path(+off) [addr] */
+                char* paren = strchr(syms[0], '(');
+                char* plus  = strchr(syms[0], '+');
+                if (paren && plus && plus > paren) {
+                    /* 有函数名: path(func+off) */
+                    size_t name_len = plus - paren - 1;
+                    if (name_len > 0 && name_len < 256) {
+                        fallback = raw_malloc(name_len + 1);
+                        if (fallback) {
+                            memcpy(fallback, paren + 1, name_len);
+                            fallback[name_len] = '\0';
+                        }
+                    }
+                }
+                if (fallback) {
+                    snprintf(out, out_size, "%s+%#tx (%s)|%s|%#tx",
+                             fallback, file_off, basename, fullpath, file_off);
+                    raw_free(fallback);
+                } else {
+                    snprintf(out, out_size, "%s(+%#tx)|%s|%#tx",
+                             basename, file_off, fullpath, file_off);
+                }
+                raw_free(syms);
+            } else {
+                snprintf(out, out_size, "%s(+%#tx)|%s|%#tx",
+                         basename, file_off, fullpath, file_off);
+            }
+        }
+    } else {
+        /* dladdr 完全失败，fallback 到 backtrace_symbols */
+        char** syms = backtrace_symbols(&addr, 1);
+        if (syms && syms[0]) {
+            snprintf(out, out_size, "%s||", syms[0]);
+            raw_free(syms);
+        } else {
+            snprintf(out, out_size, "%p||", addr);
+        }
+    }
+}
+
+/**
  * 连接到 mttd 守护进程的 Unix Domain Socket。
  *
  * 连接成功后发送 HELLO 消息，其中包含进程 PID 和从
@@ -121,17 +199,13 @@ void mtt_client_report(void)
             "LEAK %zu %s %d %d\n", e->size, e->file, e->line, e->stack_frames);
         send(fd, line, n, MSG_NOSIGNAL);
 
-        /* 解析调用栈帧地址为符号字符串 */
-        if (e->stack_frames > 0) {
-            char** symbols = backtrace_symbols(e->stack, e->stack_frames);
-            if (symbols) {
-                for (int j = 0; j < e->stack_frames; j++) {
-                    int n2 = snprintf(line, sizeof(line),
-                        "FRAME %d %s\n", j, symbols[j] ? symbols[j] : "??");
-                    send(fd, line, n2, MSG_NOSIGNAL);
-                }
-                raw_free(symbols);
-            }
+        /* 解析调用栈帧地址为可读符号，携带原始地址供 addr2line 解析 */
+        for (int j = 0; j < e->stack_frames; j++) {
+            char resolved[MTT_SYMBOL_MAX];
+            resolve_frame_symbol(e->stack[j], resolved, sizeof(resolved));
+            int n2 = snprintf(line, sizeof(line),
+                "FRAME %d %s\n", j, resolved);
+            send(fd, line, n2, MSG_NOSIGNAL);
         }
     }
 
@@ -179,16 +253,12 @@ void mtt_client_report_final(void)
             "LEAK %zu %s %d %d\n", e->size, e->file, e->line, e->stack_frames);
         send(fd, line, n, MSG_NOSIGNAL);
 
-        if (e->stack_frames > 0) {
-            char** symbols = backtrace_symbols(e->stack, e->stack_frames);
-            if (symbols) {
-                for (int j = 0; j < e->stack_frames; j++) {
-                    int n2 = snprintf(line, sizeof(line),
-                        "FRAME %d %s\n", j, symbols[j] ? symbols[j] : "??");
-                    send(fd, line, n2, MSG_NOSIGNAL);
-                }
-                raw_free(symbols);
-            }
+        for (int j = 0; j < e->stack_frames; j++) {
+            char resolved[MTT_SYMBOL_MAX];
+            resolve_frame_symbol(e->stack[j], resolved, sizeof(resolved));
+            int n2 = snprintf(line, sizeof(line),
+                "FRAME %d %s\n", j, resolved);
+            send(fd, line, n2, MSG_NOSIGNAL);
         }
     }
 

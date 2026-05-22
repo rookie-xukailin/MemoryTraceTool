@@ -530,20 +530,38 @@ char* mtt_strdup(const char* s, const char* file, int line)
 /**
  * 输出调用栈符号到 FILE 流。
  *
- * 使用 backtrace_symbols 将栈帧地址转换为可读的符号字符串
- *（如 "build/myapp(+0x2ca6) [0x...]"）。
+ * 优先使用 dladdr 解析函数名（即使二进制被 strip 也能从动态符号表获取），
+ * 失败时回退到 backtrace_symbols 原始输出。
  */
 static void print_stack_trace(mtt_entry_t* e, FILE* fp)
 {
     if (e->stack_frames <= 0) return;
 
-    char** symbols = backtrace_symbols(e->stack, e->stack_frames);
-    if (!symbols) return;
-
     fprintf(fp, "    Call stack:\n");
-    for (int i = 0; i < e->stack_frames; i++)
-        fprintf(fp, "      #%-2d %s\n", i, symbols[i]);
-    raw_free(symbols); /* backtrace_symbols 内部分配的内存需释放 */
+    for (int i = 0; i < e->stack_frames; i++) {
+        Dl_info info;
+        if (dladdr(e->stack[i], &info) && info.dli_sname) {
+            const char* fname = info.dli_fname ? info.dli_fname : "??";
+            const char* base = strrchr(fname, '/');
+            if (base) fname = base + 1;
+            ptrdiff_t offset = (char*)e->stack[i] - (char*)info.dli_saddr;
+            if (offset > 0)
+                fprintf(fp, "      #%-2d %s+%#tx (%s)\n",
+                        i, info.dli_sname, offset, fname);
+            else
+                fprintf(fp, "      #%-2d %s (%s)\n",
+                        i, info.dli_sname, fname);
+        } else {
+            /* dladdr 失败，回退到 backtrace_symbols */
+            char** syms = backtrace_symbols(&e->stack[i], 1);
+            if (syms && syms[0]) {
+                fprintf(fp, "      #%-2d %s\n", i, syms[0]);
+                raw_free(syms);
+            } else {
+                fprintf(fp, "      #%-2d %p\n", i, e->stack[i]);
+            }
+        }
+    }
 }
 
 /** qsort 比较函数：按泄漏大小降序排列 */
