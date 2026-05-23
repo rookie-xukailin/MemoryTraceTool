@@ -35,8 +35,10 @@
 #include <fcntl.h>
 #include <errno.h>
 
-/* 缓存的套接字文件描述符，避免重复连接 */
+/* 缓存的套接字文件描述符，避免重复连接。
+ * 由 g_sock_lock 保护，防止周期报告线程与 atexit 并发 double-close。 */
 static int g_sock_fd = -1;
+static pthread_mutex_t g_sock_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * 安全的整行发送（处理部分写入和 EINTR）。
@@ -133,10 +135,11 @@ static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
  */
 static int connect_daemon(void)
 {
-    if (g_sock_fd >= 0) return g_sock_fd;
+    pthread_mutex_lock(&g_sock_lock);
+    if (g_sock_fd >= 0) { int fd = g_sock_fd; pthread_mutex_unlock(&g_sock_lock); return fd; }
 
     g_sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (g_sock_fd < 0) return -1;
+    if (g_sock_fd < 0) { pthread_mutex_unlock(&g_sock_lock); return -1; }
 
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
@@ -145,6 +148,7 @@ static int connect_daemon(void)
     if (connect(g_sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(g_sock_fd);
         g_sock_fd = -1;
+        pthread_mutex_unlock(&g_sock_lock);
         return -1;
     }
 
@@ -168,7 +172,7 @@ static int connect_daemon(void)
     if (n > 0 && n < (int)sizeof(msg))
         send_all(g_sock_fd, msg, (size_t)n);
 
-    return g_sock_fd;
+    { int fd = g_sock_fd; pthread_mutex_unlock(&g_sock_lock); return fd; }
 }
 
 /**
@@ -190,7 +194,12 @@ static void do_client_report(int is_final)
     /* 收集所有泄漏记录（逐锁遍历，避免长时间持锁） */
     int nleaks = 0;
     mtt_entry_t** entries = raw_malloc(MTT_MAX_LEAKS_PER_PROC * sizeof(mtt_entry_t*));
-    if (!entries) { shutdown(fd, SHUT_RDWR); close(fd); g_sock_fd = -1; return; }
+    if (!entries) {
+        pthread_mutex_lock(&g_sock_lock);
+        shutdown(fd, SHUT_RDWR); close(fd); g_sock_fd = -1;
+        pthread_mutex_unlock(&g_sock_lock);
+        return;
+    }
 
     for (unsigned lock_idx = 0; lock_idx < MTT_LOCK_STRIPES
          && nleaks < MTT_MAX_LEAKS_PER_PROC; lock_idx++) {
@@ -230,10 +239,13 @@ static void do_client_report(int is_final)
         send_all(fd, "BYE\n", 4);
     }
 
-    /* 缺陷修复 #2: shutdown 后关闭，确保数据发送完毕 */
+    /* 缺陷修复 #2: shutdown 后关闭，确保数据发送完毕。
+     * g_sock_lock 保护防止双线关闭。 */
+    pthread_mutex_lock(&g_sock_lock);
     shutdown(fd, SHUT_RDWR);
     close(fd);
     g_sock_fd = -1;
+    pthread_mutex_unlock(&g_sock_lock);
 
     raw_free(entries);
 }

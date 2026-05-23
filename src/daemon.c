@@ -944,7 +944,7 @@ static const char* g_dashboard_html =
 "var gPrevLeaked={}; /* pid -> prev total_leaked */\n"
 "var gPrevTime=0;    /* timestamp of last snapshot */\n"
 "var gHistory={};    /* pid -> [{t,bytes},...] */\n"
-"var gDetailPid=0;\n"
+"var gDetailPid=0,gCachedProcs=null;\n"
 "\n"
 "/* ===== SIDEBAR ===== */\n"
 "function toggleSidebar(){document.getElementById('sidebar').classList.toggle('folded')}\n"
@@ -973,6 +973,10 @@ static const char* g_dashboard_html =
 "/* ===== CURSOR TRAIL: 3层lerp拖尾，20fps节流，移动渐显/静止渐消 ===== */\n"
 "var trailEls=[],trailPositions=[],targetX=0,targetY=0,trailAlpha=0,trailActive=false;\n"
 "var trailFadeTimer=null,trailFrameSkip=0,trailPaused=false;\n"
+"var trailRunning=true,trailRafId=0,trailIdleTimer=null;\n"
+"function stopTrailLoop(){trailRunning=false;if(trailRafId){cancelAnimationFrame(trailRafId);trailRafId=0};for(var i=0;i<3;i++)trailEls[i].style.opacity='0'}\n"
+"function startTrailLoop(){if(!trailRunning){trailRunning=true;trailRafId=requestAnimationFrame(tick)}}\n"
+"document.addEventListener('visibilitychange',function(){document.hidden?stopTrailLoop():startTrailLoop()});\n"
 "(function initTrail(){\n"
 "  for(var i=0;i<3;i++){\n"
 "    trailEls.push(document.getElementById('trail'+i));\n"
@@ -980,15 +984,19 @@ static const char* g_dashboard_html =
 "  }\n"
 "  document.addEventListener('mousemove',function(e){\n"
 "    targetX=e.clientX;targetY=e.clientY;trailActive=true;\n"
-"    trailFadeTimer&&clearTimeout(trailFadeTimer);\n"
+"    if(!trailRunning)startTrailLoop();\n"
+"    trailFadeTimer&&clearTimeout(trailFadeTimer);trailIdleTimer&&clearTimeout(trailIdleTimer);\n"
 "    trailFadeTimer=setTimeout(function(){trailActive=false},1200);\n"
+"    trailIdleTimer=setTimeout(function(){stopTrailLoop()},30000); /* 30s闲置彻底停止 */\n"
 "  });\n"
 "  function tick(){\n"
+"    if(!trailRunning)return;\n"
 "    trailFrameSkip++;\n"
-"    if(trailFrameSkip%3!==0){requestAnimationFrame(tick);return} /* 20fps */\n"
-"    if(trailPaused){for(var i=0;i<3;i++)trailEls[i].style.opacity='0';requestAnimationFrame(tick);return}\n"
+"    if(trailFrameSkip%3!==0){trailRafId=requestAnimationFrame(tick);return} /* 20fps */\n"
+"    if(trailPaused){for(var i=0;i<3;i++)trailEls[i].style.opacity='0';trailRafId=requestAnimationFrame(tick);return}\n"
 "    if(trailActive){trailAlpha=Math.min(1,trailAlpha+0.06)}\n"
 "    else{trailAlpha=Math.max(0,trailAlpha-0.03)}\n"
+"    if(trailAlpha<.005){for(var i=0;i<3;i++)trailEls[i].style.opacity='0';trailRafId=requestAnimationFrame(tick);return}\n"
 "    var lag=0.08;\n"
 "    for(var i=0;i<3;i++){\n"
 "      var tp=trailPositions[i];\n"
@@ -1001,9 +1009,9 @@ static const char* g_dashboard_html =
 "      el.style.transform='scale('+(1-i*0.05)+')';\n"
 "      lag=Math.max(0.03,lag-0.025);\n"
 "    }\n"
-"    requestAnimationFrame(tick);\n"
+"    trailRafId=requestAnimationFrame(tick);\n"
 "  }\n"
-"  tick();\n"
+"  trailRafId=requestAnimationFrame(tick);\n"
 "})();\n"
 "\n"
 "\n"
@@ -1020,12 +1028,14 @@ static const char* g_dashboard_html =
 "  var btn=document.getElementById('btn-confirm-reset');\n"
 "  btn.disabled=true;btn.textContent='清除中...';\n"
 "  fetch('/api/reset').then(function(r){return r.json()}).then(function(d){\n"
-"    gAllLeaks=[];gHistory={};gPrevLeaked={};gPrevTime=0;gDetailPid=0;\n"
-"    toast('已清除所有泄漏历史数据');\n"
-"    closeResetModal();\n"
+"    if(d.status==='ok'){\n"
+"      gAllLeaks=[];gHistory={};gPrevLeaked={};gPrevTime=0;gDetailPid=0;\n"
+"      toast('已清除所有泄漏历史数据');\n"
+"      closeResetModal();\n"
+"      refresh();loadProcs();\n"
+"      closeDetail();\n"
+"    }else{toast('清除失败: '+(d.message||'未知错误'))}\n"
 "    btn.disabled=false;btn.textContent='确认重新监控';\n"
-"    refresh();loadProcs();\n"
-"    closeDetail();\n"
 "  }).catch(function(){\n"
 "    toast('请求失败，请重试');\n"
 "    btn.disabled=false;btn.textContent='确认重新监控';\n"
@@ -1053,6 +1063,7 @@ static const char* g_dashboard_html =
 "    document.getElementById('kp-leaks').textContent=d.total_leaks;\n"
 "    document.getElementById('kp-bytes').textContent=fmtBytes(d.total_bytes);\n"
 "    document.getElementById('kp-hist').textContent=d.nprocs;\n"
+"    gCachedProcs=d.procs;\n"
 "\n"
 "    var now=Date.now()/1000;\n"
 "    var prevTotal=0,curTotal=0;\n"
@@ -1229,17 +1240,17 @@ static const char* g_dashboard_html =
 "document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeDetail();closeResetModal()}});\n"
 "\n"
 "function renderDetailBody(pid){\n"
-"  var hist=gHistory[pid]||[],body='';\n"
-"  /* find process name */\n"
-"  fetch('/api/data').then(function(r){return r.json()}).then(function(d){\n"
-"    var proc=null;\n"
-"    for(var i=0;i<d.procs.length;i++){if(d.procs[i].pid===pid){proc=d.procs[i];break}}\n"
-"    if(!proc){document.getElementById('dtl-title').textContent='PID '+pid+' (已退出)';return}\n"
+"  if(gDetailPid!==pid)return;\n"
+"  var hist=gHistory[pid]||[];\n"
+"  if(!gCachedProcs){document.getElementById('dtl-title').textContent='加载中...';return}\n"
+"  var proc=null;\n"
+"  for(var i=0;i<gCachedProcs.length;i++){if(gCachedProcs[i].pid===pid){proc=gCachedProcs[i];break}}\n"
+"  if(!proc){document.getElementById('dtl-title').textContent='PID '+pid+' (已退出)';return}\n"
 "\n"
-"    document.getElementById('dtl-title').textContent=proc.name+' (PID '+pid+')';\n"
-"    var rate=proc.total_leaked>0&&gPrevTime>0?'+'+fmtBytes(proc.total_leaked)+'/轮':'--';\n"
+"  document.getElementById('dtl-title').textContent=proc.name+' (PID '+pid+')';\n"
+"  var rate=proc.total_leaked>0&&gPrevTime>0?'+'+fmtBytes(proc.total_leaked)+'/轮':'--';\n"
 "\n"
-"    body='<div class=\"detail-stats\">'+\n"
+"  var body='<div class=\"detail-stats\">'+\n"
 "      '<div class=\"ds\"><div class=\"ds-val\">'+fmtBytes(proc.total_leaked)+'</div><div class=\"ds-label\">泄漏字节</div></div>'+\n"
 "      '<div class=\"ds\"><div class=\"ds-val\">'+proc.leak_count+'</div><div class=\"ds-label\">泄漏次数</div></div>'+\n"
 "      '<div class=\"ds\"><div class=\"ds-val\">'+rate+'</div><div class=\"ds-label\">增速/轮</div></div>'+\n"
@@ -1283,7 +1294,6 @@ static const char* g_dashboard_html =
 "\n"
 "    /* draw chart */\n"
 "    setTimeout(function(){drawChart(hist)},100);\n"
-"  });\n"
 "}\n"
 "\n"
 "/* ===== CANVAS CHART ===== */\n"
@@ -1433,8 +1443,7 @@ static const char* g_dashboard_html =
 "    var vis=c._vis,idx=Math.round((mx-pad.l)/c._pw*(vis.length-1));\n"
 "    if(idx<0||idx>=vis.length)return;\n"
 "    drawChart(c._data);\n"
-"    var ctx=c.getContext('2d'),dpr=window.devicePixelRatio||1;\n"
-"    ctx.scale(dpr,dpr);\n"
+"    var ctx=c.getContext('2d');\n"
 "    var cx=pad.l+(c._pw/(Math.max(1,vis.length-1)))*idx;\n"
 "    var cy=pad.t+c._ph-((vis[idx].bytes-c._minB)/(c._maxB-c._minB))*c._ph;\n"
 "    ctx.strokeStyle='rgba(0,212,255,.5)';ctx.lineWidth=1;\n"
@@ -1599,13 +1608,20 @@ static void send_api_data(int fd)
         mttd_proc_t* p = &g_procs[i];
         pthread_mutex_lock(&p->lock);
 
-        /* 获取栈顶帧（首个有符号的帧）作为摘要显示 */
+        /* 获取热点函数摘要：遍历所有泄漏和栈帧，跳过 libmemorytracetool 内部帧 */
         char top_stack[256] = "(none)";
-        for (int j = 0; j < p->leak_count; j++) {
-            if (p->leaks[j].nframes > 0 && p->leaks[j].frames[0][0]) {
-                snprintf(top_stack, sizeof(top_stack), "%s",
-                         p->leaks[j].frames[0]);
-                break;
+        int found_user_frame = 0;
+        for (int j = 0; j < p->leak_count && !found_user_frame; j++) {
+            for (int k = 0; k < p->leaks[j].nframes && !found_user_frame; k++) {
+                const char* f = p->leaks[j].frames[k];
+                if (!f[0]) continue;
+                /* 跳过内部帧: libmemorytracetool, mtt_*, capture_stack, backtrace */
+                if (strstr(f, "libmemorytracetool")) continue;
+                if (strncmp(f, "mtt_", 4) == 0) continue;
+                if (strstr(f, "capture_stack")) continue;
+                if (strstr(f, "backtrace")) continue;
+                snprintf(top_stack, sizeof(top_stack), "%s", f);
+                found_user_frame = 1;
             }
         }
 
@@ -1902,7 +1918,7 @@ static void send_api_processes(int fd)
                 }
             }
             fclose(fs);
-            if (state == 'Z' || state == 'X' || state == 'T' || state == 'D') continue;
+            if (state == 'Z' || state == 'X' || state == 'T') continue;
 
             /* 计算运行时长 = 当前时间 - 启动时间（单位:秒） */
             long ticks_per_sec = sysconf(_SC_CLK_TCK);
@@ -1953,6 +1969,7 @@ static void send_api_processes(int fd)
             pi->uptime_sec = uptime_sec;
             snprintf(pi->name, sizeof(pi->name), "%s", comm);
             snprintf(pi->cmdline, sizeof(pi->cmdline), "%s", cmdline);
+            pthread_mutex_lock(&g_lock);
             for (int i = 0; i < g_ninjected; i++) {
                 if (g_injected[i].pid == pid) {
                     pi->inj_status = g_injected[i].inject_status;
@@ -1960,6 +1977,7 @@ static void send_api_processes(int fd)
                     break;
                 }
             }
+            pthread_mutex_unlock(&g_lock);
         }
         closedir(dir);
     }
@@ -2135,8 +2153,22 @@ static void handle_api_inject(int fd, int pid)
         return;
     }
 
-    /* 记录注入结果 */
-    if (g_ninjected < MTT_MAX_INJECTED) {
+    /* 记录注入结果（g_lock 保护，防止与 send_api_processes 数据竞争） */
+    pthread_mutex_lock(&g_lock);
+    /* 检查是否已有此 PID 的注入记录，存在则更新而非追加 */
+    int existing = -1;
+    for (int i = 0; i < g_ninjected; i++) {
+        if (g_injected[i].pid == pid) { existing = i; break; }
+    }
+    if (existing >= 0) {
+        g_injected[existing].inject_time = time(NULL);
+        g_injected[existing].inject_status = (result.status == INJECT_OK) ? 1 : 2;
+        g_injected[existing].lib_base = result.lib_base;
+        g_injected[existing].patched_count = result.patched_count;
+        snprintf(g_injected[existing].inject_err,
+                 sizeof(g_injected[existing].inject_err),
+                 "%s", result.err_msg);
+    } else if (g_ninjected < MTT_MAX_INJECTED) {
         g_injected[g_ninjected].pid = pid;
         g_injected[g_ninjected].inject_time = time(NULL);
         g_injected[g_ninjected].inject_status = (result.status == INJECT_OK) ? 1 : 2;
@@ -2147,6 +2179,7 @@ static void handle_api_inject(int fd, int pid)
                  "%s", result.err_msg);
         g_ninjected++;
     }
+    pthread_mutex_unlock(&g_lock);
 
     char hdr[256];
     int body_len = snprintf(resp, sizeof(resp),
@@ -2215,6 +2248,7 @@ static void handle_api_reset(int fd)
         g_procs[i].leak_cap = 0;
         g_procs[i].total_leaked = 0;
     }
+    atomic_store(&g_total_leaks_global, 0);
     pthread_mutex_unlock(&g_lock);
 
     const char* resp =
@@ -2292,6 +2326,9 @@ static void handle_http(int fd)
         }
     } else if (strncmp(buf, "GET /api/processes", 18) == 0) {
         send_api_processes(fd);
+    } else if (strncmp(buf, "GET /api/injected", 17) == 0) {
+        /* /api/injected 必须放在 /api/inject 之前，否则被短前缀截获 */
+        send_api_injected(fd);
     } else if (strncmp(buf, "GET /api/inject", 15) == 0) {
         /* 解析 ?pid=N */
         int pid = 0;
@@ -2310,8 +2347,6 @@ static void handle_http(int fd)
                 "{\"error\":\"missing pid parameter\"}";
             send_all(fd, err, strlen(err));
         }
-    } else if (strncmp(buf, "GET /api/injected", 17) == 0) {
-        send_api_injected(fd);
     } else if (strncmp(buf, "GET /api/reset", 14) == 0) {
         handle_api_reset(fd);
     } else if (strncmp(buf, "GET /api/data", 13) == 0) {
