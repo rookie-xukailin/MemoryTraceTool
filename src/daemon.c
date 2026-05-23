@@ -199,7 +199,7 @@ static int add_leak(mttd_proc_t* p, mttd_leak_t* leak)
     }
 
     if (p->leak_count >= p->leak_cap) {
-        int newcap = p->leak_cap * 2;
+        int newcap = p->leak_cap > 0 ? p->leak_cap * 2 : 32;
         if (newcap > MTT_MAX_LEAKS) {
             if (p->leak_count >= MTT_MAX_LEAKS) return -1;
             newcap = MTT_MAX_LEAKS;
@@ -520,7 +520,6 @@ static const char* g_dashboard_html =
 "  background:var(--bg);color:var(--text);\n"
 "  min-height:100vh;display:flex;\n"
 "  -webkit-font-smoothing:antialiased;\n"
-"  cursor:crosshair;\n"
 "}\n"
 "\n"
 "/* ===== SIDEBAR ===== */\n"
@@ -659,7 +658,7 @@ static const char* g_dashboard_html =
 "\n"
 ".btn-sm{\n"
 "  padding:2px 8px;font-size:11px;border-radius:3px;font-family:var(--font);\n"
-"  border:1px solid var(--border-strong);background:transparent;color:var(--text);\n"
+"  border:1px solid var(--border-strong);background:transparent;color:var(--text);cursor:pointer;\n"
 "  cursor:pointer;transition:all .12s;position:relative;overflow:hidden;\n"
 "}\n"
 ".btn-sm:hover{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}\n"
@@ -675,9 +674,10 @@ static const char* g_dashboard_html =
 "  font-size:12px;background:var(--bg);color:var(--text);font-family:var(--font);\n"
 "  transition:border-color .15s;\n"
 "}\n"
-".ctrls input:focus{outline:none;border-color:var(--accent)}\n"
+".ctrls input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,212,255,.3)}\n"
+"button:focus-visible,.btn:focus-visible,.btn-sm:focus-visible,.pg:focus-visible,.sort:focus-visible,.sb-item:focus-visible{outline:none;box-shadow:0 0 0 2px var(--accent)}\n"
 ".ctrls input::placeholder{color:var(--text3)}\n"
-".sort{font-size:11px;padding:2px 9px}\n"
+".sort{font-size:11px;padding:2px 9px;cursor:pointer}\n"
 ".sort.on{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}\n"
 "\n"
 "/* ===== LEAK LIST ===== */\n"
@@ -774,7 +774,9 @@ static const char* g_dashboard_html =
 "  border-radius:var(--radius);padding:8px;margin-bottom:14px;position:relative;user-select:none;\n"
 "}\n"
 ".chart-wrap canvas{display:block;width:100%;height:auto;cursor:crosshair}\n"
-".chart-tip{font-size:10px;color:var(--text3);text-align:center;margin-top:4px;letter-spacing:.2px}\n"
+".chart-tip{font-size:10px;color:var(--text3);text-align:center;margin-top:4px;letter-spacing:.2px;display:flex;align-items:center;justify-content:center;gap:6px}\n"
+".chart-zoom-btn{font-size:11px;padding:1px 6px;border-radius:3px;border:1px solid var(--border);background:var(--surface);color:var(--text2);cursor:pointer;font-family:var(--mono);line-height:1.4}\n"
+".chart-zoom-btn:hover{color:var(--accent);border-color:var(--accent)}\n"
 "\n"
 ".leak-sec h4{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px}\n"
 "\n"
@@ -830,10 +832,12 @@ static const char* g_dashboard_html =
 "\n"
 "/* ===== RESPONSIVE ===== */\n"
 "\n"
-"@media(max-width:700px){.sidebar{display:none}.kpi-row{grid-template-columns:1fr}.detail{width:100vw}}\n"
+".hamburger{display:none;position:fixed;top:10px;left:10px;z-index:150;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:var(--radius);cursor:pointer;font-size:18px}\n"
+"@media(max-width:700px){.sidebar{display:none;position:fixed;z-index:200;top:0;left:0;height:100vh}.sidebar.open{display:flex}.hamburger{display:flex}.kpi-row{grid-template-columns:1fr}.detail{width:100vw}.panel{overflow-x:auto}}\n"
 "</style>\n"
 "</head>\n"
 "<body>\n"
+"<button class=\"hamburger\" onclick=\"var sb=document.getElementById('sidebar');sb.classList.toggle('open')\" title=\"菜单\">&#9776;</button>\n"
 "\n"
 "<!-- SIDEBAR -->\n"
 "<aside class=\"sidebar\" id=\"sidebar\">\n"
@@ -933,9 +937,6 @@ static const char* g_dashboard_html =
 "\n"
 "<div class=\"toast\" id=\"toast\"></div>\n"
 "<!-- Cursor trail elements -->\n"
-"<div class=\"trail\" id=\"trail0\">王华是cos0</div>\n"
-"<div class=\"trail\" id=\"trail1\">王华是cos0</div>\n"
-"<div class=\"trail\" id=\"trail2\">王华是cos0</div>\n"
 "\n"
 "<script>\n"
 "var autoRefresh=true,failCount=0;\n"
@@ -943,8 +944,10 @@ static const char* g_dashboard_html =
 "var gProcPage=1,gPageSize=15,gAllProcs=[];\n"
 "var gPrevLeaked={}; /* pid -> prev total_leaked */\n"
 "var gPrevTime=0;    /* timestamp of last snapshot */\n"
+"var gPrevLeakMap={},gPrevLeakTime=0; /* 泄漏站点速率快照 */\n"
 "var gHistory={};    /* pid -> [{t,bytes},...] */\n"
-"var gDetailPid=0,gCachedProcs=null;\n"
+"var gDetailPid=0,gCachedProcs=null,gLastDetailSig='';\n"
+"var gLoadSeq=0,toastTimer=0;\n"
 "\n"
 "/* ===== SIDEBAR ===== */\n"
 "function toggleSidebar(){document.getElementById('sidebar').classList.toggle('folded')}\n"
@@ -973,10 +976,8 @@ static const char* g_dashboard_html =
 "/* ===== CURSOR TRAIL: 3层lerp拖尾，20fps节流，移动渐显/静止渐消 ===== */\n"
 "var trailEls=[],trailPositions=[],targetX=0,targetY=0,trailAlpha=0,trailActive=false;\n"
 "var trailFadeTimer=null,trailFrameSkip=0,trailPaused=false;\n"
-"var trailRunning=true,trailRafId=0,trailIdleTimer=null;\n"
-"function stopTrailLoop(){trailRunning=false;if(trailRafId){cancelAnimationFrame(trailRafId);trailRafId=0};for(var i=0;i<3;i++)trailEls[i].style.opacity='0'}\n"
-"function startTrailLoop(){if(!trailRunning){trailRunning=true;trailRafId=requestAnimationFrame(tick)}}\n"
-"document.addEventListener('visibilitychange',function(){document.hidden?stopTrailLoop():startTrailLoop()});\n"
+"var trailRunning=false,trailRafId=0,trailIdleTimer=null;\n"
+"var stopTrailLoop,startTrailLoop;\n"
 "(function initTrail(){\n"
 "  for(var i=0;i<3;i++){\n"
 "    trailEls.push(document.getElementById('trail'+i));\n"
@@ -1011,6 +1012,9 @@ static const char* g_dashboard_html =
 "    }\n"
 "    trailRafId=requestAnimationFrame(tick);\n"
 "  }\n"
+"  stopTrailLoop=function(){trailRunning=false;if(trailRafId){cancelAnimationFrame(trailRafId);trailRafId=0};for(var i=0;i<3;i++)trailEls[i].style.opacity='0'};\n"
+"  startTrailLoop=function(){if(!trailRunning){trailRunning=true;trailRafId=requestAnimationFrame(tick)}};\n"
+"  document.addEventListener('visibilitychange',function(){document.hidden?stopTrailLoop():startTrailLoop()});\n"
 "  trailRafId=requestAnimationFrame(tick);\n"
 "})();\n"
 "\n"
@@ -1029,7 +1033,7 @@ static const char* g_dashboard_html =
 "  btn.disabled=true;btn.textContent='清除中...';\n"
 "  fetch('/api/reset').then(function(r){return r.json()}).then(function(d){\n"
 "    if(d.status==='ok'){\n"
-"      gAllLeaks=[];gHistory={};gPrevLeaked={};gPrevTime=0;gDetailPid=0;\n"
+"      gAllLeaks=[];gHistory={};gPrevLeaked={};gPrevTime=0;gDetailPid=0;gPrevLeakMap={};gPrevLeakTime=0;\n"
 "      toast('已清除所有泄漏历史数据');\n"
 "      closeResetModal();\n"
 "      refresh();loadProcs();\n"
@@ -1062,7 +1066,8 @@ static const char* g_dashboard_html =
 "    document.getElementById('kp-procs').textContent=d.nprocs;\n"
 "    document.getElementById('kp-leaks').textContent=d.total_leaks;\n"
 "    document.getElementById('kp-bytes').textContent=fmtBytes(d.total_bytes);\n"
-"    document.getElementById('kp-hist').textContent=d.nprocs;\n"
+"    var exited=0;for(var ei=0;ei<d.procs.length;ei++){if(!d.procs[ei].active)exited++}\n"
+"    document.getElementById('kp-hist').textContent=exited;\n"
 "    gCachedProcs=d.procs;\n"
 "\n"
 "    var now=Date.now()/1000;\n"
@@ -1093,7 +1098,7 @@ static const char* g_dashboard_html =
 "      rows+='<tr class=\"clickable\" onclick=\"openDetail('+p.pid+')\">'+\n"
 "        '<td>'+p.pid+'</td><td style=\"font-family:var(--font)\">'+esc(p.name)+'</td><td>'+badge+'</td>'+\n"
 "        '<td>'+p.leak_count+'</td><td>'+fmtBytes(p.total_leaked)+'</td>'+\n"
-"        '<td style=\"font-family:var(--font);font-size:12px;max-width:140px;overflow:hidden;text-overflow:ellipsis\">'+esc(hot)+'</td>'+\n"
+"        '<td style=\"font-family:var(--font);font-size:12px;max-width:140px;overflow:hidden;text-overflow:ellipsis\" title=\"'+escAttr(hot)+'\">'+esc(hot)+'</td>'+\n"
 "        '<td style=\"font-size:11px;color:var(--text3)\">'+seen+'</td></tr>';\n"
 "    }\n"
 "    document.getElementById('mtb').innerHTML=rows||'<tr><td colspan=\"7\"><div class=\"empty\">等待进程接入...</div></td></tr>';\n"
@@ -1188,7 +1193,9 @@ static const char* g_dashboard_html =
 "/* ===== PROCESS LIST ===== */\n"
 "function loadProcs(){\n"
 "  var filter=(document.getElementById('proc-filter').value||'').toLowerCase();\n"
+"  var seq=++gLoadSeq;\n"
 "  fetch('/api/processes').then(function(r){return r.json()}).then(function(d){\n"
+"    if(seq!==gLoadSeq)return;\n"
 "    gAllProcs=d.processes;\n"
 "    if(filter)gAllProcs=gAllProcs.filter(function(p){return p.name.toLowerCase().indexOf(filter)>=0});\n"
 "    gProcPage=Math.min(gProcPage,Math.max(1,Math.ceil(gAllProcs.length/gPageSize)));\n"
@@ -1242,13 +1249,14 @@ static const char* g_dashboard_html =
 "function openDetail(pid){\n"
 "  gDetailPid=pid;\n"
 "  trailPaused=true;\n"
-"  chartZoom=1;chartPan=0;\n"
+"  chartZoom=1;chartPan=0;gLastDetailSig='';\n"
 "  document.getElementById('overlay').classList.add('show');\n"
 "  document.getElementById('detail').classList.add('show');\n"
 "  renderDetailBody(pid);\n"
 "}\n"
 "\n"
 "function closeDetail(){\n"
+"  chartDragging=false;\n"
 "  document.getElementById('overlay').classList.remove('show');\n"
 "  document.getElementById('detail').classList.remove('show');\n"
 "  gDetailPid=0;\n"
@@ -1264,6 +1272,10 @@ static const char* g_dashboard_html =
 "  var proc=null;\n"
 "  for(var i=0;i<gCachedProcs.length;i++){if(gCachedProcs[i].pid===pid){proc=gCachedProcs[i];break}}\n"
 "  if(!proc){document.getElementById('dtl-title').textContent='PID '+pid+' (已退出)';document.getElementById('dtl-body').innerHTML='<div class=\"empty\">该进程已退出，无当前数据</div>';return}\n"
+"  /* 数据未变时跳过 DOM 重建，仅刷新图表数据点 */\n"
+"  var sig=proc.leak_count+':'+proc.total_leaked+':'+hist.length;\n"
+"  if(sig===gLastDetailSig&&hist.length>0){var c=document.getElementById('chart');if(c){c._data=hist;drawChart(hist)};return}\n"
+"  gLastDetailSig=sig;\n"
 "\n"
 "  document.getElementById('dtl-title').textContent=proc.name+' (PID '+pid+')';\n"
 "  var rate=proc.total_leaked>0&&gPrevTime>0?'+'+fmtBytes(proc.total_leaked-(gPrevLeaked[proc.pid]||0))+'/轮':'--';\n"
@@ -1276,7 +1288,7 @@ static const char* g_dashboard_html =
 "      '</div>';\n"
 "\n"
 "    /* chart */\n"
-"    body+='<div class=\"chart-wrap\"><canvas id=\"chart\" width=\"620\" height=\"240\"></canvas><div class=\"chart-tip\">滚轮缩放 · 拖拽平移 · 悬停查看数值</div></div>';\n"
+"    body+='<div class=\"chart-wrap\"><canvas id=\"chart\" width=\"620\" height=\"240\"></canvas><div class=\"chart-tip\"><button class=\"chart-zoom-btn\" onclick=\"chartZoomIn()\">-</button><span>'+chartZoom+'x</span><button class=\"chart-zoom-btn\" onclick=\"chartZoomOut()\">+</button><button class=\"chart-zoom-btn\" onclick=\"chartZoomReset()\">&#8634;</button><span style=\"margin-left:8px\">滚轮缩放 · 拖拽平移 · 悬停查看数值</span></div></div>';\n"
 "\n"
 "    /* leak details for this process */\n"
 "    var leakMap={};\n"
@@ -1316,6 +1328,9 @@ static const char* g_dashboard_html =
 "\n"
 "/* ===== CANVAS CHART ===== */\n"
 "var chartZoom=1,chartPan=0,chartDragging=false,chartDragStart=0,chartPanStart=0;\n"
+"function chartZoomIn(){if(chartZoom<32){chartZoom=Math.min(32,chartZoom*2);chartPan=Math.max(0,chartPan-2)};var c=document.getElementById('chart');if(c&&c._data)drawChart(c._data)}\n"
+"function chartZoomOut(){if(chartZoom>1){chartZoom=Math.max(1,Math.floor(chartZoom/2));chartPan=0};var c=document.getElementById('chart');if(c&&c._data)drawChart(c._data)}\n"
+"function chartZoomReset(){chartZoom=1;chartPan=0;var c=document.getElementById('chart');if(c&&c._data)drawChart(c._data)}\n"
 "\n"
 "function drawChart(data){\n"
 "  var c=document.getElementById('chart');if(!c||data.length<2)return;\n"
@@ -1528,7 +1543,8 @@ static const char* g_dashboard_html =
 "\n"
 "function toast(msg){\n"
 "  var t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');\n"
-"  setTimeout(function(){t.classList.remove('show')},2000);\n"
+"  clearTimeout(toastTimer);\n"
+"  toastTimer=setTimeout(function(){t.classList.remove('show')},2000);\n"
 "}\n"
 "</script>\n"
 "\n"
@@ -2158,9 +2174,17 @@ static void handle_api_inject(int fd, int pid)
     ssize_t rbytes = read(pipefd[0], &result, sizeof(result));
     close(pipefd[0]);
 
-    /* 等待子进程结束 */
-    int wstatus;
-    waitpid(child, &wstatus, 0);
+    /* 轮询子进程退出（每 100ms），避免长时间阻塞事件循环 */
+    int wstatus = 0;
+    int poll_count = 0;
+    int max_polls = MTT_INJECT_TIMEOUT_SEC * 10;
+    while (poll_count < max_polls) {
+        pid_t w = waitpid(child, &wstatus, WNOHANG);
+        if (w == child) break;
+        if (w < 0) break;
+        usleep(100000);
+        poll_count++;
+    }
 
     if (rbytes != sizeof(result)) {
         /* 子进程可能崩溃或管道中断 */
@@ -2449,9 +2473,11 @@ int main(int argc, char** argv)
     int nclients = 0;
     unix_client_ctx_t client_ctxs[MAX_CLIENTS];
     mttd_proc_t* client_procs[MAX_CLIENTS];
+    time_t client_conn_time[MAX_CLIENTS];
     for (int i = 0; i < MAX_CLIENTS; i++) {
         clients[i] = -1;
         client_procs[i] = NULL;
+        client_conn_time[i] = 0;
         memset(&client_ctxs[i], 0, sizeof(client_ctxs[i]));
     }
 
@@ -2497,18 +2523,29 @@ int main(int argc, char** argv)
         /* 缺陷修复 #8: 超时处理 — 清理空闲超时的客户端连接 */
         time_t now = time(NULL);
         for (int i = 0; i < nclients; ) {
-            if (clients[i] > 0 && client_procs[i]) {
-                if (now - client_procs[i]->last_seen > MTT_CLIENT_TIMEOUT_S) {
-                    shutdown(clients[i], SHUT_RDWR);
-                    close(clients[i]);
-                    for (int j = i; j < nclients - 1; j++) {
-                        clients[j] = clients[j + 1];
-                        client_ctxs[j] = client_ctxs[j + 1];
-                        client_procs[j] = client_procs[j + 1];
-                    }
-                    nclients--;
-                    continue;
+            int timed_out = 0;
+            if (clients[i] > 0) {
+                if (client_procs[i]) {
+                    if (now - client_procs[i]->last_seen > MTT_CLIENT_TIMEOUT_S)
+                        timed_out = 1;
+                } else {
+                    /* 未完成 HELLO 握手的连接：基于 accept 时间超时 */
+                    if (client_conn_time[i] > 0
+                        && now - client_conn_time[i] > MTT_CLIENT_TIMEOUT_S)
+                        timed_out = 1;
                 }
+            }
+            if (timed_out) {
+                shutdown(clients[i], SHUT_RDWR);
+                close(clients[i]);
+                for (int j = i; j < nclients - 1; j++) {
+                    clients[j] = clients[j + 1];
+                    client_ctxs[j] = client_ctxs[j + 1];
+                    client_procs[j] = client_procs[j + 1];
+                    client_conn_time[j] = client_conn_time[j + 1];
+                }
+                nclients--;
+                continue;
             }
             i++;
         }
@@ -2523,6 +2560,7 @@ int main(int argc, char** argv)
                     clients[nclients] = cfd;
                     memset(&client_ctxs[nclients], 0, sizeof(unix_client_ctx_t));
                     client_procs[nclients] = NULL;
+                    client_conn_time[nclients] = time(NULL);
                     nclients++;
                 } else {
                     close(cfd); /* 客户端数已满 */

@@ -135,11 +135,11 @@ static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
  */
 static int connect_daemon(void)
 {
-    pthread_mutex_lock(&g_sock_lock);
-    if (g_sock_fd >= 0) { int fd = g_sock_fd; pthread_mutex_unlock(&g_sock_lock); return fd; }
+    /* 调用者必须持有 g_sock_lock */
+    if (g_sock_fd >= 0) return g_sock_fd;
 
     g_sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (g_sock_fd < 0) { pthread_mutex_unlock(&g_sock_lock); return -1; }
+    if (g_sock_fd < 0) return -1;
 
     struct sockaddr_un addr = {0};
     addr.sun_family = AF_UNIX;
@@ -148,7 +148,6 @@ static int connect_daemon(void)
     if (connect(g_sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         close(g_sock_fd);
         g_sock_fd = -1;
-        pthread_mutex_unlock(&g_sock_lock);
         return -1;
     }
 
@@ -172,7 +171,7 @@ static int connect_daemon(void)
     if (n > 0 && n < (int)sizeof(msg))
         send_all(g_sock_fd, msg, (size_t)n);
 
-    { int fd = g_sock_fd; pthread_mutex_unlock(&g_sock_lock); return fd; }
+    return g_sock_fd;
 }
 
 /**
@@ -197,14 +196,16 @@ static void do_client_report(int is_final)
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
 
+    /* g_sock_lock 保护整段 connect→I/O→close，避免多线程共享 fd 竞争 */
+    pthread_mutex_lock(&g_sock_lock);
+
     int fd = connect_daemon();
-    if (fd < 0) return; /* 守护进程不可达，静默跳过 */
+    if (fd < 0) { pthread_mutex_unlock(&g_sock_lock); return; }
 
     /* 收集快照（逐锁遍历，持锁期间拷贝字段，避免 UAF） */
     int nleaks = 0;
     mtt_entry_snap_t* snaps = raw_malloc(MTT_MAX_LEAKS_PER_PROC * sizeof(mtt_entry_snap_t));
     if (!snaps) {
-        pthread_mutex_lock(&g_sock_lock);
         shutdown(fd, SHUT_RDWR); close(fd); g_sock_fd = -1;
         pthread_mutex_unlock(&g_sock_lock);
         return;
@@ -253,9 +254,6 @@ static void do_client_report(int is_final)
         send_all(fd, "BYE\n", 4);
     }
 
-    /* 缺陷修复 #2: shutdown 后关闭，确保数据发送完毕。
-     * g_sock_lock 保护防止双线关闭。 */
-    pthread_mutex_lock(&g_sock_lock);
     shutdown(fd, SHUT_RDWR);
     close(fd);
     g_sock_fd = -1;
