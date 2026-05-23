@@ -341,5 +341,8 @@ static void* reporter_thread_func(void* arg)
 /** 启动周期性报告线程（mtt_ensure_init 之后调用） */
 void mtt_start_periodic_report(void)
 {
-    pthread_create(&g_reporter_thread, NULL, reporter_thread_func, NULL);
+    int rc = pthread_create(&g_reporter_thread, NULL, reporter_thread_func, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "[MemoryTraceTool] WARN: pthread_create reporter failed: %s\n", strerror(rc));
+    }
 }

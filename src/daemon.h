@@ -48,6 +48,7 @@ typedef struct {
     time_t  last_seen;                       /* 最后一次收到报告的时间戳 */
 
     mttd_leak_t* leaks;                      /* 动态分配的泄漏记录数组 */
+    int     dirty;                           /* 有新泄漏未持久化到磁盘 */
 
     pthread_mutex_t lock;                    /* 保护本进程数据的互斥锁 */
 } mttd_proc_t;
