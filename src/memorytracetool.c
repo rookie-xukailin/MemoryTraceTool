@@ -832,34 +832,94 @@ void mtt_report_to_fd(int fd)
 
     for (size_t i = 0; i < count; i++) {
         mtt_entry_snap_t* sn = &snaps[i];
-        fprintf(fp,
-            "  Leak #%-3zu | %-6zu bytes | %s:%d | alloc #%lu\n",
-            i + 1, sn->size, sn->file, sn->line, sn->alloc_num);
-        /* 内联栈帧输出（锁已释放，只访问快照） */
+        /* 改进 ?:0 显示：LD_PRELOAD 模式提示无源码位置 */
+        if (sn->line == 0 && sn->file[0] == '?')
+            fprintf(fp,
+                "  Leak #%-3zu | %-6zu bytes | (LD_PRELOAD) | alloc #%lu\n",
+                i + 1, sn->size, sn->alloc_num);
+        else
+            fprintf(fp,
+                "  Leak #%-3zu | %-6zu bytes | %s:%d | alloc #%lu\n",
+                i + 1, sn->size, sn->file, sn->line, sn->alloc_num);
+        /* 内联栈帧输出（锁已释放，只访问快照）
+         * 统一格式: #N 函数+偏移 (库名) */
         if (sn->stack_frames > 0) {
             fprintf(fp, "    Call stack:\n");
             for (int j = 0; j < sn->stack_frames; j++) {
+                void* frame_addr = sn->stack[j];
+                char   func_name[256] = {0};
+                const char* lib_name = "??";
+                ptrdiff_t   func_off = 0;
+                ptrdiff_t   file_off = 0;
+
                 Dl_info info;
-                if (dladdr(sn->stack[j], &info) && info.dli_sname) {
+                if (dladdr(frame_addr, &info)) {
                     const char* fname = info.dli_fname ? info.dli_fname : "??";
                     const char* base = strrchr(fname, '/');
                     if (base) fname = base + 1;
-                    ptrdiff_t offset = (char*)sn->stack[j] - (char*)info.dli_saddr;
-                    if (offset > 0)
-                        fprintf(fp, "      #%-2d %s+%#tx (%s)\n",
-                                j, info.dli_sname, offset, fname);
-                    else
-                        fprintf(fp, "      #%-2d %s (%s)\n",
-                                j, info.dli_sname, fname);
+                    lib_name = fname;
+                    file_off = (char*)frame_addr - (char*)info.dli_fbase;
+
+                    if (info.dli_sname) {
+                        size_t nlen = strlen(info.dli_sname);
+                        if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
+                        memcpy(func_name, info.dli_sname, nlen);
+                        func_off = (char*)frame_addr - (char*)info.dli_saddr;
+                        if (func_off < 0) func_off = 0;
+                    } else {
+                        /* 无符号名，用 backtrace_symbols 提取 */
+                        char** syms = backtrace_symbols(&frame_addr, 1);
+                        if (syms && syms[0]) {
+                            char* paren = strchr(syms[0], '(');
+                            char* plus  = strchr(syms[0], '+');
+                            if (paren && plus && plus > paren) {
+                                size_t nlen = (size_t)(plus - paren - 1);
+                                if (nlen > 0 && nlen < sizeof(func_name))
+                                    memcpy(func_name, paren + 1, nlen);
+                            }
+                            free(syms);
+                        }
+                        if (!func_name[0]) {
+                            size_t llen = strlen(lib_name);
+                            if (llen >= sizeof(func_name)) llen = sizeof(func_name) - 1;
+                            memcpy(func_name, lib_name, llen);
+                        }
+                        func_off = file_off;
+                    }
                 } else {
-                    char** syms = backtrace_symbols(&sn->stack[j], 1);
+                    /* dladdr 失败，从 backtrace_symbols 解析 */
+                    char** syms = backtrace_symbols(&frame_addr, 1);
                     if (syms && syms[0]) {
-                        fprintf(fp, "      #%-2d %s\n", j, syms[0]);
+                        char* paren = strchr(syms[0], '(');
+                        char* plus  = paren ? strchr(paren, '+') : NULL;
+                        char* rparen = paren ? strchr(paren, ')') : NULL;
+                        if (paren && plus && rparen && plus > paren && plus < rparen) {
+                            size_t nlen = (size_t)(plus - paren - 1);
+                            if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
+                            memcpy(func_name, paren + 1, nlen);
+                            func_off = (ptrdiff_t)strtoul(plus + 1, NULL, 16);
+                            const char* pstart = syms[0];
+                            const char* pslash = pstart;
+                            for (const char* s = pstart; s < paren; s++)
+                                if (*s == '/') pslash = s + 1;
+                            if (pslash < paren) lib_name = pslash;
+                        } else if (paren && rparen && rparen > paren + 1) {
+                            size_t nlen = (size_t)(rparen - paren - 1);
+                            if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
+                            memcpy(func_name, paren + 1, nlen);
+                        } else {
+                            size_t slen = strlen(syms[0]);
+                            if (slen >= sizeof(func_name)) slen = sizeof(func_name) - 1;
+                            memcpy(func_name, syms[0], slen);
+                        }
                         free(syms);
                     } else {
-                        fprintf(fp, "      #%-2d %p\n", j, sn->stack[j]);
+                        snprintf(func_name, sizeof(func_name), "%p", frame_addr);
                     }
                 }
+
+                fprintf(fp, "      #%-2d %s+%#tx (%s)\n",
+                        j, func_name, func_off, lib_name);
             }
         }
         fprintf(fp, "\n");

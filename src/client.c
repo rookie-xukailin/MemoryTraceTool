@@ -64,70 +64,113 @@ static int send_all(int fd, const void* buf, size_t len)
 /**
  * 使用 dladdr 将栈帧地址解析为人类可读的符号名称。
  *
- * 格式: "显示名|二进制路径|文件偏移"
+ * 统一输出格式: "函数+偏移 (库名)|二进制路径|文件偏移"
+ * 三项组件始终齐全——函数名、偏移量、库名缺一不可。
  */
 static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
 {
+    char        func_name[256] = {0};
+    const char* lib_name = "??";
+    const char* bin_path = "";
+    ptrdiff_t   func_off = 0;
+    ptrdiff_t   file_off = 0;
+
     Dl_info info;
     if (dladdr(addr, &info)) {
-        const char* fullpath = info.dli_fname ? info.dli_fname : "??";
-        const char* basename = strrchr(fullpath, '/');
-        if (basename) basename++; else basename = fullpath;
-
-        /* 计算文件内偏移（运行时地址 - 加载基地址） */
-        ptrdiff_t file_off = (char*)addr - (char*)info.dli_fbase;
+        bin_path = info.dli_fname ? info.dli_fname : "??";
+        /* 提取库/可执行文件基础名 */
+        const char* slash = strrchr(bin_path, '/');
+        lib_name = slash ? slash + 1 : bin_path;
+        /* 文件内偏移（运行时地址 - 加载基地址） */
+        file_off = (char*)addr - (char*)info.dli_fbase;
 
         if (info.dli_sname) {
-            /* 有符号名：计算函数内偏移 */
-            ptrdiff_t func_off = (char*)addr - (char*)info.dli_saddr;
-            if (func_off > 0)
-                snprintf(out, out_size, "%s+%#tx (%s)|%s|%#tx",
-                         info.dli_sname, func_off, basename, fullpath, file_off);
-            else
-                snprintf(out, out_size, "%s (%s)|%s|%#tx",
-                         info.dli_sname, basename, fullpath, file_off);
+            /* dladdr 提供符号名：计算函数内偏移，负值钳位为 0 */
+            size_t nlen = strlen(info.dli_sname);
+            if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
+            memcpy(func_name, info.dli_sname, nlen);
+            func_name[nlen] = '\0';
+            func_off = (char*)addr - (char*)info.dli_saddr;
+            if (func_off < 0) func_off = 0;
         } else {
-            /* 无符号名但有文件信息，尝试 backtrace_symbols 补充符号名 */
-            char* fallback = NULL;
+            /* 无符号名，尝试 backtrace_symbols 提取函数名 */
             char** syms = backtrace_symbols(&addr, 1);
             if (syms && syms[0]) {
                 char* paren = strchr(syms[0], '(');
                 char* plus  = strchr(syms[0], '+');
                 if (paren && plus && plus > paren) {
-                    size_t name_len = (size_t)(plus - paren - 1);
-                    if (name_len > 0 && name_len < 256) {
-                        fallback = raw_malloc(name_len + 1);
-                        if (fallback) {
-                            memcpy(fallback, paren + 1, name_len);
-                            fallback[name_len] = '\0';
-                        }
+                    size_t nlen = (size_t)(plus - paren - 1);
+                    if (nlen > 0 && nlen < sizeof(func_name)) {
+                        memcpy(func_name, paren + 1, nlen);
+                        func_name[nlen] = '\0';
                     }
                 }
-                if (fallback) {
-                    snprintf(out, out_size, "%s+%#tx (%s)|%s|%#tx",
-                             fallback, file_off, basename, fullpath, file_off);
-                    raw_free(fallback);
-                } else {
-                    snprintf(out, out_size, "%s(+%#tx)|%s|%#tx",
-                             basename, file_off, fullpath, file_off);
-                }
-                /* 缺陷修复 #3: 使用 free() 释放 backtrace_symbols 返回的内存 */
                 free(syms);
-            } else {
-                snprintf(out, out_size, "%s(+%#tx)|%s|%#tx",
-                         basename, file_off, fullpath, file_off);
             }
+            /* 仍无符号名则用库名作为函数名 */
+            if (!func_name[0]) {
+                size_t llen = strlen(lib_name);
+                if (llen >= sizeof(func_name)) llen = sizeof(func_name) - 1;
+                memcpy(func_name, lib_name, llen);
+                func_name[llen] = '\0';
+            }
+            /* 无 dli_saddr 则用文件偏移近似函数偏移 */
+            func_off = file_off;
         }
     } else {
-        /* dladdr 完全失败，fallback 到 backtrace_symbols */
+        /* dladdr 失败，从 backtrace_symbols 解析 */
         char** syms = backtrace_symbols(&addr, 1);
         if (syms && syms[0]) {
-            snprintf(out, out_size, "%s||", syms[0]);
+            /* 格式: "path(func+offset) [addr]" 或 "path(func) [addr]" */
+            char* paren = strchr(syms[0], '(');
+            char* plus  = paren ? strchr(paren, '+') : NULL;
+            char* rparen = paren ? strchr(paren, ')') : NULL;
+
+            if (paren && plus && rparen && plus > paren && plus < rparen) {
+                /* 提取函数名 */
+                size_t nlen = (size_t)(plus - paren - 1);
+                if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
+                memcpy(func_name, paren + 1, nlen);
+                func_name[nlen] = '\0';
+                /* 提取偏移（十六进制） */
+                func_off = (ptrdiff_t)strtoul(plus + 1, NULL, 16);
+                /* 从路径提取库名（括号前，取最后 / 之后） */
+                const char* pstart = syms[0];
+                const char* pslash = pstart;
+                for (const char* s = pstart; s < paren; s++)
+                    if (*s == '/') pslash = s + 1;
+                lib_name = pslash;
+                if (lib_name == paren) lib_name = "??";
+            } else if (paren && rparen && rparen > paren + 1) {
+                /* 无偏移但有函数名: "path(func)" */
+                size_t nlen = (size_t)(rparen - paren - 1);
+                if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
+                memcpy(func_name, paren + 1, nlen);
+                func_name[nlen] = '\0';
+                func_off = 0;
+            } else {
+                /* 无法解析，用整个输出作为函数名 */
+                size_t slen = strlen(syms[0]);
+                if (slen >= sizeof(func_name)) slen = sizeof(func_name) - 1;
+                memcpy(func_name, syms[0], slen);
+                func_name[slen] = '\0';
+                func_off = 0;
+            }
             free(syms);
         } else {
-            snprintf(out, out_size, "%p||", addr);
+            /* 完全无法解析：显示为十六进制地址 */
+            snprintf(func_name, sizeof(func_name), "%p", addr);
+            func_off = 0;
         }
+        /* dladdr 失败时无库名和路径信息 */
+        lib_name = "??";
+        bin_path = "";
+        file_off = 0;
     }
+
+    /* 统一输出：三项组件始终齐全 */
+    snprintf(out, out_size, "%s+%#tx (%s)|%s|%#tx",
+             func_name, func_off, lib_name, bin_path, file_off);
 }
 
 /**
