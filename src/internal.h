@@ -33,6 +33,11 @@
 /* 分段锁数量：将 4096 个桶映射到 64 把锁上，大幅降低竞争 */
 #define MTT_LOCK_STRIPES        64
 
+/* 长期监控安全限制（24H+ 运行） */
+#define MTT_DAEMON_MAX_TOTAL_LEAKS  131072  /* 守护进程全局泄漏记录总数上限 */
+#define MTT_DAEMON_MEM_WARN_MB      512     /* 守护进程自身内存警告阈值 (MB) */
+#define MTT_INJECT_TIMEOUT_SEC      15      /* 注入操作超时（秒） */
+
 /* ---- 分配记录 ---- */
 
 /** 单次堆分配追踪记录（哈希桶链表节点） */

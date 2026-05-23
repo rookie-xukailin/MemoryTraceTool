@@ -15,7 +15,7 @@ LIB_OBJS = $(BUILD_DIR)/memorytracetool.o $(BUILD_DIR)/hooks.o $(BUILD_DIR)/clie
 SHARED_LIB = $(LIB_DIR)/libmemorytracetool.so
 STATIC_LIB = $(LIB_DIR)/libmemorytracetool.a
 
-.PHONY: all clean daemon demo demo_preload test run_daemon_demo run_demo_long_running stop_daemon
+.PHONY: all clean daemon demo demo_preload test run_daemon_demo run_demo_long_running stop_daemon injector demo_stealth_leak run_demo_stealth_leak
 
 all: $(SHARED_LIB) $(STATIC_LIB) daemon
 
@@ -38,11 +38,21 @@ $(BUILD_DIR)/hooks.o: $(SRC_DIR)/hooks.c $(SRC_DIR)/internal.h | $(BUILD_DIR)
 $(BUILD_DIR)/client.o: $(SRC_DIR)/client.c $(SRC_DIR)/internal.h $(SRC_DIR)/daemon.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC) -c -o $@ $<
 
-# Daemon binary (standalone, no fPIC)
+# Injector object (linked into daemon and standalone binary)
+$(BUILD_DIR)/injector.o: $(SRC_DIR)/injector.c $(SRC_DIR)/injector.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS_NOPIC) $(INC) -c -o $@ $<
+
+# Daemon binary (now links injector.o)
 daemon: $(BUILD_DIR)/mttd
 
-$(BUILD_DIR)/mttd: $(SRC_DIR)/daemon.c $(SRC_DIR)/daemon.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS_NOPIC) $(INC) -o $@ $< $(LDFLAGS)
+$(BUILD_DIR)/mttd: $(SRC_DIR)/daemon.c $(SRC_DIR)/daemon.h $(BUILD_DIR)/injector.o | $(BUILD_DIR)
+	$(CC) $(CFLAGS_NOPIC) $(INC) -o $@ $< $(BUILD_DIR)/injector.o $(LDFLAGS)
+
+# Standalone injector binary for testing
+$(BUILD_DIR)/mtt-inject: $(SRC_DIR)/injector.c $(SRC_DIR)/injector.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS_NOPIC) $(INC) -DINJECTOR_STANDALONE -o $@ $< $(LDFLAGS)
+
+injector: $(BUILD_DIR)/mtt-inject
 
 # Create directories
 $(BUILD_DIR):
@@ -74,6 +84,23 @@ demo_long_running: $(STATIC_LIB) examples/demo_long_running.c
 # Long-running server demo (LD_PRELOAD mode)
 demo_long_running_preload: $(SHARED_LIB) examples/demo_long_running_preload.c
 	$(CC) $(CFLAGS) -o $(BUILD_DIR)/demo_long_running_preload examples/demo_long_running_preload.c
+
+# Stealth leak demo (no MemoryTraceTool dependency - for runtime injection testing)
+demo_stealth_leak: examples/demo_stealth_leak.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $(BUILD_DIR)/demo_stealth_leak examples/demo_stealth_leak.c -lpthread
+
+# Run stealth leak demo with daemon
+run_demo_stealth_leak: daemon demo_stealth_leak
+	@echo "=== Starting daemon ==="
+	$(BUILD_DIR)/mttd 8080 &
+	@sleep 1
+	@echo "=== Starting stealth leak demo ==="
+	$(BUILD_DIR)/demo_stealth_leak &
+	@echo ""
+	@echo "=== Demo running! ==="
+	@echo "=== Open http://localhost:8080 ==="
+	@echo "=== Find demo_stealth_leak in the Injection panel and click 'Inject' ==="
+	@echo "=== make stop_daemon  to stop everything ==="
 
 # Run macro demo
 run_demo: demo
