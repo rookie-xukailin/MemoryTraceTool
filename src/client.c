@@ -183,6 +183,15 @@ static int connect_daemon(void)
  *
  * @param is_final  1=最终报告（发送BYE），0=中间报告
  */
+/* entry 快照：持锁期间拷贝字段，释放锁后安全访问，防止 UAF */
+typedef struct {
+    size_t size;
+    char   file[MTT_FILE_MAX];
+    int    line;
+    int    stack_frames;
+    void*  stack[MTT_STACK_DEPTH];
+} mtt_entry_snap_t;
+
 static void do_client_report(int is_final)
 {
     mtt_ensure_init();
@@ -191,10 +200,10 @@ static void do_client_report(int is_final)
     int fd = connect_daemon();
     if (fd < 0) return; /* 守护进程不可达，静默跳过 */
 
-    /* 收集所有泄漏记录（逐锁遍历，避免长时间持锁） */
+    /* 收集快照（逐锁遍历，持锁期间拷贝字段，避免 UAF） */
     int nleaks = 0;
-    mtt_entry_t** entries = raw_malloc(MTT_MAX_LEAKS_PER_PROC * sizeof(mtt_entry_t*));
-    if (!entries) {
+    mtt_entry_snap_t* snaps = raw_malloc(MTT_MAX_LEAKS_PER_PROC * sizeof(mtt_entry_snap_t));
+    if (!snaps) {
         pthread_mutex_lock(&g_sock_lock);
         shutdown(fd, SHUT_RDWR); close(fd); g_sock_fd = -1;
         pthread_mutex_unlock(&g_sock_lock);
@@ -208,27 +217,32 @@ static void do_client_report(int is_final)
              && nleaks < MTT_MAX_LEAKS_PER_PROC; b += MTT_LOCK_STRIPES) {
             mtt_entry_t* e = s->buckets[b];
             while (e && nleaks < MTT_MAX_LEAKS_PER_PROC) {
-                entries[nleaks++] = e;
+                mtt_entry_snap_t* sn = &snaps[nleaks++];
+                sn->size = e->size;
+                memcpy(sn->file, e->file, MTT_FILE_MAX);
+                sn->line = e->line;
+                sn->stack_frames = e->stack_frames;
+                memcpy(sn->stack, e->stack, sizeof(void*) * e->stack_frames);
                 e = e->next;
             }
         }
         pthread_mutex_unlock(&s->bucket_locks[lock_idx]);
     }
 
-    /* 序列化并发送每条泄漏 */
+    /* 序列化并发送每条泄漏（锁已释放，只访问快照） */
     for (int i = 0; i < nleaks; i++) {
-        mtt_entry_t* e = entries[i];
+        mtt_entry_snap_t* sn = &snaps[i];
 
         char line[4096];
         int n = snprintf(line, sizeof(line),
-            "LEAK %zu %s %d %d\n", e->size, e->file, e->line, e->stack_frames);
+            "LEAK %zu %s %d %d\n", sn->size, sn->file, sn->line, sn->stack_frames);
         if (n > 0 && n < (int)sizeof(line))
             send_all(fd, line, (size_t)n);
 
         /* 解析调用栈帧地址为可读符号 */
-        for (int j = 0; j < e->stack_frames; j++) {
+        for (int j = 0; j < sn->stack_frames; j++) {
             char resolved[MTT_SYMBOL_MAX];
-            resolve_frame_symbol(e->stack[j], resolved, sizeof(resolved));
+            resolve_frame_symbol(sn->stack[j], resolved, sizeof(resolved));
             n = snprintf(line, sizeof(line), "FRAME %d %s\n", j, resolved);
             if (n > 0 && n < (int)sizeof(line))
                 send_all(fd, line, (size_t)n);
@@ -247,7 +261,7 @@ static void do_client_report(int is_final)
     g_sock_fd = -1;
     pthread_mutex_unlock(&g_sock_lock);
 
-    raw_free(entries);
+    raw_free(snaps);
 }
 
 /**

@@ -728,44 +728,23 @@ char* mtt_strdup(const char* s, const char* file, int line)
 /**
  * 输出调用栈符号到 FILE 流。
  */
-static void print_stack_trace(mtt_entry_t* e, FILE* fp)
-{
-    if (e->stack_frames <= 0) return;
-
-    fprintf(fp, "    Call stack:\n");
-    for (int i = 0; i < e->stack_frames; i++) {
-        Dl_info info;
-        if (dladdr(e->stack[i], &info) && info.dli_sname) {
-            const char* fname = info.dli_fname ? info.dli_fname : "??";
-            const char* base = strrchr(fname, '/');
-            if (base) fname = base + 1;
-            ptrdiff_t offset = (char*)e->stack[i] - (char*)info.dli_saddr;
-            if (offset > 0)
-                fprintf(fp, "      #%-2d %s+%#tx (%s)\n",
-                        i, info.dli_sname, offset, fname);
-            else
-                fprintf(fp, "      #%-2d %s (%s)\n",
-                        i, info.dli_sname, fname);
-        } else {
-            /* dladdr 失败，回退到 backtrace_symbols */
-            char** syms = backtrace_symbols(&e->stack[i], 1);
-            if (syms && syms[0]) {
-                fprintf(fp, "      #%-2d %s\n", i, syms[0]);
-                free(syms);
-            } else {
-                fprintf(fp, "      #%-2d %p\n", i, e->stack[i]);
-            }
-        }
-    }
-}
-
 /** qsort 比较函数：按泄漏大小降序排列 */
+/* entry 快照：持锁期间拷贝字段，释放锁后安全访问，防止 UAF */
+typedef struct {
+    size_t size;
+    char   file[MTT_FILE_MAX];
+    int    line;
+    unsigned long alloc_num;
+    int    stack_frames;
+    void*  stack[MTT_STACK_DEPTH];
+} mtt_entry_snap_t;
+
 static int entry_size_cmp(const void* a, const void* b)
 {
-    const mtt_entry_t* ea = *(const mtt_entry_t**)a;
-    const mtt_entry_t* eb = *(const mtt_entry_t**)b;
-    if (ea->size > eb->size) return -1;
-    if (ea->size < eb->size) return  1;
+    const mtt_entry_snap_t* sa = (const mtt_entry_snap_t*)a;
+    const mtt_entry_snap_t* sb = (const mtt_entry_snap_t*)b;
+    if (sa->size > sb->size) return -1;
+    if (sa->size < sb->size) return  1;
     return 0;
 }
 
@@ -804,9 +783,9 @@ void mtt_report_to_fd(int fd)
         return;
     }
 
-    /* 收集所有泄漏记录到数组，用于排序（逐桶加锁，减少竞争） */
-    mtt_entry_t** entries = raw_malloc(count * sizeof(mtt_entry_t*));
-    if (!entries) { fclose(fp); return; }
+    /* 收集快照到数组（持锁期间拷贝字段，避免 UAF） */
+    mtt_entry_snap_t* snaps = raw_malloc(count * sizeof(mtt_entry_snap_t));
+    if (!snaps) { fclose(fp); return; }
 
     size_t idx = 0;
     /* 缺陷修复 #26: 逐锁遍历（0..63），每个锁一次覆盖所有映射到它的桶，
@@ -818,7 +797,13 @@ void mtt_report_to_fd(int fd)
              b += MTT_LOCK_STRIPES) {
             mtt_entry_t* e = s->buckets[b];
             while (e && idx < count) {
-                entries[idx++] = e;
+                mtt_entry_snap_t* sn = &snaps[idx++];
+                sn->size = e->size;
+                memcpy(sn->file, e->file, MTT_FILE_MAX);
+                sn->line = e->line;
+                sn->alloc_num = e->alloc_num;
+                sn->stack_frames = e->stack_frames;
+                memcpy(sn->stack, e->stack, sizeof(void*) * e->stack_frames);
                 e = e->next;
             }
         }
@@ -826,7 +811,7 @@ void mtt_report_to_fd(int fd)
     }
     count = idx;
 
-    qsort(entries, count, sizeof(mtt_entry_t*), entry_size_cmp);
+    qsort(snaps, count, sizeof(mtt_entry_snap_t), entry_size_cmp);
 
     fprintf(fp,
         "\n"
@@ -844,16 +829,42 @@ void mtt_report_to_fd(int fd)
         (double)atomic_load(&s->total_bytes) / 1024.0);
 
     for (size_t i = 0; i < count; i++) {
-        mtt_entry_t* e = entries[i];
+        mtt_entry_snap_t* sn = &snaps[i];
         fprintf(fp,
             "  Leak #%-3zu | %-6zu bytes | %s:%d | alloc #%lu\n",
-            i + 1, e->size, e->file, e->line, e->alloc_num);
-        print_stack_trace(e, fp);
+            i + 1, sn->size, sn->file, sn->line, sn->alloc_num);
+        /* 内联栈帧输出（锁已释放，只访问快照） */
+        if (sn->stack_frames > 0) {
+            fprintf(fp, "    Call stack:\n");
+            for (int j = 0; j < sn->stack_frames; j++) {
+                Dl_info info;
+                if (dladdr(sn->stack[j], &info) && info.dli_sname) {
+                    const char* fname = info.dli_fname ? info.dli_fname : "??";
+                    const char* base = strrchr(fname, '/');
+                    if (base) fname = base + 1;
+                    ptrdiff_t offset = (char*)sn->stack[j] - (char*)info.dli_saddr;
+                    if (offset > 0)
+                        fprintf(fp, "      #%-2d %s+%#tx (%s)\n",
+                                j, info.dli_sname, offset, fname);
+                    else
+                        fprintf(fp, "      #%-2d %s (%s)\n",
+                                j, info.dli_sname, fname);
+                } else {
+                    char** syms = backtrace_symbols(&sn->stack[j], 1);
+                    if (syms && syms[0]) {
+                        fprintf(fp, "      #%-2d %s\n", j, syms[0]);
+                        free(syms);
+                    } else {
+                        fprintf(fp, "      #%-2d %p\n", j, sn->stack[j]);
+                    }
+                }
+            }
+        }
         fprintf(fp, "\n");
     }
 
     fprintf(fp, "  ==========================================\n\n");
-    raw_free(entries);
+    raw_free(snaps);
     fclose(fp);
 }
 

@@ -418,7 +418,31 @@ static int patch_got_entries(pid_t pid, const char* exe_path,
     if (sym_off < 0) { free(dyns); free(phdrs); fclose(f); return -1; }
     long str_off = vaddr_to_file_off(phdrs, ehdr.e_phnum, strtab);
     if (str_off < 0) { free(dyns); free(phdrs); fclose(f); return -1; }
-    size_t sym_size = (size_t)(str_off - sym_off);
+    size_t sym_size = 0;
+    /* 从 section header 读取 .dynsym 的真实大小，避免依赖 .dynstr 紧邻布局的假设 */
+    {
+        Elf64_Shdr* shdrs = (Elf64_Shdr*)malloc(ehdr.e_shnum * sizeof(Elf64_Shdr));
+        if (shdrs) {
+            fseek(f, ehdr.e_shoff, SEEK_SET);
+            if (fread(shdrs, 1, ehdr.e_shnum * sizeof(Elf64_Shdr), f)
+                == ehdr.e_shnum * sizeof(Elf64_Shdr)) {
+                for (int i = 0; i < ehdr.e_shnum; i++) {
+                    if (shdrs[i].sh_type == SHT_DYNSYM) {
+                        sym_size = shdrs[i].sh_size;
+                        break;
+                    }
+                }
+            }
+            free(shdrs);
+        }
+    }
+    /* 回退: section header 不可用时用偏移差(带溢出保护) */
+    if (sym_size == 0) {
+        if (str_off > sym_off && (size_t)(str_off - sym_off) < 16 * 1024 * 1024)
+            sym_size = (size_t)(str_off - sym_off);
+        else
+            sym_size = 65536 * sizeof(Elf64_Sym);
+    }
 
     fseek(f, 0, SEEK_END);
     long file_sz = ftell(f);

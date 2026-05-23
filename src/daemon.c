@@ -1110,6 +1110,23 @@ static const char* g_dashboard_html =
 "        leakMap[key].total+=l.size;leakMap[key].count++;\n"
 "      }\n"
 "    }\n"
+"    /* 计算每条泄漏站点的速率 (delta bytes / delta time) */\n"
+"    var nowSec=Date.now()/1000;\n"
+"    var dt=nowSec-(gPrevLeakTime||nowSec);\n"
+"    if(dt<=0)dt=3;\n"
+"    var prevMap=gPrevLeakMap||{};\n"
+"    var keys=Object.keys(leakMap);\n"
+"    for(var ki=0;ki<keys.length;ki++){\n"
+"      var k=keys[ki],lk=leakMap[k];\n"
+"      var prev=prevMap[k]||0;\n"
+"      lk.rate=Math.max(0,(lk.total-prev))/dt;\n"
+"    }\n"
+"    gPrevLeakMap={};\n"
+"    for(var ki=0;ki<keys.length;ki++){\n"
+"      var k=keys[ki];\n"
+"      gPrevLeakMap[k]=leakMap[k].total;\n"
+"    }\n"
+"    gPrevLeakTime=nowSec;\n"
 "    gAllLeaks=Object.values(leakMap);\n"
 "    renderLeaks();\n"
 "    /* update detail panel if open */\n"
@@ -1136,7 +1153,7 @@ static const char* g_dashboard_html =
 "    arr=arr.filter(function(l){return (l.name&&l.name.toLowerCase().indexOf(filter)>=0)||(l.file&&l.file.toLowerCase().indexOf(filter)>=0)||String(l.pid).indexOf(filter)>=0});\n"
 "  }\n"
 "  /* compute rate per leak site: use per-pid rate scaled by count ratio */\n"
-"  if(gSortMode==='rate'){arr.sort(function(a,b){return b.total-a.total})}\n"
+"  if(gSortMode==='rate'){arr.sort(function(a,b){return b.rate-a.rate})}\n"
 "  else if(gSortMode==='count'){arr.sort(function(a,b){return b.count-a.count})}\n"
 "  else{arr.sort(function(a,b){return b.total-a.total})} /* bytes */\n"
 "\n"
@@ -1225,6 +1242,7 @@ static const char* g_dashboard_html =
 "function openDetail(pid){\n"
 "  gDetailPid=pid;\n"
 "  trailPaused=true;\n"
+"  chartZoom=1;chartPan=0;\n"
 "  document.getElementById('overlay').classList.add('show');\n"
 "  document.getElementById('detail').classList.add('show');\n"
 "  renderDetailBody(pid);\n"
@@ -1245,10 +1263,10 @@ static const char* g_dashboard_html =
 "  if(!gCachedProcs){document.getElementById('dtl-title').textContent='加载中...';return}\n"
 "  var proc=null;\n"
 "  for(var i=0;i<gCachedProcs.length;i++){if(gCachedProcs[i].pid===pid){proc=gCachedProcs[i];break}}\n"
-"  if(!proc){document.getElementById('dtl-title').textContent='PID '+pid+' (已退出)';return}\n"
+"  if(!proc){document.getElementById('dtl-title').textContent='PID '+pid+' (已退出)';document.getElementById('dtl-body').innerHTML='<div class=\"empty\">该进程已退出，无当前数据</div>';return}\n"
 "\n"
 "  document.getElementById('dtl-title').textContent=proc.name+' (PID '+pid+')';\n"
-"  var rate=proc.total_leaked>0&&gPrevTime>0?'+'+fmtBytes(proc.total_leaked)+'/轮':'--';\n"
+"  var rate=proc.total_leaked>0&&gPrevTime>0?'+'+fmtBytes(proc.total_leaked-(gPrevLeaked[proc.pid]||0))+'/轮':'--';\n"
 "\n"
 "  var body='<div class=\"detail-stats\">'+\n"
 "      '<div class=\"ds\"><div class=\"ds-val\">'+fmtBytes(proc.total_leaked)+'</div><div class=\"ds-label\">泄漏字节</div></div>'+\n"
@@ -1454,7 +1472,7 @@ static const char* g_dashboard_html =
 "    var d=new Date(vis[idx].t*1000);\n"
 "    var tw=ctx.measureText(d.toLocaleTimeString()+'  '+fmtBytes(vis[idx].bytes)).width;\n"
 "    ctx.fillStyle='rgba(17,22,34,.9)';ctx.fillRect(cx-tw/2-6,cy-16,tw+12,22);\n"
-"    ctx.fillStyle='var(--text)';ctx.font='11px var(--mono)';ctx.textAlign='center';\n"
+"    ctx.fillStyle='#e4e7ec';ctx.font=\"11px 'Courier New','Liberation Mono','Consolas',monospace\";ctx.textAlign='center';\n"
 "    ctx.fillText(d.toLocaleTimeString()+'  '+fmtBytes(vis[idx].bytes),cx,cy-2);\n"
 "  });\n"
 "})();\n"
@@ -1802,7 +1820,6 @@ static const char* default_lib_paths[] = {
 /** 解析出注入库的绝对路径（基于 /proc/self/exe 定位项目树中的 .so） */
 static int resolve_lib_path(char* out, size_t out_sz)
 {
-    (void)out_sz;
     /* 通过 /proc/self/exe 获取 mttd 自身路径，推导 ../lib/libmemorytracetool.so */
     char self_exe[512];
     ssize_t n = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
@@ -1813,13 +1830,25 @@ static int resolve_lib_path(char* out, size_t out_sz)
             *slash = '\0';                              /* self_exe 现在是 build/ 目录 */
             char rel[640];
             snprintf(rel, sizeof(rel), "%s/../lib/libmemorytracetool.so", self_exe);
-            if (realpath(rel, out)) return 0;
+            char* resolved = realpath(rel, NULL);
+            if (resolved) {
+                strncpy(out, resolved, out_sz - 1);
+                out[out_sz - 1] = '\0';
+                free(resolved);
+                return 0;
+            }
         }
     }
 
     /* 兜底：绝对路径安装 */
     for (int i = 0; default_lib_paths[i]; i++) {
-        if (realpath(default_lib_paths[i], out)) return 0;
+        char* resolved = realpath(default_lib_paths[i], NULL);
+        if (resolved) {
+            strncpy(out, resolved, out_sz - 1);
+            out[out_sz - 1] = '\0';
+            free(resolved);
+            return 0;
+        }
     }
     return -1;
 }
@@ -2031,10 +2060,13 @@ static void handle_api_inject(int fd, int pid)
         /* 检查是否已注入 */
         for (int i = 0; i < g_ninjected; i++) {
             if (g_injected[i].pid == pid && g_injected[i].inject_status == 1) {
+                char timebuf[64];
+                strftime(timebuf, sizeof(timebuf), "%c",
+                         localtime(&g_injected[i].inject_time));
                 snprintf(resp, sizeof(resp),
                     "{\"pid\":%d,\"status\":\"already_injected\","
                     "\"error\":\"Already injected at %s\"}",
-                    pid, ctime(&g_injected[i].inject_time));
+                    pid, timebuf);
                 valid = 0;
                 break;
             }
@@ -2054,8 +2086,6 @@ static void handle_api_inject(int fd, int pid)
             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
             "{\"pid\":%d,\"status\":\"fail\",\"error\":\"%s\"}", pid, err_msg);
         send_all(fd, resp, n);
-        shutdown(fd, SHUT_RDWR);
-        close(fd);
         return;
     }
     if (!valid) {
@@ -2068,8 +2098,6 @@ static void handle_api_inject(int fd, int pid)
             "Connection: close\r\n\r\n", n);
         send_all(fd, hdr, hdrlen);
         send_all(fd, resp, n);
-        shutdown(fd, SHUT_RDWR);
-        close(fd);
         return;
     }
 
@@ -2082,8 +2110,6 @@ static void handle_api_inject(int fd, int pid)
             "{\"pid\":%d,\"status\":\"fail\",\"error\":\"Cannot find libmemorytracetool.so\"}",
             pid);
         send_all(fd, resp, n);
-        shutdown(fd, SHUT_RDWR);
-        close(fd);
         return;
     }
 
@@ -2095,8 +2121,6 @@ static void handle_api_inject(int fd, int pid)
             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
             "{\"pid\":%d,\"status\":\"fail\",\"error\":\"pipe() failed\"}", pid);
         send_all(fd, resp, n);
-        shutdown(fd, SHUT_RDWR);
-        close(fd);
         return;
     }
 
@@ -2108,8 +2132,6 @@ static void handle_api_inject(int fd, int pid)
             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
             "{\"pid\":%d,\"status\":\"fail\",\"error\":\"fork() failed\"}", pid);
         send_all(fd, resp, n);
-        shutdown(fd, SHUT_RDWR);
-        close(fd);
         return;
     }
 
@@ -2148,8 +2170,6 @@ static void handle_api_inject(int fd, int pid)
             "{\"pid\":%d,\"status\":\"fail\",\"error\":\"Injector child failed\"}",
             pid);
         send_all(fd, resp, n);
-        shutdown(fd, SHUT_RDWR);
-        close(fd);
         return;
     }
 
@@ -2193,8 +2213,6 @@ static void handle_api_inject(int fd, int pid)
         "Connection: close\r\n\r\n", body_len);
     send_all(fd, hdr, hdrlen);
     send_all(fd, resp, body_len);
-    shutdown(fd, SHUT_RDWR);
-    close(fd);
 }
 
 /**
