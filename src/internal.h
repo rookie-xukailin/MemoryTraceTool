@@ -27,7 +27,7 @@
 #define MTT_MAX_ENTRIES         65536  /* 哈希表最大条目数 */
 
 /* 采样配置：高负载场景下默认每 256 次分配采样 1 次以降低开销 */
-#define MTT_SAMPLE_DEFAULT      256    /* 默认采样周期，0=全量追踪 */
+#define MTT_SAMPLE_DEFAULT      0      /* 默认全量追踪，0=全量追踪 */
 #define MTT_SAMPLE_MAX_PERIOD   1024   /* 最大采样周期 */
 
 /* 分段锁数量：将 4096 个桶映射到 64 把锁上，大幅降低竞争 */
