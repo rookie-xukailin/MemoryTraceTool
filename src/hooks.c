@@ -185,7 +185,10 @@ void* realloc(void* ptr, size_t size)
     mtt_entry_t* old = mtt_entry_find(s, ptr);
     size_t old_size = old ? old->size : malloc_usable_size(ptr);
     if (old) {
-        s->current_bytes -= old->size;
+        if (old->size <= s->current_bytes)
+            s->current_bytes -= old->size;
+        else
+            s->current_bytes = 0;
         s->free_count++;
         mtt_entry_remove(s, ptr);
     }
@@ -230,7 +233,10 @@ void free(void* ptr)
     mtt_stripe_lock(s, ptr);
     mtt_entry_t* e = mtt_entry_find(s, ptr);
     if (e) {
-        s->current_bytes -= e->size;
+        if (e->size <= s->current_bytes)
+            s->current_bytes -= e->size;
+        else
+            s->current_bytes = 0;
         s->free_count++;
         mtt_entry_remove(s, ptr);
     }

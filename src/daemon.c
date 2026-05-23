@@ -316,8 +316,10 @@ static void load_persisted(void)
         if (nread <= 0) { free(json); continue; }
         json[nread] = '\0';
 
-        /* 简易 JSON 解析：提取 pid/name/active */
+        /* 简易 JSON 解析：提取 pid/name/active/total_leaked/leak_count */
         int pid = 0;
+        size_t total_leaked = 0;
+        int leak_count = 0;
         char name[256] = {0};
         char* pp = json;
         char* pidp = strstr(pp, "\"pid\":");
@@ -331,6 +333,16 @@ static void load_persisted(void)
         }
         char* actp = strstr(pp, "\"active\":");
         int persisted_active = actp ? atoi(actp + 9) : 1;
+        char* tlp = strstr(pp, "\"total_leaked\":");
+        if (tlp) total_leaked = (size_t)atoll(tlp + 15);
+        /* 统计泄漏记录条数: 每个 "size": 字段对应一条记录 */
+        {
+            char* sp = pp;
+            while ((sp = strstr(sp, "\"size\":")) != NULL) {
+                leak_count++;
+                sp++;
+            }
+        }
 
         free(json);
 
@@ -350,11 +362,14 @@ static void load_persisted(void)
             p->pid = pid;
             snprintf(p->name, sizeof(p->name), "%s", name[0] ? name : "?");
             p->active = persisted_active; /* 使用持久化的状态 */
+            p->total_leaked = total_leaked; /* 恢复历史泄漏字节数 */
+            p->leak_count = leak_count;     /* 恢复历史泄漏记录条数 */
             p->last_seen = time(NULL);
-            p->leak_cap = 32;
-            p->leaks = malloc(p->leak_cap * sizeof(mttd_leak_t));
+            p->leak_cap = leak_count > 32 ? leak_count : 32;
+            p->leaks = malloc((size_t)p->leak_cap * sizeof(mttd_leak_t));
             pthread_mutex_init(&p->lock, NULL);
-            printf("[mttd] 已加载历史记录: PID %d (%s)\n", pid, name);
+            printf("[mttd] 已加载历史记录: PID %d (%s), 总计=%zu, 泄漏=%d 条\n",
+                   pid, name, total_leaked, leak_count);
         }
     }
     closedir(d);
@@ -465,11 +480,9 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
                 persist_proc(ctx->proc); /* 退出时确保持久化 */
             }
             *out_proc = ctx->proc;
-            shutdown(fd, SHUT_RDWR);
-            close(fd);
             ctx->bufpos = 0;
             ctx->proc = NULL;
-            return 0;
+            return -1; /* 通知调用者关闭 fd（由事件循环统一清理） */
         }
 
         line = nl + 1;
@@ -862,12 +875,12 @@ static const char* g_dashboard_html =
 "<aside class=\"sidebar\" id=\"sidebar\">\n"
 "  <div class=\"sb-brand\"><div class=\"sb-dot\" id=\"status-dot\"></div><span class=\"sb-text\">MemoryTraceTool</span></div>\n"
 "  <nav class=\"sb-nav\">\n"
-"    <div class=\"sb-item on\" data-panel=\"overview\" onclick=\"switchPanel('overview')\">\n"
-"      <svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"><rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\"/></svg>\n"
+"    <div class=\"sb-item on\" data-panel=\"overview\" onclick=\"switchPanel('overview')\" onkeydown=\"if(event.key==='Enter'||event.key===' ')switchPanel('overview')\" tabindex=\"0\" role=\"button\" aria-label=\"概览面板\">\n"
+"      <svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\"/></svg>\n"
 "      <span class=\"sb-label\">概览</span>\n"
 "    </div>\n"
-"    <div class=\"sb-item\" data-panel=\"ranking\" onclick=\"switchPanel('ranking')\">\n"
-"      <svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"><line x1=\"4\" y1=\"20\" x2=\"4\" y2=\"12\"/><line x1=\"10\" y1=\"20\" x2=\"10\" y2=\"7\"/><line x1=\"16\" y1=\"20\" x2=\"16\" y2=\"4\"/><line x1=\"2\" y1=\"20\" x2=\"22\" y2=\"20\"/></svg>\n"
+"    <div class=\"sb-item\" data-panel=\"ranking\" onclick=\"switchPanel('ranking')\" onkeydown=\"if(event.key==='Enter'||event.key===' ')switchPanel('ranking')\" tabindex=\"0\" role=\"button\" aria-label=\"泄漏排行面板\">\n"
+"      <svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><line x1=\"4\" y1=\"20\" x2=\"4\" y2=\"12\"/><line x1=\"10\" y1=\"20\" x2=\"10\" y2=\"7\"/><line x1=\"16\" y1=\"20\" x2=\"16\" y2=\"4\"/><line x1=\"2\" y1=\"20\" x2=\"22\" y2=\"20\"/></svg>\n"
 "      <span class=\"sb-label\">泄漏排行</span>\n"
 "    </div>\n"
 "  </nav>\n"
@@ -1072,12 +1085,20 @@ static const char* g_dashboard_html =
 "}\n"
 "\n"
 "/* ===== AUTO REFRESH ===== */\n"
+"/* periodic cleanup of exited-PID history and resolved frames cache */\n"
+"setInterval(function(){\n"
+"  var live=new Set();\n"
+"  if(gCachedProcs)for(var i=0;i<gCachedProcs.length;i++)live.add(gCachedProcs[i].pid);\n"
+"  for(var k in gHistory){if(!live.has(+k))delete gHistory[k]}\n"
+"  var rkeys=Object.keys(gResolvedFrames);\n"
+"  if(rkeys.length>300){var drop=rkeys.slice(0,rkeys.length-200);for(var di=0;di<drop.length;di++)delete gResolvedFrames[drop[di]]}\n"
+"},30000);\n"
 "setInterval(function(){if(autoRefresh){refresh();loadProcs()}},3000);\n"
 "setInterval(function(){\n"
 "  var stale=Math.round(Date.now()/1000-gLastUpdateTime);\n"
 "  var el=document.getElementById('stale');if(!el)return;\n"
 "  if(stale>60)el.style.color='var(--orange)';else el.style.color=stale>15?'#cc0':'var(--text3)';\n"
-"  el.textContent=autoRefresh?'':(stale>5?' (数据已过期 '+stale+'s)':'');\n"
+"  el.textContent=stale>5?(autoRefresh?' (自动刷新失败 ':' (数据已过期 ')+stale+'s)':'';\n"
 "},1000);\n"
 "refresh();\n"
 "\n"
@@ -1166,12 +1187,15 @@ static const char* g_dashboard_html =
 "    }\n"
 "    gPrevLeakTime=nowSec;\n"
 "    gAllLeaks=Object.values(leakMap);\n"
-"    renderLeaks();\n"
+"    /* 仅在泄漏排行面板可见时才触发 DOM 渲染，避免隐藏面板的无谓 layout */\n"
+"    var rankingPanel=document.getElementById('panel-ranking');\n"
+"    if(rankingPanel&&rankingPanel.style.display!=='none')renderLeaks();\n"
 "    /* update detail panel if open */\n"
 "    if(gDetailPid>0 && document.getElementById('detail').classList.contains('show')) renderDetailBody(gDetailPid);\n"
 "  }).catch(function(){\n"
 "    failCount++;document.getElementById('status-dot').classList.add('off');\n"
-"    if(failCount<=1)document.getElementById('conn-status').textContent='重试中...';\n"
+"    var txt='重试中...'+(failCount>1?' (x'+failCount+')':'');\n"
+"    document.getElementById('conn-status').textContent=txt;\n"
 "  });\n"
 "}\n"
 "\n"
@@ -1282,10 +1306,14 @@ static const char* g_dashboard_html =
 "\n"
 "function renderPager(){\n"
 "  var t=Math.max(1,Math.ceil(gAllProcs.length/gPageSize)),h='';\n"
-"  h+='<button class=\"pg\" '+(gProcPage<=1?'disabled':'')+' onclick=\"goPage('+(gProcPage-1)+')\">&laquo;</button>';\n"
-"  for(var i=1;i<=t&&i<=8;i++)h+='<button class=\"pg'+(i===gProcPage?' on':'')+'\" onclick=\"goPage('+i+')\">'+i+'</button>';\n"
-"  if(t>8)h+='<button class=\"pg\" onclick=\"goPage('+Math.max(9,t-3)+')\" title=\"跳转到后段\">...'+t+'</button>';\n"
-"  h+='<button class=\"pg\" '+(gProcPage>=t?'disabled':'')+' onclick=\"goPage('+(gProcPage+1)+')\">&raquo;</button>';\n"
+"  h+='<button class=\"pg\" role=\"button\" tabindex=\"0\" '+(gProcPage<=1?'disabled':'')+' onclick=\"goPage('+(gProcPage-1)+')\">&laquo;</button>';\n"
+"  /* show pages 1..8 plus ensure current page always visible */\n"
+"  var shown=Math.min(8,t),pg=gProcPage;\n"
+"  if(pg>8){shown=Math.min(pg+1,t);var start=Math.max(1,pg-6)}\n"
+"  else{var start=1}\n"
+"  for(var i=start;i<=shown;i++)h+='<button class=\"pg'+(i===pg?' on':'')+'\" onclick=\"goPage('+i+')\" role=\"button\" tabindex=\"0\">'+i+'</button>';\n"
+"  if(shown<t)h+='<button class=\"pg\" onclick=\"goPage('+Math.max(9,t-3)+')\" title=\"跳转到后段\" role=\"button\" tabindex=\"0\">...'+t+'</button>';\n"
+"  h+='<button class=\"pg\" role=\"button\" tabindex=\"0\" '+(gProcPage>=t?'disabled':'')+' onclick=\"goPage('+(gProcPage+1)+')\">&raquo;</button>';\n"
 "  document.getElementById('pg').innerHTML=h;\n"
 "}\n"
 "\n"
@@ -2257,6 +2285,17 @@ static void handle_api_inject(int fd, int pid)
         alarm(MTT_INJECT_TIMEOUT_SEC);
         inject_result_t r = inject_library(pid, lib_path);
         alarm(0);
+        /* alarm(0) 取消定时器但不清除已 pending 的 SIGALRM。
+           若 SIGALRM 恰好在 alarm(0) 之前被 pending，继续写管道
+           会在信号递送时被 SIGALRM 杀掉，导致父进程收到超时错误。
+           这里主动检查 pending 信号以避免该竞态。 */
+        {
+            sigset_t pending;
+            sigemptyset(&pending);
+            if (sigpending(&pending) == 0 && sigismember(&pending, SIGALRM)) {
+                _exit(1); /* 超时: alarm 恰好在取消前触发 */
+            }
+        }
         /* 通过管道将结果发回父进程 */
         ssize_t w = write(pipefd[1], &r, sizeof(r));
         (void)w;
@@ -2674,7 +2713,12 @@ int main(int argc, char** argv)
         /* 接受新的 HTTP 连接（短连接，一次请求-响应即关闭） */
         if (FD_ISSET(http_fd, &rfds)) {
             int cfd = accept(http_fd, NULL, NULL);
-            if (cfd >= 0) handle_http(cfd);
+            if (cfd >= 0) {
+                /* 设置发送超时（5 秒），防止慢客户端阻塞事件循环 */
+                struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+                setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                handle_http(cfd);
+            }
         }
 
         /* 处理 Unix 客户端的 I/O（协议解析） */
