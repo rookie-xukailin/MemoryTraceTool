@@ -38,6 +38,7 @@
 #include <dirent.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include "injector.h"
 #include "internal.h"
 
@@ -176,6 +177,8 @@ static mttd_proc_t* find_or_create_proc(int pid, const char* name)
     return p;
 }
 
+static void persist_proc(mttd_proc_t* p);
+
 /**
  * 向进程记录添加一条泄漏信息。
  *
@@ -209,6 +212,7 @@ static int add_leak(mttd_proc_t* p, mttd_leak_t* leak)
     p->leaks[p->leak_count++] = *leak;
     p->total_leaked += leak->size;
     atomic_fetch_add(&g_total_leaks_global, 1);
+    persist_proc(p);
     return 0;
 }
 
@@ -225,6 +229,146 @@ static void set_recv_timeout(int fd, int seconds)
 {
     struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
+/* ---- 持久化与存活检测 ---- */
+
+/** 获取持久化日志目录（优先 /var/log/mtt，fallback /tmp/mtt-logs） */
+static const char* get_log_dir(void)
+{
+    static char dir[256] = {0};
+    if (dir[0]) return dir;
+
+    const char* primary = MTT_LOG_DIR;
+    if (mkdir(primary, 0755) == 0 || access(primary, W_OK) == 0) {
+        snprintf(dir, sizeof(dir), "%s", primary);
+        return dir;
+    }
+    /* fallback */
+    const char* fb = "/tmp/mtt-logs";
+    mkdir(fb, 0755);
+    snprintf(dir, sizeof(dir), "%s", fb);
+    return dir;
+}
+
+/** 将进程泄漏数据序列化为 JSON 并写入持久化文件 */
+static void persist_proc(mttd_proc_t* p)
+{
+    const char* logdir = get_log_dir();
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%d.json", logdir, p->pid);
+
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+
+    fprintf(f, "{\"pid\":%d,\"name\":\"%s\",\"active\":%d,\"total_leaked\":%zu,"
+            "\"last_seen\":%ld,\"leaks\":[",
+            p->pid, p->name, p->active, p->total_leaked, (long)p->last_seen);
+
+    for (int i = 0; i < p->leak_count; i++) {
+        mttd_leak_t* l = &p->leaks[i];
+        fprintf(f, "%s{\"size\":%zu,\"file\":\"%s\",\"line\":%d,\"nframes\":%d,\"frames\":[",
+                i > 0 ? "," : "", l->size, l->file, l->line, l->nframes);
+        for (int j = 0; j < l->nframes; j++) {
+            fprintf(f, "%s\"", j > 0 ? "," : "");
+            /* 转义 JSON 特殊字符 */
+            for (char* s = l->frames[j]; *s; s++) {
+                if (*s == '"' || *s == '\\') fputc('\\', f);
+                fputc(*s, f);
+            }
+            fputc('"', f);
+        }
+        fprintf(f, "]}");
+    }
+    fprintf(f, "]}\n");
+    fclose(f);
+}
+
+/** 启动时从持久化目录加载历史记录 */
+static void load_persisted(void)
+{
+    const char* logdir = get_log_dir();
+    DIR* d = opendir(logdir);
+    if (!d) return;
+
+    struct dirent* de;
+    while ((de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", logdir, de->d_name);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz <= 0 || sz > 1048576) { fclose(f); continue; } /* 跳过空文件或 >1MB */
+
+        char* json = malloc((size_t)sz + 1);
+        if (!json) { fclose(f); continue; }
+        size_t nread = fread(json, 1, (size_t)sz, f);
+        fclose(f);
+        if (nread <= 0) { free(json); continue; }
+        json[nread] = '\0';
+
+        /* 简易 JSON 解析：提取 pid/name/active */
+        int pid = 0;
+        char name[256] = {0};
+        char* pp = json;
+        char* pidp = strstr(pp, "\"pid\":");
+        if (pidp) pid = atoi(pidp + 6);
+        char* namep = strstr(pp, "\"name\":\"");
+        if (namep) {
+            namep += 8;
+            int ni = 0;
+            while (*namep && *namep != '"' && ni < 254) name[ni++] = *namep++;
+            name[ni] = '\0';
+        }
+        char* actp = strstr(pp, "\"active\":");
+        int persisted_active = actp ? atoi(actp + 9) : 1;
+
+        free(json);
+
+        if (pid <= 1) continue;
+
+        /* 检查是否已有此 PID 的记录 */
+        int exists = 0;
+        for (int i = 0; i < g_nprocs; i++) {
+            if (g_procs[i].pid == pid) { exists = 1; break; }
+        }
+        if (exists) continue;
+
+        /* 创建记录（标记为非活跃，等待 HELLO 恢复） */
+        if (g_nprocs < MTT_MAX_PROCS) {
+            mttd_proc_t* p = &g_procs[g_nprocs++];
+            memset(p, 0, sizeof(*p));
+            p->pid = pid;
+            snprintf(p->name, sizeof(p->name), "%s", name[0] ? name : "?");
+            p->active = persisted_active; /* 使用持久化的状态 */
+            p->last_seen = time(NULL);
+            p->leak_cap = 32;
+            p->leaks = malloc(p->leak_cap * sizeof(mttd_leak_t));
+            pthread_mutex_init(&p->lock, NULL);
+            printf("[mttd] 已加载历史记录: PID %d (%s)\n", pid, name);
+        }
+    }
+    closedir(d);
+}
+
+/** 检查已监控进程是否仍然存活 */
+static void check_liveness(void)
+{
+    for (int i = 0; i < g_nprocs; i++) {
+        if (!g_procs[i].active) continue;
+        char proc_path[64];
+        snprintf(proc_path, sizeof(proc_path), "/proc/%d", g_procs[i].pid);
+        if (access(proc_path, F_OK) != 0) {
+            pthread_mutex_lock(&g_procs[i].lock);
+            g_procs[i].active = 0;
+            pthread_mutex_unlock(&g_procs[i].lock);
+            persist_proc(&g_procs[i]);
+        }
+    }
 }
 
 /* 每个 Unix 客户端的解析上下文（消除 static 变量冲突） */
@@ -353,55 +497,58 @@ static const char* g_dashboard_html =
 "<title>MemoryTraceTool - 内存泄漏监控</title>\n"
 "<style>\n"
 ":root {\n"
-"  --bg: #ffffff;\n"
-"  --bg-secondary: #f6f8fa;\n"
-"  --bg-tertiary: #f3f4f6;\n"
-"  --border: #d0d7de;\n"
-"  --border-light: #e8ecf0;\n"
-"  --text: #1f2328;\n"
-"  --text-secondary: #656d76;\n"
-"  --text-tertiary: #8b949e;\n"
-"  --accent: #0969da;\n"
-"  --accent-light: #ddf4ff;\n"
-"  --green: #1a7f37;\n"
-"  --green-bg: #dafbe1;\n"
-"  --green-border: #aceebb;\n"
-"  --red: #cf222e;\n"
-"  --red-bg: #ffebe9;\n"
-"  --red-border: #ffc1ba;\n"
-"  --orange: #9a6700;\n"
-"  --orange-bg: #fff8c5;\n"
-"  --purple: #8250df;\n"
-"  --shadow-sm: 0 1px 2px rgba(31,35,40,0.04);\n"
-"  --shadow-md: 0 3px 8px rgba(31,35,40,0.06);\n"
-"  --shadow-lg: 0 8px 24px rgba(31,35,40,0.08);\n"
+"  --bg: #0d1117;\n"
+"  --bg-card: #161b22;\n"
+"  --bg-hover: #1c2128;\n"
+"  --bg-raised: #21262d;\n"
+"  --border: #30363d;\n"
+"  --border-light: #21262d;\n"
+"  --text: #e6edf3;\n"
+"  --text-secondary: #8b949e;\n"
+"  --text-tertiary: #6e7681;\n"
+"  --accent: #58a6ff;\n"
+"  --accent-bg: rgba(88,166,255,0.1);\n"
+"  --green: #3fb950;\n"
+"  --green-bg: rgba(63,185,80,0.12);\n"
+"  --red: #f85149;\n"
+"  --red-bg: rgba(248,81,73,0.08);\n"
+"  --orange: #d29922;\n"
+"  --orange-bg: rgba(210,153,34,0.12);\n"
+"  --purple: #a371f7;\n"
+"  --purple-bg: rgba(163,113,247,0.1);\n"
+"  --shadow: 0 1px 3px rgba(0,0,0,0.3);\n"
+"  --shadow-lg: 0 4px 16px rgba(0,0,0,0.4);\n"
 "  --radius: 8px;\n"
 "  --radius-sm: 6px;\n"
-"  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;\n"
-"  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', ui-monospace, monospace;\n"
+"  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', 'Helvetica Neue', Arial, sans-serif;\n"
+"  --mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', ui-monospace, monospace;\n"
+"  --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);\n"
 "}\n"
 "* { margin: 0; padding: 0; box-sizing: border-box; }\n"
 "body {\n"
 "  font-family: var(--font);\n"
-"  background: var(--bg-secondary);\n"
+"  font-size: 14px;\n"
+"  background: var(--bg);\n"
 "  color: var(--text);\n"
 "  min-height: 100vh;\n"
 "  line-height: 1.5;\n"
 "  -webkit-font-smoothing: antialiased;\n"
+"  cursor: default;\n"
 "}\n"
-"/* ---- Navbar ---- */\n"
+"\n"
+"/* ==== Navbar ==== */\n"
 ".nav {\n"
-"  background: var(--bg);\n"
+"  background: var(--bg-card);\n"
 "  border-bottom: 1px solid var(--border);\n"
-"  padding: 0 24px;\n"
-"  height: 56px;\n"
+"  padding: 0 28px;\n"
+"  height: 52px;\n"
 "  display: flex;\n"
 "  align-items: center;\n"
 "  justify-content: space-between;\n"
 "  position: sticky;\n"
 "  top: 0;\n"
 "  z-index: 100;\n"
-"  box-shadow: var(--shadow-sm);\n"
+"  backdrop-filter: blur(8px);\n"
 "}\n"
 ".nav-brand {\n"
 "  display: flex;\n"
@@ -413,121 +560,125 @@ static const char* g_dashboard_html =
 "  letter-spacing: -.2px;\n"
 "}\n"
 ".nav-brand .logo {\n"
-"  width: 28px; height: 28px;\n"
-"  background: linear-gradient(135deg, var(--accent), #0550ae);\n"
-"  border-radius: 7px;\n"
+"  width: 26px; height: 26px;\n"
+"  background: linear-gradient(135deg, #58a6ff, #a371f7);\n"
+"  border-radius: 6px;\n"
 "  display: flex;\n"
 "  align-items: center;\n"
 "  justify-content: center;\n"
 "  color: #fff;\n"
-"  font-size: 14px;\n"
+"  font-size: 13px;\n"
 "  font-weight: 700;\n"
+"  position: relative;\n"
+"  overflow: hidden;\n"
 "}\n"
-".nav-actions {\n"
-"  display: flex;\n"
-"  align-items: center;\n"
-"  gap: 10px;\n"
+".nav-brand .logo::after {\n"
+"  content: '';\n"
+"  position: absolute;\n"
+"  width: 100%; height: 50%;\n"
+"  bottom: 0;\n"
+"  background: linear-gradient(to top, rgba(0,0,0,0.2), transparent);\n"
 "}\n"
+".nav-actions { display: flex; align-items: center; gap: 8px; }\n"
 ".nav-dot {\n"
 "  width: 7px; height: 7px;\n"
 "  border-radius: 50%;\n"
 "  background: var(--green);\n"
-"  box-shadow: 0 0 0 3px var(--green-bg);\n"
+"  box-shadow: 0 0 6px rgba(63,185,80,0.5);\n"
 "  transition: all .3s;\n"
 "}\n"
-".nav-dot.off {\n"
-"  background: var(--text-tertiary);\n"
-"  box-shadow: 0 0 0 3px var(--bg-secondary);\n"
-"}\n"
+".nav-dot.off { background: var(--text-tertiary); box-shadow: none; }\n"
 ".nav-age {\n"
 "  font-family: var(--mono);\n"
-"  font-size: 11px;\n"
+"  font-size: 12px;\n"
 "  color: var(--text-secondary);\n"
 "  margin-right: 4px;\n"
 "}\n"
 ".btn {\n"
-"  background: var(--bg);\n"
+"  background: var(--bg-raised);\n"
 "  border: 1px solid var(--border);\n"
 "  color: var(--text);\n"
-"  padding: 5px 14px;\n"
+"  padding: 6px 14px;\n"
 "  border-radius: var(--radius-sm);\n"
 "  cursor: pointer;\n"
-"  font-size: 12px;\n"
+"  font-size: 13px;\n"
 "  font-weight: 500;\n"
 "  font-family: var(--font);\n"
-"  transition: all .15s;\n"
+"  transition: all var(--transition);\n"
 "  white-space: nowrap;\n"
+"  position: relative;\n"
+"  overflow: hidden;\n"
 "}\n"
-".btn:hover { background: var(--bg-secondary); border-color: #b0b8c1; }\n"
-".btn:active { background: var(--bg-tertiary); }\n"
-".btn.paused { border-color: var(--orange); color: var(--orange); background: var(--orange-bg); }\n"
-".sort-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }\n"
-".sort-btn.active:hover { background: var(--accent); border-color: var(--accent); }\n"
-"/* ---- Layout ---- */\n"
-".container { max-width: 1280px; margin: 0 auto; padding: 24px; }\n"
-"/* ---- Summary cards ---- */\n"
+".btn:hover { background: var(--bg-hover); border-color: #484f58; }\n"
+".btn:active { transform: scale(0.97); }\n"
+".btn.paused { border-color: var(--orange); color: var(--orange); }\n"
+"\n"
+"/* ripple */\n"
+".ripple {\n"
+"  position: absolute;\n"
+"  border-radius: 50%;\n"
+"  background: rgba(255,255,255,0.15);\n"
+"  transform: scale(0);\n"
+"  animation: ripple-anim 0.6s ease-out;\n"
+"  pointer-events: none;\n"
+"}\n"
+"@keyframes ripple-anim { to { transform: scale(4); opacity: 0; } }\n"
+"\n"
+"/* ==== Container ==== */\n"
+".container { max-width: 1440px; margin: 0 auto; padding: 20px 28px; }\n"
+"\n"
+"/* ==== Summary ==== */\n"
 ".summary {\n"
 "  display: grid;\n"
-"  grid-template-columns: repeat(3, 1fr);\n"
-"  gap: 16px;\n"
-"  margin-bottom: 24px;\n"
+"  grid-template-columns: repeat(4, 1fr);\n"
+"  gap: 14px;\n"
+"  margin-bottom: 20px;\n"
 "}\n"
 ".card {\n"
-"  background: var(--bg);\n"
-"  border: 1px solid var(--border-light);\n"
+"  background: var(--bg-card);\n"
+"  border: 1px solid var(--border);\n"
 "  border-radius: var(--radius);\n"
-"  padding: 20px 24px;\n"
-"  box-shadow: var(--shadow-sm);\n"
-"  transition: box-shadow .2s, border-color .2s;\n"
+"  padding: 18px 22px;\n"
+"  transition: border-color var(--transition), box-shadow var(--transition);\n"
 "}\n"
-".card:hover { box-shadow: var(--shadow-md); border-color: var(--border); }\n"
-".card-label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .5px; font-weight: 600; margin-bottom: 6px; }\n"
-".card-value {\n"
-"  font-size: 32px;\n"
-"  font-weight: 700;\n"
-"  font-family: var(--mono);\n"
-"  letter-spacing: -1px;\n"
-"  line-height: 1.1;\n"
-"}\n"
+".card:hover { border-color: #484f58; box-shadow: var(--shadow-lg); }\n"
+".card-label { font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .5px; font-weight: 600; margin-bottom: 4px; }\n"
+".card-value { font-size: 28px; font-weight: 700; font-family: var(--mono); letter-spacing: -1px; line-height: 1.1; }\n"
 ".card-sub { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }\n"
 ".card-procs { border-left: 3px solid var(--accent); }\n"
-".card-leaks { border-left: 3px solid var(--orange); }\n"
-".card-bytes { border-left: 3px solid var(--red); }\n"
 ".card-procs .card-value { color: var(--accent); }\n"
+".card-leaks { border-left: 3px solid var(--orange); }\n"
 ".card-leaks .card-value { color: var(--orange); }\n"
+".card-bytes { border-left: 3px solid var(--red); }\n"
 ".card-bytes .card-value { color: var(--red); }\n"
-"/* ---- Section ---- */\n"
-".section { margin-bottom: 24px; }\n"
+".card-persist { border-left: 3px solid var(--purple); }\n"
+".card-persist .card-value { color: var(--purple); }\n"
+"\n"
+"/* ==== Section ==== */\n"
+".section { margin-bottom: 22px; }\n"
 ".section-head {\n"
 "  display: flex;\n"
 "  align-items: center;\n"
 "  gap: 8px;\n"
-"  margin-bottom: 12px;\n"
+"  margin-bottom: 10px;\n"
 "}\n"
-".section-head h2 {\n"
-"  font-size: 14px;\n"
-"  font-weight: 600;\n"
-"  color: var(--text);\n"
-"}\n"
-".section-head .count {\n"
-"  font-size: 12px;\n"
-"  color: var(--text-secondary);\n"
-"  font-weight: 400;\n"
-"}\n"
-"/* ---- Table ---- */\n"
+".section-head h2 { font-size: 14px; font-weight: 600; color: var(--text); }\n"
+".section-head .count { font-size: 12px; color: var(--text-secondary); font-weight: 400; }\n"
+".section-head svg { opacity: 0.7; }\n"
+"\n"
+"/* ==== Table ==== */\n"
 ".table-wrap {\n"
-"  background: var(--bg);\n"
-"  border: 1px solid var(--border-light);\n"
+"  background: var(--bg-card);\n"
+"  border: 1px solid var(--border);\n"
 "  border-radius: var(--radius);\n"
 "  overflow: hidden;\n"
-"  box-shadow: var(--shadow-sm);\n"
 "}\n"
 "table { width: 100%; border-collapse: collapse; }\n"
 "thead th {\n"
 "  text-align: left;\n"
 "  padding: 10px 16px;\n"
-"  background: var(--bg-secondary);\n"
-"  font-size: 11px;\n"
+"  background: var(--bg);\n"
+"  font-size: 12px;\n"
 "  font-weight: 600;\n"
 "  color: var(--text-secondary);\n"
 "  text-transform: uppercase;\n"
@@ -543,22 +694,23 @@ static const char* g_dashboard_html =
 "}\n"
 "tbody tr:last-child td { border-bottom: none; }\n"
 "tbody tr { transition: background .1s; }\n"
-"tbody tr:hover { background: var(--bg-secondary); }\n"
-"/* ---- Badges ---- */\n"
+"tbody tr:hover { background: var(--bg-hover); }\n"
+"\n"
+"/* ==== Badges ==== */\n"
 ".badge {\n"
 "  display: inline-flex;\n"
 "  align-items: center;\n"
-"  gap: 5px;\n"
+"  gap: 4px;\n"
 "  padding: 2px 10px;\n"
 "  border-radius: 12px;\n"
-"  font-size: 11px;\n"
+"  font-size: 12px;\n"
 "  font-weight: 600;\n"
 "  line-height: 1.6;\n"
 "}\n"
 ".badge-live {\n"
 "  background: var(--green-bg);\n"
 "  color: var(--green);\n"
-"  border: 1px solid var(--green-border);\n"
+"  border: 1px solid rgba(63,185,80,0.2);\n"
 "}\n"
 ".badge-live::before {\n"
 "  content: '';\n"
@@ -568,119 +720,127 @@ static const char* g_dashboard_html =
 "  animation: pulse 2s ease-in-out infinite;\n"
 "}\n"
 "@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }\n"
-".badge-done {\n"
-"  background: var(--bg-tertiary);\n"
-"  color: var(--text-secondary);\n"
-"}\n"
+".badge-done { background: var(--bg-raised); color: var(--text-secondary); }\n"
 ".hot-fn {\n"
 "  font-family: var(--mono);\n"
-"  font-size: 11px;\n"
+"  font-size: 12px;\n"
 "  color: var(--accent);\n"
-"  max-width: 300px;\n"
+"  max-width: 320px;\n"
 "  overflow: hidden;\n"
 "  text-overflow: ellipsis;\n"
 "  display: inline-block;\n"
 "}\n"
-"/* ---- Leak cards ---- */\n"
+".badge-ok { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px;\n"
+"  font-weight:500; background:var(--green-bg); color:var(--green); border:1px solid rgba(63,185,80,0.2); }\n"
+".badge-fail { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px;\n"
+"  font-weight:500; background:var(--red-bg); color:var(--red); border:1px solid rgba(248,81,73,0.2); }\n"
+".badge-pending { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px;\n"
+"  font-weight:500; background:var(--orange-bg); color:var(--orange); }\n"
+"\n"
+"/* ==== Leak cards (always expanded) ==== */\n"
 ".leak-card {\n"
-"  background: var(--bg);\n"
-"  border: 1px solid var(--border-light);\n"
-"  border-radius: var(--radius-sm);\n"
-"  margin-bottom: 6px;\n"
+"  background: var(--bg-card);\n"
+"  border: 1px solid var(--border);\n"
+"  border-radius: var(--radius);\n"
+"  margin-bottom: 10px;\n"
 "  overflow: hidden;\n"
-"  box-shadow: var(--shadow-sm);\n"
-"  transition: box-shadow .15s, border-color .15s;\n"
+"  transition: border-color var(--transition), box-shadow var(--transition);\n"
+"  position: relative;\n"
 "}\n"
-".leak-card:hover { border-color: var(--border); box-shadow: var(--shadow-md); }\n"
-".leak-card.open { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-light); }\n"
+".leak-card:hover { border-color: #484f58; box-shadow: var(--shadow-lg); }\n"
 ".leak-header {\n"
-"  padding: 12px 16px;\n"
-"  cursor: pointer;\n"
+"  padding: 12px 18px;\n"
 "  display: flex;\n"
 "  align-items: center;\n"
-"  gap: 12px;\n"
+"  gap: 14px;\n"
 "  font-size: 13px;\n"
-"  user-select: none;\n"
-"  transition: background .1s;\n"
+"  border-bottom: 1px solid var(--border-light);\n"
 "}\n"
-".leak-header:hover { background: var(--bg-secondary); }\n"
-".leak-header .arrow {\n"
-"  font-size: 10px;\n"
-"  color: var(--text-tertiary);\n"
-"  transition: transform .2s;\n"
-"  flex-shrink: 0;\n"
-"}\n"
-".leak-card.open .leak-header .arrow { transform: rotate(90deg); }\n"
 ".leak-header .sz {\n"
 "  color: var(--red);\n"
 "  font-weight: 600;\n"
 "  font-family: var(--mono);\n"
-"  font-size: 13px;\n"
+"  font-size: 14px;\n"
 "  white-space: nowrap;\n"
-"  min-width: 70px;\n"
+"  min-width: 80px;\n"
 "}\n"
 ".leak-header .loc {\n"
 "  color: var(--accent);\n"
 "  font-family: var(--mono);\n"
-"  font-size: 12px;\n"
+"  font-size: 13px;\n"
 "}\n"
 ".leak-header .proc-info {\n"
 "  color: var(--text-tertiary);\n"
-"  font-size: 11px;\n"
+"  font-size: 12px;\n"
 "  margin-left: auto;\n"
 "  white-space: nowrap;\n"
 "}\n"
-".leak-body { display: none; padding: 0 16px 16px; }\n"
-".leak-card.open .leak-body { display: block; }\n"
-".leak-body-divider {\n"
-"  border-top: 1px solid var(--border-light);\n"
-"  margin-bottom: 12px;\n"
-"}\n"
+"\n"
+"/* ==== Call tree (always visible) ==== */\n"
+".leak-body { padding: 0; }\n"
 ".call-tree {\n"
-"  padding: 4px 0 0 12px;\n"
-"  border-left: 2px solid var(--border-light);\n"
-"  margin-left: 8px;\n"
+"  padding: 4px 0 4px 0;\n"
+"  position: relative;\n"
+"}\n"
+"/* gradient connector line */\n"
+".call-tree::before {\n"
+"  content: '';\n"
+"  position: absolute;\n"
+"  left: 32px;\n"
+"  top: 12px;\n"
+"  bottom: 12px;\n"
+"  width: 2px;\n"
+"  background: linear-gradient(to bottom, #30363d 0%, #a371f7 20%, #58a6ff 60%, #f85149 100%);\n"
+"  border-radius: 1px;\n"
 "}\n"
 ".call-node {\n"
-"  padding: 5px 0 5px 16px;\n"
+"  padding: 9px 12px 9px 60px;\n"
 "  position: relative;\n"
 "  font-family: var(--mono);\n"
-"  font-size: 12px;\n"
+"  font-size: 13px;\n"
 "  line-height: 1.5;\n"
+"  transition: background 0.15s;\n"
 "}\n"
+"/* horizontal connector */\n"
 ".call-node::before {\n"
 "  content: '';\n"
 "  position: absolute;\n"
-"  left: 0; top: 50%;\n"
-"  width: 10px; height: 1.5px;\n"
+"  left: 32px; top: 50%;\n"
+"  width: 14px; height: 1.5px;\n"
 "  background: var(--border);\n"
 "  border-radius: 1px;\n"
 "}\n"
 ".call-node .fn { color: var(--text); font-weight: 500; }\n"
-".call-node .lib { color: var(--text-tertiary); font-size: 11px; margin-left: 4px; }\n"
+".call-node .lib { color: var(--text-tertiary); font-size: 12px; margin-left: 4px; }\n"
 ".call-node.entry .fn { color: var(--purple); font-weight: 600; }\n"
-".call-node.leak-site { font-weight: 600; }\n"
-".call-node.leak-site .fn { color: var(--red); font-weight: 700; }\n"
-".call-node[onclick]:hover { background: var(--accent-light); border-radius: 4px; cursor: pointer; }\n"
-".call-node .source-tip {\n"
-"  color: var(--green);\n"
-"  font-size: 11px;\n"
-"  margin-left: 6px;\n"
-"  font-weight: 500;\n"
+".call-node.leak-site {\n"
+"  background: var(--red-bg);\n"
+"  border-left: 2px solid var(--red);\n"
 "}\n"
-".call-node.leak-site .tag {\n"
+".call-node.leak-site::after {\n"
+"  content: '';\n"
+"  position: absolute;\n"
+"  left: 0; top: 0; bottom: 0;\n"
+"  width: 2px;\n"
+"  background: var(--red);\n"
+"}\n"
+".call-node.leak-site .fn { color: var(--red); font-weight: 700; }\n"
+".call-node .tag {\n"
 "  display: inline-block;\n"
 "  background: var(--red-bg);\n"
 "  color: var(--red);\n"
 "  font-size: 10px;\n"
-"  padding: 1px 6px;\n"
-"  border-radius: 3px;\n"
+"  padding: 1px 7px;\n"
+"  border-radius: 4px;\n"
 "  margin-left: 8px;\n"
 "  font-weight: 600;\n"
 "  letter-spacing: .3px;\n"
-"  border: 1px solid var(--red-border);\n"
+"  border: 1px solid rgba(248,81,73,0.25);\n"
 "}\n"
-"/* ---- Empty state ---- */\n"
+".call-node[onclick]:hover { background: var(--accent-bg); border-radius: 4px; cursor: pointer; }\n"
+".call-node .source-tip { color: var(--green); font-size: 12px; margin-left: 6px; font-weight: 500; }\n"
+"\n"
+"/* ==== Empty state ==== */\n"
 ".empty {\n"
 "  text-align: center;\n"
 "  padding: 48px 20px;\n"
@@ -688,48 +848,121 @@ static const char* g_dashboard_html =
 "  font-size: 13px;\n"
 "}\n"
 ".empty-icon { font-size: 28px; margin-bottom: 8px; opacity: .4; }\n"
-".empty p { margin-top: 4px; }\n"
-"/* ---- Toast ---- */\n"
+"\n"
+"/* ==== Toast ==== */\n"
 ".toast {\n"
 "  position: fixed;\n"
-"  bottom: 24px;\n"
-"  right: 24px;\n"
-"  background: var(--text);\n"
-"  color: #fff;\n"
-"  padding: 10px 20px;\n"
+"  bottom: 28px;\n"
+"  right: 28px;\n"
+"  background: var(--bg-raised);\n"
+"  color: var(--text);\n"
+"  padding: 10px 22px;\n"
 "  border-radius: var(--radius-sm);\n"
-"  font-size: 12px;\n"
+"  font-size: 13px;\n"
 "  font-weight: 500;\n"
 "  opacity: 0;\n"
 "  transform: translateY(8px);\n"
 "  transition: all .25s;\n"
 "  pointer-events: none;\n"
 "  z-index: 200;\n"
+"  border: 1px solid var(--border);\n"
 "  box-shadow: var(--shadow-lg);\n"
 "}\n"
 ".toast.show { opacity: 1; transform: translateY(0); }\n"
-"/* ---- Responsive ---- */\n"
-".inject-table { width:100%%; border-collapse:collapse; }\n"
-".inject-table th { text-align:left; font-size:11px; color:var(--text-secondary); "
-  "padding:6px 10px; border-bottom:1px solid var(--border-light); }\n"
-".inject-table td { padding:6px 10px; font-size:12px; border-bottom:1px solid var(--border-light); }\n"
-".btn-sm { padding:3px 10px; font-size:11px; border-radius:5px; border:1px solid var(--border); "
-  "background:var(--bg); color:var(--text); cursor:pointer; transition:all 0.15s; }\n"
+"\n"
+"/* ==== Footer art text ==== */\n"
+".footer-art {\n"
+"  position: fixed;\n"
+"  bottom: 8px;\n"
+"  left: 50%;\n"
+"  transform: translateX(-50%);\n"
+"  font-family: 'Brush Script MT', 'Comic Sans MS', cursive, 'Segoe Script', 'KaiTi', serif;\n"
+"  font-size: 15px;\n"
+"  color: rgba(139,148,158,0.15);\n"
+"  letter-spacing: 2px;\n"
+"  pointer-events: none;\n"
+"  z-index: 0;\n"
+"  transition: color 0.8s, text-shadow 0.8s;\n"
+"  user-select: none;\n"
+"}\n"
+".footer-art:hover {\n"
+"  color: rgba(139,148,158,0.5);\n"
+"  text-shadow: 0 0 12px rgba(163,113,247,0.3);\n"
+"}\n"
+"\n"
+"/* ==== Pagination ==== */\n"
+".pagination {\n"
+"  display: flex;\n"
+"  align-items: center;\n"
+"  justify-content: center;\n"
+"  gap: 4px;\n"
+"  margin-top: 12px;\n"
+"  padding: 4px 0;\n"
+"}\n"
+".page-btn {\n"
+"  background: var(--bg-card);\n"
+"  border: 1px solid var(--border);\n"
+"  color: var(--text-secondary);\n"
+"  padding: 4px 10px;\n"
+"  border-radius: 5px;\n"
+"  cursor: pointer;\n"
+"  font-size: 12px;\n"
+"  font-family: var(--font);\n"
+"  transition: all var(--transition);\n"
+"  min-width: 32px;\n"
+"  text-align: center;\n"
+"}\n"
+".page-btn:hover { background: var(--bg-hover); color: var(--text); }\n"
+".page-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }\n"
+".page-btn:disabled { opacity: 0.3; cursor: not-allowed; }\n"
+".page-info { font-size: 12px; color: var(--text-secondary); margin: 0 8px; }\n"
+"\n"
+"/* ==== Search & Filter Row ==== */\n"
+".controls-row {\n"
+"  display: flex;\n"
+"  gap: 10px;\n"
+"  align-items: center;\n"
+"  margin-bottom: 10px;\n"
+"  flex-wrap: wrap;\n"
+"}\n"
+".controls-row input[type=\"text\"] {\n"
+"  width: 260px;\n"
+"  padding: 6px 12px;\n"
+"  border: 1px solid var(--border);\n"
+"  border-radius: 6px;\n"
+"  font-size: 13px;\n"
+"  background: var(--bg-card);\n"
+"  color: var(--text);\n"
+"  font-family: var(--font);\n"
+"  transition: border-color var(--transition);\n"
+"}\n"
+".controls-row input[type=\"text\"]:focus {\n"
+"  outline: none;\n"
+"  border-color: var(--accent);\n"
+"  box-shadow: 0 0 0 2px rgba(88,166,255,0.15);\n"
+"}\n"
+".controls-row input[type=\"text\"]::placeholder { color: var(--text-tertiary); }\n"
+".sort-btn { font-size: 12px; padding: 4px 12px; }\n"
+".sort-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }\n"
+".sort-btn.active:hover { background: var(--accent); }\n"
+"\n"
+".inject-table { width:100%; border-collapse:collapse; }\n"
+".inject-table th { text-align:left; font-size:12px; color:var(--text-secondary);\n"
+"  padding:8px 12px; border-bottom:1px solid var(--border); }\n"
+".inject-table td { padding:8px 12px; font-size:13px; border-bottom:1px solid var(--border-light); }\n"
+".btn-sm { padding:4px 12px; font-size:12px; border-radius:5px; border:1px solid var(--border);\n"
+"  background:var(--bg-raised); color:var(--text); cursor:pointer; transition:all var(--transition);\n"
+"  position: relative; overflow: hidden; }\n"
 ".btn-sm:hover { background:var(--accent); color:#fff; border-color:var(--accent); }\n"
-".btn-sm:disabled { opacity:0.5; cursor:not-allowed; }\n"
-".badge-ok { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; "
-  "font-weight:500; background:var(--green-bg); color:var(--green); border:1px solid var(--green-border); }\n"
-".badge-fail { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; "
-  "font-weight:500; background:var(--red-bg); color:var(--red); border:1px solid var(--red-border); }\n"
-".badge-pending { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; "
-  "font-weight:500; background:var(--orange-bg); color:var(--orange); }\n"
+".btn-sm:disabled { opacity:0.4; cursor:not-allowed; }\n"
+"\n"
+"/* ==== Responsive ==== */\n"
+"@media (max-width: 1024px) { .summary { grid-template-columns: repeat(2, 1fr); } }\n"
 "@media (max-width: 768px) {\n"
 "  .summary { grid-template-columns: 1fr; }\n"
 "  .nav { padding: 0 14px; }\n"
-"  .container { padding: 16px; }\n"
-"  table { font-size: 11px; }\n"
-"  thead th, tbody td { padding: 8px 10px; }\n"
-"  .inject-table { font-size:10px; }\n"
+"  .container { padding: 14px; }\n"
+"  .controls-row { flex-direction: column; align-items: flex-start; }\n"
 "}\n"
 "</style>\n"
 "</head>\n"
@@ -744,7 +977,7 @@ static const char* g_dashboard_html =
 "    <span class=\"nav-age\" id=\"refresh-age\">--</span>\n"
 "    <div class=\"nav-dot\" id=\"status-dot\" title=\"连接状态\"></div>\n"
 "    <button class=\"btn\" id=\"btn-pause\" onclick=\"toggleAuto()\">暂停刷新</button>\n"
-"    <button class=\"btn\" onclick=\"refresh()\">立即刷新</button>\n"
+"    <button class=\"btn\" onclick=\"refresh();loadProcesses()\">立即刷新</button>\n"
 "  </div>\n"
 "</nav>\n"
 "\n"
@@ -752,7 +985,7 @@ static const char* g_dashboard_html =
 "\n"
 "  <div class=\"summary\">\n"
 "    <div class=\"card card-procs\">\n"
-"      <div class=\"card-label\">监控进程数</div>\n"
+"      <div class=\"card-label\">监控进程</div>\n"
 "      <div class=\"card-value\" id=\"p\">--</div>\n"
 "      <div class=\"card-sub\">当前活跃连接</div>\n"
 "    </div>\n"
@@ -762,100 +995,189 @@ static const char* g_dashboard_html =
 "      <div class=\"card-sub\">可疑内存泄漏点</div>\n"
 "    </div>\n"
 "    <div class=\"card card-bytes\">\n"
-"      <div class=\"card-label\">泄漏字节数</div>\n"
+"      <div class=\"card-label\">泄漏字节</div>\n"
 "      <div class=\"card-value\" id=\"b\">--</div>\n"
 "      <div class=\"card-sub\">累计未释放内存</div>\n"
+"    </div>\n"
+"    <div class=\"card card-persist\">\n"
+"      <div class=\"card-label\">持久化记录</div>\n"
+"      <div class=\"card-value\" id=\"h\">--</div>\n"
+"      <div class=\"card-sub\">已保存的历史进程</div>\n"
 "    </div>\n"
 "  </div>\n"
 "\n"
 "  <div class=\"section\">\n"
 "    <div class=\"section-head\">\n"
-"      <svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\"><circle cx=\"8\" cy=\"8\" r=\"5\" stroke=\"#0969da\" stroke-width=\"1.5\"/><line x1=\"8\" y1=\"5\" x2=\"8\" y2=\"11\" stroke=\"#0969da\" stroke-width=\"1.2\"/><line x1=\"5\" y1=\"8\" x2=\"11\" y2=\"8\" stroke=\"#0969da\" stroke-width=\"1.2\"/></svg>\n"
-"      <h2>运行时注入</h2>\n"
+"      <svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\"><circle cx=\"8\" cy=\"8\" r=\"5\" stroke=\"#58a6ff\" stroke-width=\"1.5\"/><line x1=\"8\" y1=\"5\" x2=\"8\" y2=\"11\" stroke=\"#58a6ff\" stroke-width=\"1.2\"/><line x1=\"5\" y1=\"8\" x2=\"11\" y2=\"8\" stroke=\"#58a6ff\" stroke-width=\"1.2\"/></svg>\n"
+"      <h2>可注入进程</h2>\n"
 "      <span class=\"count\" id=\"proc-count-inject\"></span>\n"
 "    </div>\n"
-"    <div style=\"margin-bottom:8px;\">\n"
-"      <input type=\"text\" id=\"proc-filter\" placeholder=\"搜索进程名...\" "
-"        oninput=\"loadProcesses()\" "
-"        style=\"width:240px;padding:5px 10px;border:1px solid var(--border);"
-"        border-radius:5px;font-size:12px;background:var(--bg);color:var(--text)\">\n"
-"      <span style=\"font-size:11px;color:var(--text-tertiary);margin-left:8px\">"
-"        选择一个正在运行的进程，点击「注入」开始监控其内存分配</span>\n"
+"    <div class=\"controls-row\">\n"
+"      <input type=\"text\" id=\"proc-filter\" placeholder=\"搜索进程名...\" oninput=\"loadProcesses()\">\n"
+"      <span style=\"font-size:12px;color:var(--text-tertiary)\">按堆内存从大到小排列</span>\n"
 "    </div>\n"
 "    <div class=\"table-wrap\">\n"
 "      <table class=\"inject-table\">\n"
 "        <thead>\n"
-"          <tr>\n"
-"            <th style=\"width:80px\">PID</th>\n"
-"            <th>进程名</th>\n"
-"            <th style=\"width:120px\">注入状态</th>\n"
-"            <th style=\"width:80px\">操作</th>\n"
-"          </tr>\n"
+"          <tr><th style=\"width:80px\">PID</th><th>进程名</th><th style=\"width:100px\">堆内存</th><th style=\"width:100px\">注入状态</th><th style=\"width:80px\">操作</th></tr>\n"
 "        </thead>\n"
-"        <tbody id=\"ptb\">\n"
-"          <tr><td colspan=\"4\"><div class=\"empty\"><p>加载中...</p></div></td></tr>\n"
-"        </tbody>\n"
+"        <tbody id=\"ptb\"><tr><td colspan=\"5\"><div class=\"empty\"><p>加载中...</p></div></td></tr></tbody>\n"
 "      </table>\n"
 "    </div>\n"
+"    <div class=\"pagination\" id=\"proc-pager\"></div>\n"
 "  </div>\n"
 "\n"
 "  <div class=\"section\">\n"
 "    <div class=\"section-head\">\n"
-"      <svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\"><rect x=\"1.5\" y=\"1.5\" width=\"13\" height=\"13\" rx=\"2\" stroke=\"#656d76\" stroke-width=\"1.5\"/><line x1=\"5\" y1=\"4.5\" x2=\"5\" y2=\"11.5\" stroke=\"#656d76\" stroke-width=\"1.2\"/><line x1=\"8\" y1=\"4.5\" x2=\"8\" y2=\"11.5\" stroke=\"#656d76\" stroke-width=\"1.2\"/><line x1=\"11\" y1=\"4.5\" x2=\"11\" y2=\"11.5\" stroke=\"#656d76\" stroke-width=\"1.2\"/></svg>\n"
+"      <svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\"><rect x=\"1.5\" y=\"1.5\" width=\"13\" height=\"13\" rx=\"2\" stroke=\"#8b949e\" stroke-width=\"1.5\"/><line x1=\"5\" y1=\"4.5\" x2=\"5\" y2=\"11.5\" stroke=\"#8b949e\" stroke-width=\"1.2\"/><line x1=\"8\" y1=\"4.5\" x2=\"8\" y2=\"11.5\" stroke=\"#8b949e\" stroke-width=\"1.2\"/><line x1=\"11\" y1=\"4.5\" x2=\"11\" y2=\"11.5\" stroke=\"#8b949e\" stroke-width=\"1.2\"/></svg>\n"
 "      <h2>被监控进程</h2>\n"
 "      <span class=\"count\" id=\"proc-count\"></span>\n"
 "    </div>\n"
 "    <div class=\"table-wrap\">\n"
 "      <table>\n"
 "        <thead>\n"
-"          <tr>\n"
-"            <th>PID</th>\n"
-"            <th>进程名</th>\n"
-"            <th>状态</th>\n"
-"            <th>泄漏数</th>\n"
-"            <th>字节数</th>\n"
-"            <th>最后活跃</th>\n"
-"            <th>热点函数</th>\n"
-"          </tr>\n"
+"          <tr><th>PID</th><th>进程名</th><th>状态</th><th>泄漏数</th><th>字节数</th><th>最后活跃</th><th>热点函数</th></tr>\n"
 "        </thead>\n"
-"        <tbody id=\"tb\">\n"
-"          <tr><td colspan=\"7\"><div class=\"empty\"><div class=\"empty-icon\">--</div><p>等待被监控进程接入...</p></div></td></tr>\n"
-"        </tbody>\n"
+"        <tbody id=\"tb\"><tr><td colspan=\"7\"><div class=\"empty\"><div class=\"empty-icon\">--</div><p>等待被监控进程接入...</p></div></td></tr></tbody>\n"
 "      </table>\n"
 "    </div>\n"
 "  </div>\n"
 "\n"
 "  <div class=\"section\">\n"
 "    <div class=\"section-head\">\n"
-"      <svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\"><circle cx=\"8\" cy=\"8\" r=\"5\" stroke=\"#cf222e\" stroke-width=\"1.5\"/><line x1=\"8\" y1=\"5.5\" x2=\"8\" y2=\"8.5\" stroke=\"#cf222e\" stroke-width=\"1.2\"/><circle cx=\"8\" cy=\"10.2\" r=\"0.8\" fill=\"#cf222e\"/></svg>\n"
+"      <svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\"><circle cx=\"8\" cy=\"8\" r=\"5\" stroke=\"#f85149\" stroke-width=\"1.5\"/><line x1=\"8\" y1=\"5.5\" x2=\"8\" y2=\"8.5\" stroke=\"#f85149\" stroke-width=\"1.2\"/><circle cx=\"8\" cy=\"10.2\" r=\"0.8\" fill=\"#f85149\"/></svg>\n"
 "      <h2>可疑泄漏排行</h2>\n"
 "      <span class=\"count\" id=\"leak-count\"></span>\n"
 "    </div>\n"
-"    <div style=\"margin-bottom:8px;display:flex;gap:8px;align-items:center;\">\n"
-"      <input type=\"text\" id=\"leak-filter\" placeholder=\"按进程名或 PID 过滤泄漏...\" "
-"        oninput=\"renderLeaks()\" "
-"        style=\"width:260px;padding:5px 10px;border:1px solid var(--border);"
-"        border-radius:5px;font-size:12px;background:var(--bg);color:var(--text)\">\n"
-"      <span style=\"font-size:11px;color:var(--text-tertiary);margin-left:4px\">排序:</span>\n"
+"    <div class=\"controls-row\" style=\"margin-bottom:10px;\">\n"
+"      <input type=\"text\" id=\"leak-filter\" placeholder=\"搜索泄漏 — 进程名 / PID / 文件名...\" oninput=\"renderLeaks()\">\n"
+"      <span style=\"font-size:12px;color:var(--text-tertiary);margin-left:4px\">排序:</span>\n"
 "      <button class=\"btn sort-btn active\" id=\"sort-size\" onclick=\"setSort('size')\">大小</button>\n"
 "      <button class=\"btn sort-btn\" id=\"sort-time\" onclick=\"setSort('time')\">最近</button>\n"
 "      <button class=\"btn sort-btn\" id=\"sort-proc\" onclick=\"setSort('proc')\">进程</button>\n"
 "    </div>\n"
-"    <div id=\"tl\"><div class=\"empty\"><div class=\"empty-icon\">OK</div><p>暂无泄漏 - 一切正常</p></div></div>\n"
+"    <div id=\"tl\"><div class=\"empty\"><div class=\"empty-icon\">OK</div><p>暂无泄漏 — 一切正常</p></div></div>\n"
 "  </div>\n"
 "\n"
 "</div>\n"
 "\n"
 "<div class=\"toast\" id=\"toast\"></div>\n"
+"<div class=\"footer-art\" id=\"footer-art\">王华是cos0</div>\n"
 "\n"
 "<script>\n"
 "var autoRefresh = true;\n"
 "var failCount = 0;\n"
 "var gAllLeaks = [];\n"
 "var gSortMode = 'size';\n"
+"var gProcPage = 1;\n"
+"var gProcPageSize = 15;\n"
+"var gAllProcs = [];\n"
 "\n"
+"/* ---- ripple effect ---- */\n"
+"document.addEventListener('click', function(e) {\n"
+"  var el = e.target.closest('.btn, .btn-sm, .page-btn');\n"
+"  if (!el) return;\n"
+"  var ripple = document.createElement('span');\n"
+"  ripple.className = 'ripple';\n"
+"  var rect = el.getBoundingClientRect();\n"
+"  var size = Math.max(rect.width, rect.height);\n"
+"  ripple.style.width = ripple.style.height = size + 'px';\n"
+"  ripple.style.left = (e.clientX - rect.left - size/2) + 'px';\n"
+"  ripple.style.top = (e.clientY - rect.top - size/2) + 'px';\n"
+"  el.appendChild(ripple);\n"
+"  setTimeout(function() { ripple.remove(); }, 600);\n"
+"});\n"
+"\n"
+"/* ---- footer art mouse tracking ---- */\n"
+"document.addEventListener('mousemove', function(e) {\n"
+"  var art = document.getElementById('footer-art');\n"
+"  var x = (e.clientX / window.innerWidth - 0.5) * 40;\n"
+"  art.style.transform = 'translateX(calc(-50% + ' + x + 'px))';\n"
+"});\n"
+"\n"
+"/* ---- auto-refresh ---- */\n"
 "setInterval(function() { if (autoRefresh) { refresh(); loadProcesses(); } }, 3000);\n"
 "refresh();\n"
+"\n"
+"function toggleAuto() {\n"
+"  autoRefresh = !autoRefresh;\n"
+"  var btn = document.getElementById('btn-pause');\n"
+"  var dot = document.getElementById('status-dot');\n"
+"  if (autoRefresh) {\n"
+"    btn.textContent = '暂停刷新';\n"
+"    btn.classList.remove('paused');\n"
+"    dot.classList.remove('off');\n"
+"    refresh();\n"
+"  } else {\n"
+"    btn.textContent = '恢复刷新';\n"
+"    btn.classList.add('paused');\n"
+"    dot.classList.add('off');\n"
+"    document.getElementById('refresh-age').textContent = '已暂停';\n"
+"  }\n"
+"  toast(autoRefresh ? '自动刷新已恢复' : '自动刷新已暂停');\n"
+"}\n"
+"\n"
+"function refresh() {\n"
+"  fetch('/api/data')\n"
+"    .then(function(r) { return r.json(); })\n"
+"    .then(function(d) {\n"
+"      failCount = 0;\n"
+"      document.getElementById('status-dot').classList.remove('off');\n"
+"      document.getElementById('refresh-age').textContent = new Date().toLocaleTimeString();\n"
+"\n"
+"      document.getElementById('p').textContent = d.nprocs;\n"
+"      document.getElementById('l').textContent = d.total_leaks;\n"
+"      document.getElementById('b').textContent = fmtBytes(d.total_bytes);\n"
+"      document.getElementById('h').textContent = d.nprocs;\n"
+"\n"
+"      var rows = '';\n"
+"      for (var i = 0; i < d.procs.length; i++) {\n"
+"        var p = d.procs[i];\n"
+"        var badge = p.active\n"
+"          ? '<span class=\"badge badge-live\">运行中</span>'\n"
+"          : '<span class=\"badge badge-done\">已退出</span>';\n"
+"        var seen = p.last_seen ? new Date(p.last_seen * 1000).toLocaleTimeString() : '--';\n"
+"        var topFn = parseTopFn(p.top_stack);\n"
+"        rows += '<tr>' +\n"
+"          '<td style=\"font-family:var(--mono);font-size:13px\">' + p.pid + '</td>' +\n"
+"          '<td>' + esc(p.name) + '</td>' +\n"
+"          '<td>' + badge + '</td>' +\n"
+"          '<td style=\"font-family:var(--mono);font-size:13px\">' + p.leak_count + '</td>' +\n"
+"          '<td style=\"font-family:var(--mono);font-size:13px\">' + fmtBytes(p.total_leaked) + '</td>' +\n"
+"          '<td style=\"font-size:12px;color:var(--text-secondary)\">' + seen + '</td>' +\n"
+"          '<td><span class=\"hot-fn\" title=\"' + escAttr(p.top_stack || '') + '\">' + esc(topFn) + '</span></td>' +\n"
+"          '</tr>';\n"
+"      }\n"
+"      document.getElementById('tb').innerHTML = rows ||\n"
+"        '<tr><td colspan=\"7\"><div class=\"empty\"><p>等待被监控进程接入...</p></div></td></tr>';\n"
+"      document.getElementById('proc-count').textContent = d.nprocs > 0 ? '(' + d.nprocs + ')' : '';\n"
+"\n"
+"      var seq = 0;\n"
+"      var all = [];\n"
+"      for (var i = 0; i < d.procs.length; i++) {\n"
+"        var p = d.procs[i];\n"
+"        for (var j = 0; j < p.leaks.length; j++) {\n"
+"          all.push({\n"
+"            size: p.leaks[j].size,\n"
+"            file: p.leaks[j].file,\n"
+"            line: p.leaks[j].line,\n"
+"            nframes: p.leaks[j].nframes,\n"
+"            frames: p.leaks[j].frames,\n"
+"            pid: p.pid,\n"
+"            name: p.name,\n"
+"            seq: seq++\n"
+"          });\n"
+"        }\n"
+"      }\n"
+"      gAllLeaks = all;\n"
+"      renderLeaks();\n"
+"    })\n"
+"    .catch(function() {\n"
+"      failCount++;\n"
+"      document.getElementById('status-dot').classList.add('off');\n"
+"      if (failCount <= 1) document.getElementById('refresh-age').textContent = '连接失败，重试中...';\n"
+"    });\n"
+"}\n"
 "\n"
 "function setSort(mode) {\n"
 "  gSortMode = mode;\n"
@@ -888,7 +1210,9 @@ static const char* g_dashboard_html =
 "    });\n"
 "  }\n"
 "\n"
-"  // 保存当前打开卡片状态（key=pid:file:line:size:idx）\n"
+"  var top = filtered.slice(0, 15);\n"
+"\n"
+"  // save open state\n"
 "  var openKeys = {};\n"
 "  var openCards = document.querySelectorAll('#tl .leak-card.open');\n"
 "  for (var k = 0; k < openCards.length; k++) {\n"
@@ -896,13 +1220,12 @@ static const char* g_dashboard_html =
 "    if (key) openKeys[key] = true;\n"
 "  }\n"
 "\n"
-"  var top = filtered.slice(0, 15);\n"
 "  var html = '';\n"
 "  for (var i = 0; i < top.length; i++) {\n"
 "    var l = top[i];\n"
 "    var leakKey = l.pid + ':' + l.file + ':' + l.line + ':' + l.size + ':' + i;\n"
 "\n"
-"    // 找到真正的泄漏帧: 从最内层(0)向外，跳过 libmemorytracetool.so 内部帧\n"
+"    // find real leak frame (skip internal libmemorytracetool frames)\n"
 "    var leakFrameIdx = 0;\n"
 "    if (l.nframes > 0) {\n"
 "      for (var j = 0; j < l.nframes; j++) {\n"
@@ -915,19 +1238,21 @@ static const char* g_dashboard_html =
 "      }\n"
 "    }\n"
 "\n"
-"    html += '<div class=\"leak-card\" data-leak-key=\"' + leakKey + '\" onclick=\"event.stopPropagation();this.classList.toggle(\\'open\\')\">';\n"
+"    // show max 10 frames\n"
+"    var maxFrames = Math.min(l.nframes, 10);\n"
+"\n"
+"    html += '<div class=\"leak-card open\" data-leak-key=\"' + leakKey + '\">';\n"
 "    html += '<div class=\"leak-header\">';\n"
-"    html += '<span class=\"arrow\">&#9654;</span>';\n"
 "    html += '<span class=\"sz\">' + fmtBytes(l.size) + '</span>';\n"
 "    html += '<span class=\"loc\">' + esc(l.file) + ':' + l.line + '</span>';\n"
 "    html += '<span class=\"proc-info\">PID ' + l.pid + ' &middot; ' + esc(l.name) + '</span>';\n"
 "    html += '</div>';\n"
-"    html += '<div class=\"leak-body\"><div class=\"leak-body-divider\"></div>';\n"
+"    html += '<div class=\"leak-body\">';\n"
 "    html += '<div class=\"call-tree\">';\n"
 "\n"
 "    if (l.nframes > 0) {\n"
-"      for (var j = l.nframes - 1; j >= 0; j--) {\n"
-"        var cls = j === leakFrameIdx ? 'call-node leak-site' : (j === l.nframes - 1 ? 'call-node entry' : 'call-node');\n"
+"      for (var j = maxFrames - 1; j >= 0; j--) {\n"
+"        var cls = j === leakFrameIdx ? 'call-node leak-site' : (j === maxFrames - 1 ? 'call-node entry' : 'call-node');\n"
 "        var parsed = parseFrame(l.frames[j] || '?');\n"
 "        html += '<div class=\"' + cls + '\"';\n"
 "        if (parsed.bin && parsed.off) html += ' onclick=\"event.stopPropagation();resolveFrame(this,\\'' + escAttr(parsed.bin) + '\\',\\'' + escAttr(parsed.off) + '\\')\" style=\"cursor:pointer\" title=\"点击解析源码位置\"';\n"
@@ -958,7 +1283,7 @@ static const char* g_dashboard_html =
 "    '<div class=\"empty\"><div class=\"empty-icon\">OK</div><p>' + (filter ? '无匹配泄漏' : '暂无泄漏 - 一切正常') + '</p></div>';\n"
 "  document.getElementById('leak-count').textContent = label;\n"
 "\n"
-"  // 恢复之前打开的卡片\n"
+"  // restore open state\n"
 "  var allCards = document.querySelectorAll('#tl .leak-card');\n"
 "  for (var k = 0; k < allCards.length; k++) {\n"
 "    var key = allCards[k].getAttribute('data-leak-key');\n"
@@ -966,128 +1291,75 @@ static const char* g_dashboard_html =
 "  }\n"
 "}\n"
 "\n"
-"function toggleAuto() {\n"
-"  autoRefresh = !autoRefresh;\n"
-"  var btn = document.getElementById('btn-pause');\n"
-"  var dot = document.getElementById('status-dot');\n"
-"  if (autoRefresh) {\n"
-"    btn.textContent = '暂停刷新';\n"
-"    btn.classList.remove('paused');\n"
-"    dot.classList.remove('off');\n"
-"    refresh();\n"
-"  } else {\n"
-"    btn.textContent = '恢复刷新';\n"
-"    btn.classList.add('paused');\n"
-"    dot.classList.add('off');\n"
-"    document.getElementById('refresh-age').textContent = '已暂停';\n"
-"  }\n"
-"  toast(autoRefresh ? '自动刷新已恢复' : '自动刷新已暂停');\n"
-"}\n"
-"\n"
-"function refresh() {\n"
-"  fetch('/api/data')\n"
-"    .then(function(r) { return r.json(); })\n"
-"    .then(function(d) {\n"
-"      failCount = 0;\n"
-"      document.getElementById('status-dot').classList.remove('off');\n"
-"      document.getElementById('refresh-age').textContent = new Date().toLocaleTimeString();\n"
-"\n"
-"      document.getElementById('p').textContent = d.nprocs;\n"
-"      document.getElementById('l').textContent = d.total_leaks;\n"
-"      document.getElementById('b').textContent = fmtBytes(d.total_bytes);\n"
-"\n"
-"      var rows = '';\n"
-"      for (var i = 0; i < d.procs.length; i++) {\n"
-"        var p = d.procs[i];\n"
-"        var badge = p.active\n"
-"          ? '<span class=\"badge badge-live\">运行中</span>'\n"
-"          : '<span class=\"badge badge-done\">已退出</span>';\n"
-"        var seen = p.last_seen ? new Date(p.last_seen * 1000).toLocaleTimeString() : '--';\n"
-"        var topFn = parseTopFn(p.top_stack);\n"
-"        rows += '<tr>' +\n"
-"          '<td style=\"font-family:var(--mono);font-size:12px\">' + p.pid + '</td>' +\n"
-"          '<td>' + esc(p.name) + '</td>' +\n"
-"          '<td>' + badge + '</td>' +\n"
-"          '<td style=\"font-family:var(--mono);font-size:12px\">' + p.leak_count + '</td>' +\n"
-"          '<td style=\"font-family:var(--mono);font-size:12px\">' + fmtBytes(p.total_leaked) + '</td>' +\n"
-"          '<td style=\"font-size:12px;color:var(--text-secondary)\">' + seen + '</td>' +\n"
-"          '<td><span class=\"hot-fn\" title=\"' + escAttr(p.top_stack || '') + '\">' + esc(topFn) + '</span></td>' +\n"
-"          '</tr>';\n"
-"      }\n"
-"      document.getElementById('tb').innerHTML = rows ||\n"
-"        '<tr><td colspan=\"7\"><div class=\"empty\"><div class=\"empty-icon\">--</div><p>等待被监控进程接入...</p></div></td></tr>';\n"
-"      document.getElementById('proc-count').textContent = d.nprocs > 0 ? '(' + d.nprocs + ')' : '';\n"
-"\n"
-"      var seq = 0;\n"
-"      var all = [];\n"
-"      for (var i = 0; i < d.procs.length; i++) {\n"
-"        var p = d.procs[i];\n"
-"        for (var j = 0; j < p.leaks.length; j++) {\n"
-"          all.push({\n"
-"            size: p.leaks[j].size,\n"
-"            file: p.leaks[j].file,\n"
-"            line: p.leaks[j].line,\n"
-"            nframes: p.leaks[j].nframes,\n"
-"            frames: p.leaks[j].frames,\n"
-"            pid: p.pid,\n"
-"            name: p.name,\n"
-"            seq: seq++\n"
-"          });\n"
-"        }\n"
-"      }\n"
-"      gAllLeaks = all;\n"
-"      renderLeaks();\n"
-"    })\n"
-"    .catch(function() {\n"
-"      failCount++;\n"
-"      document.getElementById('status-dot').classList.add('off');\n"
-"      if (failCount <= 1) {\n"
-"        document.getElementById('refresh-age').textContent = '连接失败，重试中...';\n"
-"      }\n"
-"    });\n"
-"}\n"
-"\n"
+"/* ---- Process list with pagination ---- */\n"
 "function loadProcesses() {\n"
 "  var filter = (document.getElementById('proc-filter').value || '').toLowerCase();\n"
 "  fetch('/api/processes')\n"
 "    .then(function(r) { return r.json(); })\n"
 "    .then(function(d) {\n"
-"      var rows = '';\n"
-"      var shown = 0;\n"
-"      for (var i = 0; i < d.processes.length; i++) {\n"
-"        var p = d.processes[i];\n"
-"        if (filter && p.name.toLowerCase().indexOf(filter) < 0) continue;\n"
-"        shown++;\n"
-"        var injHtml = '';\n"
-"        if (p.injected) {\n"
-"          if (p.inj_status === 1) {\n"
-"            injHtml = '<span class=\"badge-ok\">监控中</span>';\n"
-"          } else if (p.inj_status === 2) {\n"
-"            injHtml = '<span class=\"badge-fail\" title=\"' + escAttr(p.inj_err) + '\">失败</span>';\n"
-"          }\n"
-"        } else {\n"
-"          injHtml = '<span class=\"badge-pending\">未注入</span>';\n"
-"        }\n"
-"        var btnHtml = '';\n"
-"        if (p.injected && p.inj_status === 1) {\n"
-"          btnHtml = '<span class=\"badge-ok\">已注入</span>';\n"
-"        } else {\n"
-"          btnHtml = '<button class=\"btn-sm\" onclick=\"injectProcess(' + p.pid + ', this)\">注入</button>';\n"
-"        }\n"
-"        rows += '<tr>' +\n"
-"          '<td style=\"font-family:var(--mono);font-size:11px\">' + p.pid + '</td>' +\n"
-"          '<td>' + esc(p.name) + '</td>' +\n"
-"          '<td>' + injHtml + '</td>' +\n"
-"          '<td>' + btnHtml + '</td>' +\n"
-"          '</tr>';\n"
+"      gAllProcs = d.processes;\n"
+"      if (filter) {\n"
+"        gAllProcs = gAllProcs.filter(function(p) {\n"
+"          return p.name.toLowerCase().indexOf(filter) >= 0;\n"
+"        });\n"
 "      }\n"
-"      document.getElementById('ptb').innerHTML = rows ||\n"
-"        '<tr><td colspan=\"4\"><div class=\"empty\"><p>' + (filter ? '无匹配进程' : '无可用进程') + '</p></div></td></tr>';\n"
-"      document.getElementById('proc-count-inject').textContent = shown > 0 ? '(' + shown + ')' : '';\n"
+"      gProcPage = Math.min(gProcPage, Math.max(1, Math.ceil(gAllProcs.length / gProcPageSize)));\n"
+"      renderProcPage();\n"
+"      renderPager();\n"
 "    })\n"
 "    .catch(function() {\n"
 "      document.getElementById('ptb').innerHTML = '<tr><td colspan=\"5\"><div class=\"empty\"><p>加载失败</p></div></td></tr>';\n"
 "    });\n"
+"}\n"
+"\n"
+"function renderProcPage() {\n"
+"  var start = (gProcPage - 1) * gProcPageSize;\n"
+"  var page = gAllProcs.slice(start, start + gProcPageSize);\n"
+"  var rows = '';\n"
+"  for (var i = 0; i < page.length; i++) {\n"
+"    var p = page[i];\n"
+"    var injHtml = '';\n"
+"    if (p.injected) {\n"
+"      injHtml = p.inj_status === 1\n"
+"        ? '<span class=\"badge-ok\">监控中</span>'\n"
+"        : '<span class=\"badge-fail\" title=\"' + escAttr(p.inj_err) + '\">失败</span>';\n"
+"    } else {\n"
+"      injHtml = '<span class=\"badge-pending\">未注入</span>';\n"
+"    }\n"
+"    var btnHtml = (p.injected && p.inj_status === 1)\n"
+"      ? '<span class=\"badge-ok\">已注入</span>'\n"
+"      : '<button class=\"btn-sm\" onclick=\"injectProcess(' + p.pid + ', this)\">注入</button>';\n"
+"    var heapStr = p.heap_kb >= 1024 ? (p.heap_kb/1024).toFixed(1)+' MB' : p.heap_kb+' KB';\n"
+"    rows += '<tr>' +\n"
+"      '<td style=\"font-family:var(--mono);font-size:12px\">' + p.pid + '</td>' +\n"
+"      '<td>' + esc(p.name) + '</td>' +\n"
+"      '<td style=\"font-family:var(--mono);font-size:12px;color:var(--text-secondary)\">' + heapStr + '</td>' +\n"
+"      '<td>' + injHtml + '</td>' +\n"
+"      '<td>' + btnHtml + '</td>' +\n"
+"      '</tr>';\n"
+"  }\n"
+"  document.getElementById('ptb').innerHTML = rows ||\n"
+"    '<tr><td colspan=\"5\"><div class=\"empty\"><p>' + (gAllProcs.length === 0 ? '无可用进程' : '无匹配进程') + '</p></div></td></tr>';\n"
+"  document.getElementById('proc-count-inject').textContent = gAllProcs.length > 0 ? '(' + gAllProcs.length + ')' : '';\n"
+"}\n"
+"\n"
+"function renderPager() {\n"
+"  var total = Math.max(1, Math.ceil(gAllProcs.length / gProcPageSize));\n"
+"  var html = '';\n"
+"  html += '<button class=\"page-btn\" ' + (gProcPage <= 1 ? 'disabled' : '') + ' onclick=\"goPage(' + (gProcPage - 1) + ')\">&laquo;</button>';\n"
+"  for (var i = 1; i <= total && i <= 10; i++) {\n"
+"    html += '<button class=\"page-btn' + (i === gProcPage ? ' active' : '') + '\" onclick=\"goPage(' + i + ')\">' + i + '</button>';\n"
+"  }\n"
+"  if (total > 10) html += '<span class=\"page-info\">...' + total + '</span>';\n"
+"  html += '<button class=\"page-btn\" ' + (gProcPage >= total ? 'disabled' : '') + ' onclick=\"goPage(' + (gProcPage + 1) + ')\">&raquo;</button>';\n"
+"  html += '<span class=\"page-info\">共 ' + gAllProcs.length + ' 个进程</span>';\n"
+"  document.getElementById('proc-pager').innerHTML = html;\n"
+"}\n"
+"\n"
+"function goPage(n) {\n"
+"  gProcPage = n;\n"
+"  renderProcPage();\n"
+"  renderPager();\n"
 "}\n"
 "\n"
 "function injectProcess(pid, btn) {\n"
@@ -1098,7 +1370,7 @@ static const char* g_dashboard_html =
 "    .then(function(r) { return r.json(); })\n"
 "    .then(function(d) {\n"
 "      if (d.status === 'ok') {\n"
-"        toast('PID ' + pid + ' 注入成功！(' + d.patched + ' 个GOT表项已修补)');\n"
+"        toast('PID ' + pid + ' 注入成功！(' + d.patched + ' GOT)');\n"
 "        loadProcesses();\n"
 "      } else {\n"
 "        toast('注入失败: ' + d.error);\n"
@@ -1107,7 +1379,7 @@ static const char* g_dashboard_html =
 "      }\n"
 "    })\n"
 "    .catch(function() {\n"
-"      toast('注入请求失败（网络错误）');\n"
+"      toast('注入请求失败');\n"
 "      btn.disabled = false;\n"
 "      btn.textContent = '重试';\n"
 "    });\n"
@@ -1149,16 +1421,14 @@ static const char* g_dashboard_html =
 "      tip.textContent = ' @ ' + d.result;\n"
 "      tip.title = d.result;\n"
 "    })\n"
-"    .catch(function() {\n"
-"      fnEl.textContent = orig;\n"
-"    });\n"
+"    .catch(function() { fnEl.textContent = orig; });\n"
 "}\n"
 "\n"
 "function fmtBytes(b) {\n"
 "  if (b < 1024) return b + ' B';\n"
 "  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';\n"
 "  if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MB';\n"
-"  return (b / 1073741824).toFixed(1) + ' GB';\n"
+"  return (b / 1073741824).toFixed(2) + ' GB';\n"
 "}\n"
 "\n"
 "function esc(s) {\n"
@@ -1465,9 +1735,28 @@ static int resolve_lib_path(char* out, size_t out_sz)
  *
  * @param fd  HTTP 客户端 socket
  */
+/* 用于排序的临时进程信息 */
+typedef struct {
+    int pid;
+    char name[256];
+    char state;
+    int inj_status;
+    char inj_err[256];
+    unsigned long heap_kb;
+} proc_info_t;
+
+static int proc_cmp_heapsz(const void* a, const void* b)
+{
+    const proc_info_t* pa = (const proc_info_t*)a;
+    const proc_info_t* pb = (const proc_info_t*)b;
+    if (pb->heap_kb > pa->heap_kb) return 1;
+    if (pb->heap_kb < pa->heap_kb) return -1;
+    return 0;
+}
+
 static void send_api_processes(int fd)
 {
-    char buf[65536];
+    char buf[131072];
     int pos = 0;
     int size = (int)sizeof(buf);
 
@@ -1479,14 +1768,16 @@ static void send_api_processes(int fd)
     int hdr_len = (int)strlen(hdr);
     if (pos + hdr_len < size) { memcpy(buf + pos, hdr, hdr_len); pos += hdr_len; }
 
-    safe_append(buf, &pos, size, "{\"processes\":[");
-    int first = 1;
+    /* 第一步：收集所有进程信息 */
+    enum { MAX_COLLECT = 4096 };
+    proc_info_t* procs = malloc(MAX_COLLECT * sizeof(proc_info_t));
+    int n = 0;
+    if (!procs) { send_all(fd, buf, pos); return; }
 
     DIR* dir = opendir("/proc");
     if (dir) {
         struct dirent* de;
-        while ((de = readdir(dir))) {
-            /* 只处理数字目录（PID） */
+        while ((de = readdir(dir)) && n < MAX_COLLECT) {
             if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
             int pid = atoi(de->d_name);
             if (pid <= 1) continue;
@@ -1497,50 +1788,76 @@ static void send_api_processes(int fd)
             if (!fc) continue;
             if (!fgets(comm, sizeof(comm), fc)) { fclose(fc); continue; }
             fclose(fc);
-            /* 去掉尾部换行 */
             size_t cl = strlen(comm);
             while (cl > 0 && (comm[cl-1] == '\n' || comm[cl-1] == '\r'))
                 comm[--cl] = '\0';
 
-            /* 跳过内核线程: /proc/<pid>/exe 不可读 */
             char exe_path[64];
             snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", pid);
             if (access(exe_path, F_OK) != 0) continue;
 
-            /* 检查进程状态（跳过僵尸） */
             char stat_path[64];
             snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
             FILE* fs = fopen(stat_path, "r");
             if (!fs) continue;
             char state = '?';
-            /* stat 格式: pid (comm) state ... */
             fscanf(fs, "%*d %*s %c", &state);
             fclose(fs);
-            if (state == 'Z' || state == 'X' || state == 'T' || state == 'D') continue; /* 跳过僵尸/已死/停止/不可中断进程 */
+            if (state == 'Z' || state == 'X' || state == 'T' || state == 'D') continue;
 
-            /* 检查注入状态 */
-            int inj_status = 0;  /* 0=未注入，1=成功，2=失败 */
-            const char* inj_err = "";
+            /* 读取堆内存使用量 (VmData from /proc/<pid>/status) */
+            unsigned long heap_kb = 0;
+            char status_path[64];
+            snprintf(status_path, sizeof(status_path), "/proc/%d/status", pid);
+            FILE* fst = fopen(status_path, "r");
+            if (fst) {
+                char sline[256];
+                while (fgets(sline, sizeof(sline), fst)) {
+                    if (strncmp(sline, "VmData:", 7) == 0) {
+                        /* VmData: <N> kB */
+                        char* vp = sline + 7;
+                        while (*vp == ' ' || *vp == '\t') vp++;
+                        heap_kb = strtoul(vp, NULL, 10);
+                        break;
+                    }
+                }
+                fclose(fst);
+            }
+
+            proc_info_t* pi = &procs[n++];
+            memset(pi, 0, sizeof(*pi));
+            pi->pid = pid;
+            pi->state = state;
+            pi->heap_kb = heap_kb;
+            snprintf(pi->name, sizeof(pi->name), "%s", comm);
             for (int i = 0; i < g_ninjected; i++) {
                 if (g_injected[i].pid == pid) {
-                    inj_status = g_injected[i].inject_status;
-                    inj_err = g_injected[i].inject_err;
+                    pi->inj_status = g_injected[i].inject_status;
+                    snprintf(pi->inj_err, sizeof(pi->inj_err), "%s", g_injected[i].inject_err);
                     break;
                 }
             }
-
-            if (!first) safe_append(buf, &pos, size, ",");
-            first = 0;
-            safe_append(buf, &pos, size,
-                "{\"pid\":%d,\"name\":\"%s\",\"state\":\"%c\","
-                "\"injected\":%s,\"inj_status\":%d,\"inj_err\":\"%s\"}",
-                pid, comm, state,
-                inj_status == 1 ? "true" : "false",
-                inj_status, inj_err);
         }
         closedir(dir);
     }
+
+    /* 第二步：按堆内存降序排序 */
+    qsort(procs, (size_t)n, sizeof(proc_info_t), proc_cmp_heapsz);
+
+    /* 第三步：序列化为 JSON */
+    safe_append(buf, &pos, size, "{\"processes\":[");
+    for (int i = 0; i < n; i++) {
+        proc_info_t* pi = &procs[i];
+        if (i > 0) safe_append(buf, &pos, size, ",");
+        safe_append(buf, &pos, size,
+            "{\"pid\":%d,\"name\":\"%s\",\"state\":\"%c\","
+            "\"injected\":%s,\"inj_status\":%d,\"inj_err\":\"%s\",\"heap_kb\":%lu}",
+            pi->pid, pi->name, pi->state,
+            pi->inj_status == 1 ? "true" : "false",
+            pi->inj_status, pi->inj_err, pi->heap_kb);
+    }
     safe_append(buf, &pos, size, "]}");
+    free(procs);
 
     send_all(fd, buf, pos);
 }
@@ -1929,9 +2246,15 @@ int main(int argc, char** argv)
         memset(&client_ctxs[i], 0, sizeof(client_ctxs[i]));
     }
 
+    /* 加载持久化历史记录 */
+    pthread_mutex_lock(&g_lock);
+    load_persisted();
+    pthread_mutex_unlock(&g_lock);
+
     printf("[mttd] Ready.\n");
 
     /* ---- 事件循环 ---- */
+    unsigned loop_ticks = 0;
     while (g_running) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -1953,6 +2276,13 @@ int main(int argc, char** argv)
         if (ready < 0) {
             if (errno == EINTR) continue; /* 被信号中断，检查 g_running */
             break;
+        }
+
+        /* 每 5 次循环（约 5 秒）检查进程存活状态 */
+        if (++loop_ticks % 5 == 0) {
+            pthread_mutex_lock(&g_lock);
+            check_liveness();
+            pthread_mutex_unlock(&g_lock);
         }
 
         /* 缺陷修复 #8: 超时处理 — 清理空闲超时的客户端连接 */
