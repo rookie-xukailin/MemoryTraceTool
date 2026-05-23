@@ -18,6 +18,7 @@
  * 缺陷修复 #2: 添加 shutdown() 优雅关闭连接。
  * 缺陷修复 #3: 修复 backtrace_symbols 返回值释放方式。
  * 缺陷修复 #4: 修复 socket 泄漏（错误路径 close 保护）。
+ * 缺陷修复 #23: 遍历桶时逐锁收集记录，安全读取链表。
  */
 #define _GNU_SOURCE
 #include "internal.h"
@@ -62,16 +63,6 @@ static int send_all(int fd, const void* buf, size_t len)
  * 使用 dladdr 将栈帧地址解析为人类可读的符号名称。
  *
  * 格式: "显示名|二进制路径|文件偏移"
- * - 显示名用于前端展示（如 "main (myapp)"）
- * - 二进制路径和文件偏移用于 addr2line 源码解析
- * dladdr 失败时退化为 backtrace_symbols 的输出。
- *
- * 缺陷修复 #3: backtrace_symbols 返回的内存使用 free() 释放（手册要求），
- * 而非 raw_free。
- *
- * @param addr      backtrace 返回的原始栈帧地址
- * @param out       输出缓冲区
- * @param out_size  输出缓冲区大小
  */
 static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
 {
@@ -101,7 +92,6 @@ static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
                 char* paren = strchr(syms[0], '(');
                 char* plus  = strchr(syms[0], '+');
                 if (paren && plus && plus > paren) {
-                    /* 有函数名: path(func+off) */
                     size_t name_len = (size_t)(plus - paren - 1);
                     if (name_len > 0 && name_len < 256) {
                         fallback = raw_malloc(name_len + 1);
@@ -140,12 +130,6 @@ static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
 
 /**
  * 连接到 mttd 守护进程的 Unix Domain Socket。
- *
- * 连接成功后发送 HELLO 消息，其中包含进程 PID 和从
- * /proc/<pid>/exe 读取的进程名。在连接建立后缓存 socket fd，
- * 后续中间报告可能复用此连接（当前实现每次关闭后重建）。
- *
- * @return socket fd (>=0) 表示成功，-1 表示守护进程不可达
  */
 static int connect_daemon(void)
 {
@@ -173,11 +157,9 @@ static int connect_daemon(void)
         exe_name[len] = '\0';
         const char* base = strrchr(exe_name, '/');
         if (base) {
-            /* memmove 处理重叠内存（同一数组内移动） */
             memmove(exe_name, base + 1, strlen(base + 1) + 1);
         }
     } else {
-        /* /proc/<pid>/exe 不可读时的 fallback */
         snprintf(exe_name, sizeof(exe_name), "process_%d", getpid());
     }
 
@@ -190,7 +172,10 @@ static int connect_daemon(void)
 }
 
 /**
- * 通用的泄漏报告发送函数，避免代码重复。
+ * 通用的泄漏报告发送函数。
+ *
+ * 缺陷修复 #23: 逐锁收集记录到临时数组，避免无锁遍历链表。
+ * 每个分段锁只持有一小段时间，收集完即释放。
  *
  * @param is_final  1=最终报告（发送BYE），0=中间报告
  */
@@ -202,17 +187,23 @@ static void do_client_report(int is_final)
     int fd = connect_daemon();
     if (fd < 0) return; /* 守护进程不可达，静默跳过 */
 
-    /* 收集所有泄漏记录到临时数组（避免在遍历时被锁阻塞） */
+    /* 收集所有泄漏记录（逐锁遍历，避免长时间持锁） */
     int nleaks = 0;
     mtt_entry_t** entries = raw_malloc(MTT_MAX_LEAKS_PER_PROC * sizeof(mtt_entry_t*));
     if (!entries) { shutdown(fd, SHUT_RDWR); close(fd); g_sock_fd = -1; return; }
 
-    for (unsigned b = 0; b < s->bucket_count && nleaks < MTT_MAX_LEAKS_PER_PROC; b++) {
-        mtt_entry_t* e = s->buckets[b];
-        while (e && nleaks < MTT_MAX_LEAKS_PER_PROC) {
-            entries[nleaks++] = e;
-            e = e->next;
+    for (unsigned lock_idx = 0; lock_idx < MTT_LOCK_STRIPES
+         && nleaks < MTT_MAX_LEAKS_PER_PROC; lock_idx++) {
+        pthread_mutex_lock(&s->bucket_locks[lock_idx]);
+        for (unsigned b = lock_idx; b < s->bucket_count
+             && nleaks < MTT_MAX_LEAKS_PER_PROC; b += MTT_LOCK_STRIPES) {
+            mtt_entry_t* e = s->buckets[b];
+            while (e && nleaks < MTT_MAX_LEAKS_PER_PROC) {
+                entries[nleaks++] = e;
+                e = e->next;
+            }
         }
+        pthread_mutex_unlock(&s->bucket_locks[lock_idx]);
     }
 
     /* 序列化并发送每条泄漏 */
@@ -225,7 +216,7 @@ static void do_client_report(int is_final)
         if (n > 0 && n < (int)sizeof(line))
             send_all(fd, line, (size_t)n);
 
-        /* 解析调用栈帧地址为可读符号，携带原始地址供 addr2line 解析 */
+        /* 解析调用栈帧地址为可读符号 */
         for (int j = 0; j < e->stack_frames; j++) {
             char resolved[MTT_SYMBOL_MAX];
             resolve_frame_symbol(e->stack[j], resolved, sizeof(resolved));
@@ -236,7 +227,6 @@ static void do_client_report(int is_final)
     }
 
     if (is_final) {
-        /* 发送 BYE 标记进程退出 */
         send_all(fd, "BYE\n", 4);
     }
 
@@ -250,13 +240,6 @@ static void do_client_report(int is_final)
 
 /**
  * 发送中间泄漏报告到守护进程。
- *
- * 遍历所有哈希桶收集当前泄漏记录，序列化后发送。
- * 关闭连接时**不发送** BYE 消息 — 守护进程会保持该进程状态为 ACTIVE。
- *
- * 适用于：
- *   - SIGUSR1 信号触发（常驻进程周期性报告）
- *   - 程序逻辑中主动调用的 mtt_report_to_daemon()
  */
 void mtt_client_report(void)
 {
@@ -265,11 +248,6 @@ void mtt_client_report(void)
 
 /**
  * 发送最终泄漏报告到守护进程（进程退出时调用）。
- *
- * 与 mtt_client_report 的区别在于关闭连接前会发送 BYE 消息，
- * 守护进程收到 BYE 后将该进程标记为 DONE（不再活跃）。
- *
- * 由 atexit 回调或进程退出路径调用。
  */
 void mtt_client_report_final(void)
 {

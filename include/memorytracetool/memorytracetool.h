@@ -9,9 +9,10 @@
  *                无需修改源码，但无文件:行号信息。
  *
  * 环境变量控制（不影响代码，仅需设置环境变量）：
- *   MTT_SAMPLE=N    — 每 N 次分配记录 1 次，N>=1 时启用采样，默认 0（全量）
- *   MTT_DISABLE=1   — 完全禁用追踪（紧急开关，降低开销为零）
- *   MTT_MAX_ENTRIES=N — 哈希表最大条目数，默认 65536
+ *   MTT_SAMPLE=N       — 每 N 次分配记录 1 次，0=全量，默认 256
+ *   MTT_DISABLE=1      — 完全禁用追踪（紧急开关，降低开销为零）
+ *   MTT_PROC_FILTER=name — 仅追踪进程名为 name 的进程，其他进程自动禁用
+ *   MTT_MAX_ENTRIES=N  — 哈希表最大条目数，默认 65536
  *
  * 重要：Macro 模式下，系统头文件（stdlib.h、string.h 等）必须
  * 放在 #define MEMORYTRACETOOL_ENABLE 之前，否则会导致语法错误。

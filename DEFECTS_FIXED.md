@@ -279,3 +279,123 @@ $ make test
 | `mtt_set_max_entries(n)` | 设置哈希表容量上限 |
 | `mtt_get_skipped_sampled()` | 获取因采样跳过的次数 |
 | `mtt_get_skipped_overcap()` | 获取因容量限制跳过的次数 |
+
+---
+
+## 第二轮修复 (2026-05-23) — 7 项
+
+### 高负载优化 (Task 1)
+
+#### 缺陷 #23: 全局互斥锁导致高并发严重竞争
+
+**文件**: `src/internal.h`, `src/memorytracetool.c`, `src/hooks.c`, `src/client.c`
+
+**问题**: 所有 malloc/free 操作共享一把全局互斥锁 `g_state.lock`，高并发场景下（数十线程同时分配/释放）锁竞争成为瓶颈，CPU 空转等待锁释放。
+
+**修复**:
+- 新增 `MTT_LOCK_STRIPES=64`，4096 个哈希桶映射到 64 把分段锁（bucket % 64）
+- 统计数据全部改为 `_Atomic` 类型（`alloc_count`, `free_count`, `current_bytes`, `peak_bytes`, `total_bytes`, `skipped_sampled`, `skipped_overcap`），读取无需持锁
+- `mtt_entry_find/add/remove` 改为调用者持有对应分段锁
+- 新增内联辅助函数: `mtt_bucket_of()`, `mtt_stripe_lock()`, `mtt_stripe_unlock()`
+- `mtt_report_to_fd` 和 `do_client_report` 改为逐锁收集记录
+- peak_bytes 更新使用 CAS 循环实现 lock-free max 操作
+
+#### 缺陷 #24: MTT_DISABLE 和 MTT_PROC_FILTER 未实现
+
+**文件**: `src/memorytracetool.c`, `src/hooks.c`, `include/memorytracetool/memorytracetool.h`
+
+**问题**: 文档和 DEFECT_FIXED 中已提到 `MTT_DISABLE=1` 完全禁用追踪，但代码从未实现。同样 `MTT_PROC_FILTER` 按进程名过滤也未实现。
+
+**修复**:
+- `mtt_ensure_init` 中调用 `check_env_switches()` 检查环境变量
+- `MTT_DISABLE=1`: 所有 mtt_malloc/free/realloc 及 hooks 直接透传到 raw 分配器，零开销
+- `MTT_PROC_FILTER=name`: 读取 `/proc/self/comm` 与过滤器比较，不匹配则设置 disabled=1
+- 所有入口函数首行检查 `s->disabled` 标志
+
+#### 缺陷 #25: 默认采样周期为 0（无采样）
+
+**文件**: `src/internal.h`
+
+**问题**: `MTT_SAMPLE_DEFAULT=0` 意味着默认全量追踪，在高负载场景下开销过大。已在文档中说明采样用法但默认关闭。
+
+**修复**: `MTT_SAMPLE_DEFAULT` 改为 256（每 256 次分配记录 1 次），用户可通过 `MTT_SAMPLE=0` 恢复全量追踪。
+
+### 第二轮走读发现的缺陷 (Task 3)
+
+#### 缺陷 #26: mtt_ensure_init 初始化竞态
+
+**文件**: `src/internal.h`, `src/memorytracetool.c`
+
+**问题**: `initialized` 字段为普通 `int`，`if (s->initialized) return; ... s->initialized = 1;` 存在 TOCTOU 竞态。两线程首次调用 `malloc` 时可能同时看到 initialized=0，导致 bucket_locks 被 double-init（UB）或 bucket 表被重复分配（内存泄漏）。
+
+**修复**:
+- `initialized` 改为 `atomic_int`
+- 使用 `atomic_compare_exchange_strong` 原子地 test-and-set
+
+#### 缺陷 #27: mtt_report_to_fd 重复遍历同一桶
+
+**文件**: `src/memorytracetool.c`
+
+**问题**: 外层循环 `for (b = 0; b < bucket_count; b++)`，内层按 `lock_idx = b & 63` 加锁后遍历 `sub = b, b+64, b+128, ...`。当 b >= 64 时，lock_idx 重复（如 b=64 的 lock_idx=0），导致已遍历过的桶被再次收集，报告中出现重复条目。
+
+**修复**: 外层循环改为 `for (lock_idx = 0; lock_idx < MTT_LOCK_STRIPES; lock_idx++)`，每把锁只获取一次。
+
+#### 缺陷 #28: realloc 失败时违反标准语义
+
+**文件**: `src/memorytracetool.c`, `src/hooks.c`
+
+**问题**: realloc 的 disabled 路径中，`raw_malloc(size)` 失败后仍然 `raw_free(ptr)` 并返回 NULL — 丢失了旧数据。非 disabled 路径中，先删除旧追踪记录再尝试新分配，若新分配失败则追踪表已损坏且无法恢复。
+
+POSIX 标准规定 realloc 失败时原内存块必须保持不变。
+
+**修复**:
+- 先调用 `raw_malloc(size)` 尝试新分配
+- 成功后才删除旧追踪记录、拷贝数据、插入新记录
+- 失败时直接返回 NULL，不修改任何状态
+- disabled 路径同理：失败时 `return NULL`，不释放旧指针
+
+### Web 页面重新设计 (Task 2)
+
+#### 缺陷 #29: 看板页面为暗色主题
+
+**文件**: `src/daemon.c`
+
+**问题**: 原有看板使用暗色主题（`--bg: #0a0e14`），用户要求改为白色底色的简洁设计。
+
+**修复**: 完全重写 `g_dashboard_html` 内嵌 CSS/HTML，参考 GitHub/Linear/Stripe 设计语言：
+- 白色底色 `#ffffff` + 浅灰背景 `#f6f8fa`
+- 蓝色强调色 `#0969da`
+- 顶部导航栏 + 三卡片概览（进程数/泄漏数/字节数）
+- 轻阴影卡片 + 圆角边框
+- 响应式布局
+- 状态徽章使用绿底绿字 / 灰底灰字
+- 调用栈节点悬停高亮、泄漏点红色标记
+
+---
+
+## 文件修改统计（第二轮）
+
+| 文件 | 修改行数(约) | 涉及缺陷 |
+|------|-------------|---------|
+| `src/internal.h` | +30 | #23, #25, #26 |
+| `src/memorytracetool.c` | +80 | #23, #24, #26, #27, #28 |
+| `src/hooks.c` | +50 | #23, #24, #28 |
+| `src/client.c` | +20 | #23 |
+| `src/daemon.c` | ~600 替换 | #29 |
+| `include/memorytracetool/memorytracetool.h` | +3 | #24 |
+
+## 编译与测试
+
+```
+$ make clean && make
+# 零警告，零错误
+
+$ make test
+# 7/7 tests passed
+```
+
+## 新增环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MTT_PROC_FILTER=name` | 未设置 | 仅追踪进程名为 name 的进程 |
