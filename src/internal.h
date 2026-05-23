@@ -159,5 +159,7 @@ void        mtt_entry_remove(mtt_state_t* s, const void* ptr);
 void        mtt_client_report(void);
 /** 发送最终报告到守护进程（含 BYE，进程即将退出） */
 void        mtt_client_report_final(void);
+/** 启动周期性报告线程（每 3 秒推送一次，供实时看板使用） */
+void        mtt_start_periodic_report(void);
 
 #endif /* MEMORYTRACETOOL_INTERNAL_H */

@@ -679,23 +679,71 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     }
 
     /* ---- Step 6: 找到注入库中钩子函数地址 ---- */
+    /* 查找 .so 的 ELF load bias（最低地址映射，即第一个 PT_LOAD 所在页）。
+     * 符号虚拟地址以 p_vaddr=0 为基准，不可用 r-xp 段起始地址，
+     * 否则 hook_addr 超出可执行映射范围导致 SIGSEGV 指令预取异常。 */
     nregions = read_maps(pid, regions, MAX_REGIONS);
     const mem_region_t* our_lib = NULL;
+    const mem_region_t* our_lib_load = NULL;  /* 最低地址映射 = load bias */
     for (int i = 0; i < nregions; i++) {
         if (strstr(regions[i].path, "libmemorytracetool")) {
-            our_lib = &regions[i];
-            if (strchr(regions[i].perms, 'x')) break;
+            if (!our_lib_load) our_lib_load = &regions[i];  /* 第一个映射 */
+            if (!our_lib || !strchr(our_lib->perms, 'x'))
+                our_lib = &regions[i];
+            if (strchr(regions[i].perms, 'x')) {
+                our_lib = &regions[i];
+                break;
+            }
         }
     }
-    if (!our_lib) {
+    if (!our_lib || !our_lib_load) {
         ptrace(PTRACE_SETREGS, pid, NULL, &saved_regs);
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         set_error(&res, INJECT_ERR_DLOPEN,
                   "Library loaded but not found in /proc/%d/maps", pid);
         return res;
     }
-    unsigned long so_base = our_lib->start;
+    /* 使用 ELF load bias（最低地址映射），非 r-xp 段地址 */
+    unsigned long so_base = our_lib_load->start;
+    fprintf(stderr, "[DEBUG] .so load_bias=0x%lx r-xp_start=0x%lx\n",
+            so_base, our_lib->start);
     res.lib_base = so_base;
+
+    /* ---- Step 6.5: 修复 raw_* 函数指针（缺陷修复 #26）----
+     * .so 的构造函数通过 dlsym(RTLD_NEXT) 解析 raw_malloc/free/calloc，
+     * 但通过 dlopen 注入时 RTLD_NEXT 在 link map 末尾搜不到 libc，
+     * 内部的 dlopen("libc.so.6") fallback 也不可靠（可能导致 SIGSEGV）。
+     * 这里直接用已知的 libc 基址和 dlsym 偏移写入正确的函数地址。 */
+    {
+        /* raw_* 符号在 .so 中的偏移（readelf 确认） */
+        #define RAW_MALLOC_OFF  0xa240
+        #define RAW_FREE_OFF    0xa248
+        #define RAW_CALLOC_OFF  0xa250
+
+        /* 通过自身 dlsym 计算 libc 中 malloc/free/calloc 的偏移 */
+        unsigned long real_malloc = 0, real_free = 0, real_calloc = 0;
+        void* sym_malloc = dlsym(RTLD_DEFAULT, "malloc");
+        void* sym_free   = dlsym(RTLD_DEFAULT, "free");
+        void* sym_calloc = dlsym(RTLD_DEFAULT, "calloc");
+
+        if (our_libc_base && sym_malloc)
+            real_malloc = libc_base + ((unsigned long)sym_malloc - our_libc_base);
+        if (our_libc_base && sym_free)
+            real_free   = libc_base + ((unsigned long)sym_free - our_libc_base);
+        if (our_libc_base && sym_calloc)
+            real_calloc = libc_base + ((unsigned long)sym_calloc - our_libc_base);
+
+        if (real_malloc && real_free && real_calloc) {
+            ptrace(PTRACE_POKEDATA, pid, (void*)(so_base + RAW_MALLOC_OFF), (void*)real_malloc);
+            ptrace(PTRACE_POKEDATA, pid, (void*)(so_base + RAW_FREE_OFF),   (void*)real_free);
+            ptrace(PTRACE_POKEDATA, pid, (void*)(so_base + RAW_CALLOC_OFF), (void*)real_calloc);
+            fprintf(stderr, "[DEBUG] Fixed raw_*: malloc=0x%lx free=0x%lx calloc=0x%lx\n",
+                    real_malloc, real_free, real_calloc);
+        } else {
+            fprintf(stderr, "[DEBUG] WARNING: cannot resolve raw_* fallback, "
+                    "injected process may crash\n");
+        }
+    }
 
     unsigned long hook_addrs[4] = {0};
     const char* hook_names[4] = {"malloc", "free", "calloc", "realloc"};

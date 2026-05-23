@@ -53,27 +53,38 @@ static atomic_int g_raw_resolved = 0;
 /**
  * 共享库构造函数，在动态库加载时自动执行。
  *
- * 使用 dlsym(RTLD_NEXT, ...) 查找真正的 libc 分配函数。
- * 在非 LD_PRELOAD 的 Macro 模式下，dlsym 返回 NULL，
- * 此时 fallback 到直接使用 malloc/free/calloc。
+ * 查找真正的 libc 分配函数（raw_malloc / raw_free / raw_calloc）。
+ * 优先使用 RTLD_NEXT（LD_PRELOAD 模式），失败时显式打开 libc
+ * 查找（dlopen/ptrace 注入模式），最后 fallback 到直接调用。
  *
- * 缺陷修复 #4: 使用 atomic_flag 确保只初始化一次，防止多线程竞争
- * 导致部分函数指针为空而其他线程已经开始使用。
+ * 缺陷修复 #4: 使用 atomic_flag 确保只初始化一次，防止多线程竞争。
+ * 缺陷修复 #26: dlopen 注入时 RTLD_NEXT 失败，显式打开 libc 查找符号。
  */
 __attribute__((constructor)) static void resolve_raw_allocators(void)
 {
     int expected = 0;
     if (!atomic_compare_exchange_strong(&g_raw_resolved, &expected, 1))
-        return; /* 已被其他线程初始化 */
+        return;
 
     raw_malloc = (raw_malloc_fn)dlsym(RTLD_NEXT, "malloc");
     raw_free   = (raw_free_fn)dlsym(RTLD_NEXT, "free");
     raw_calloc = (raw_calloc_fn)dlsym(RTLD_NEXT, "calloc");
 
-    /* dlsym 失败时 fallback 到直接调用（Macro 模式） */
-    if (!raw_malloc) raw_malloc = malloc;
-    if (!raw_free)   raw_free   = free;
-    if (!raw_calloc) raw_calloc = calloc;
+    /* RTLD_NEXT 失败时显式打开 libc（dlopen/ptrace 注入路径） */
+    if (!raw_malloc || !raw_free || !raw_calloc) {
+        void* libc_handle = dlopen("libc.so.6", RTLD_LAZY);
+        if (libc_handle) {
+            if (!raw_malloc) raw_malloc = (raw_malloc_fn)dlsym(libc_handle, "malloc");
+            if (!raw_free)   raw_free   = (raw_free_fn)dlsym(libc_handle, "free");
+            if (!raw_calloc) raw_calloc = (raw_calloc_fn)dlsym(libc_handle, "calloc");
+            dlclose(libc_handle);
+        }
+    }
+
+    /* 最终 fallback */
+    if (!raw_malloc) raw_malloc = (raw_malloc_fn)malloc;
+    if (!raw_free)   raw_free   = (raw_free_fn)free;
+    if (!raw_calloc) raw_calloc = (raw_calloc_fn)calloc;
 }
 
 /* ======================================================================== *
@@ -362,16 +373,29 @@ static void check_env_switches(mtt_state_t* s)
 void mtt_ensure_init(void)
 {
     mtt_state_t* s = &g_state;
-    /* 缺陷修复 #25: 使用 CAS 确保只初始化一次，防止多线程首次调用时的竞争 */
-    int expected = 0;
-    if (!atomic_compare_exchange_strong(&s->initialized, &expected, 1))
+
+    /* 快速路径：初始化已完成 */
+    if (atomic_load(&s->initialized))
         return;
+
+    /* 缺陷修复 #25: 用静态锁保护初始化，防止多线程首次调用竞争。
+     * 不能用 CAS（会在线程 B 看到 initialized=1 时立即返回，
+     * 但此时桶表/互斥锁可能尚未初始化完成）。 */
+    static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&init_lock);
+
+    /* 双重检查：可能在等锁期间已被其他线程初始化 */
+    if (s->initialized) {
+        pthread_mutex_unlock(&init_lock);
+        return;
+    }
 
     s->bucket_count = MTT_BUCKETS;
     /* 使用 raw_calloc 避免分配操作被自身追踪记录 */
     s->buckets = raw_calloc(s->bucket_count, sizeof(mtt_entry_t*));
     if (!s->buckets) {
         fprintf(stderr, "[MemoryTraceTool] FATAL: cannot allocate bucket table\n");
+        pthread_mutex_unlock(&init_lock);
         return;
     }
 
@@ -422,10 +446,14 @@ void mtt_ensure_init(void)
         }
     }
 
-    /* 初始化线程必须在 env check 之后，否则 disabled 状态未设置 */
-    s->initialized = 1;
+    /* initialized 必须在所有字段就绪后才置 1 */
+    atomic_store(&s->initialized, 1);
+    pthread_mutex_unlock(&init_lock);
 
     atexit(mtt_atexit_report);
+
+    /* 启动周期性报告线程：每 3 秒向守护进程推送泄漏数据，供实时看板 */
+    mtt_start_periodic_report();
 }
 
 /** 显式初始化（等同于 mtt_ensure_init） */

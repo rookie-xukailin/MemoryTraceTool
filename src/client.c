@@ -253,3 +253,26 @@ void mtt_client_report_final(void)
 {
     do_client_report(1);
 }
+
+/* ---- 周期性报告（实时看板） ---- */
+
+static pthread_t g_reporter_thread;
+static volatile int g_reporter_running = 1;
+
+/** 后台报告线程：每 3 秒向守护进程推送当前泄漏数据 */
+static void* reporter_thread_func(void* arg)
+{
+    (void)arg;
+    while (g_reporter_running) {
+        sleep(3);
+        if (g_reporter_running)
+            do_client_report(0);
+    }
+    return NULL;
+}
+
+/** 启动周期性报告线程（mtt_ensure_init 之后调用） */
+void mtt_start_periodic_report(void)
+{
+    pthread_create(&g_reporter_thread, NULL, reporter_thread_func, NULL);
+}
