@@ -47,7 +47,7 @@
 static mttd_proc_t g_procs[MTT_MAX_PROCS];      /* 被监控进程数组 */
 static int         g_nprocs = 0;                  /* 当前监控的进程数 */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER; /* 保护 g_procs / g_nprocs */
-static volatile int g_running = 1;                /* 信号控制的主循环退出标志 */
+static volatile sig_atomic_t g_running = 1;        /* 信号控制的主循环退出标志 */
 
 /* 运行时注入追踪 */
 static mttd_injected_t g_injected[MTT_MAX_INJECTED]; /* 注入记录数组 */
@@ -862,7 +862,7 @@ static const char* g_dashboard_html =
 "      <span class=\"sb-label\">泄漏排行</span>\n"
 "    </div>\n"
 "  </nav>\n"
-"  <div class=\"sb-toggle\" onclick=\"toggleSidebar()\">&laquo;</div>\n"
+"  <div class=\"sb-toggle\" onclick=\"toggleSidebar()\" onkeydown=\"if(event.key==='Enter'||event.key===' ')toggleSidebar()\" title=\"折叠/展开侧边栏\" role=\"button\" aria-label=\"折叠/展开侧边栏\" tabindex=\"0\">&laquo;</div>\n"
 "</aside>\n"
 "\n"
 "<!-- MAIN -->\n"
@@ -870,6 +870,7 @@ static const char* g_dashboard_html =
 "<div class=\"topbar\">\n"
 "  <div class=\"topbar-left\">\n"
 "    <span class=\"topbar-time\" id=\"clock\">--:--:--</span>\n"
+"    <span class=\"topbar-stale\" id=\"stale\" style=\"font-size:11px;color:var(--text3);margin-left:4px\"></span>\n"
 "    <span class=\"topbar-status\" id=\"conn-status\">在线</span>\n"
 "  </div>\n"
 "  <div>\n"
@@ -947,9 +948,12 @@ static const char* g_dashboard_html =
 "\n"
 "<div class=\"toast\" id=\"toast\"></div>\n"
 "<!-- Cursor trail elements -->\n"
+"<div class=\"trail\" id=\"trail0\">王华是cos0</div>\n"
+"<div class=\"trail\" id=\"trail1\">王华是cos0</div>\n"
+"<div class=\"trail\" id=\"trail2\">王华是cos0</div>\n"
 "\n"
 "<script>\n"
-"var autoRefresh=true,failCount=0;\n"
+"var autoRefresh=true,failCount=0,gLastUpdateTime=Date.now()/1000;\n"
 "var gAllLeaks=[],gSortMode='bytes';\n"
 "var gProcPage=1,gPageSize=15,gAllProcs=[];\n"
 "var gPrevLeaked={}; /* pid -> prev total_leaked */\n"
@@ -960,7 +964,7 @@ static const char* g_dashboard_html =
 "var gLoadSeq=0,toastTimer=0;\n"
 "\n"
 "/* ===== SIDEBAR ===== */\n"
-"function toggleSidebar(){document.getElementById('sidebar').classList.toggle('folded')}\n"
+"function toggleSidebar(){var sb=document.getElementById('sidebar'),tog=sb.querySelector('.sb-toggle');sb.classList.toggle('folded');tog.innerHTML=sb.classList.contains('folded')?'&raquo;':'&laquo;'}\n"
 "/* ===== TAB SWITCHING ===== */\n"
 "function switchPanel(name){\n"
 "  document.querySelectorAll('.sb-item').forEach(function(el){el.classList.toggle('on',el.getAttribute('data-panel')===name)});\n"
@@ -1004,17 +1008,17 @@ static const char* g_dashboard_html =
 "    if(!trailRunning)return;\n"
 "    trailFrameSkip++;\n"
 "    if(trailFrameSkip%3!==0){trailRafId=requestAnimationFrame(tick);return} /* 20fps */\n"
-"    if(trailPaused){for(var i=0;i<3;i++)trailEls[i].style.opacity='0';trailRafId=requestAnimationFrame(tick);return}\n"
+"    if(trailPaused){for(var i=0;i<3;i++){var el=trailEls[i];if(el)el.style.opacity='0'};trailRafId=requestAnimationFrame(tick);return}\n"
 "    if(trailActive){trailAlpha=Math.min(1,trailAlpha+0.06)}\n"
 "    else{trailAlpha=Math.max(0,trailAlpha-0.03)}\n"
-"    if(trailAlpha<.005){for(var i=0;i<3;i++)trailEls[i].style.opacity='0';trailRafId=requestAnimationFrame(tick);return}\n"
+"    if(trailAlpha<.005){for(var i=0;i<3;i++){var el=trailEls[i];if(el)el.style.opacity='0'};trailRafId=requestAnimationFrame(tick);return}\n"
 "    var lag=0.08;\n"
 "    for(var i=0;i<3;i++){\n"
 "      var tp=trailPositions[i];\n"
 "      var tx=(i===0)?targetX:trailPositions[i-1].x;\n"
 "      var ty=(i===0)?targetY:trailPositions[i-1].y;\n"
 "      tp.x+=(tx-tp.x)*lag;tp.y+=(ty-tp.y)*lag;\n"
-"      var el=trailEls[i];\n"
+"      var el=trailEls[i];if(!el)continue;\n"
 "      el.style.left=tp.x+16+'px';el.style.top=tp.y+18+'px';\n"
 "      el.style.opacity=trailAlpha*(0.85-i*0.2);\n"
 "      el.style.transform='scale('+(1-i*0.05)+')';\n"
@@ -1022,7 +1026,7 @@ static const char* g_dashboard_html =
 "    }\n"
 "    trailRafId=requestAnimationFrame(tick);\n"
 "  }\n"
-"  stopTrailLoop=function(){trailRunning=false;if(trailRafId){cancelAnimationFrame(trailRafId);trailRafId=0};for(var i=0;i<3;i++)trailEls[i].style.opacity='0'};\n"
+"  stopTrailLoop=function(){trailRunning=false;if(trailRafId){cancelAnimationFrame(trailRafId);trailRafId=0};for(var i=0;i<3;i++){var el=trailEls[i];if(el)el.style.opacity='0'}};\n"
 "  startTrailLoop=function(){if(!trailRunning){trailRunning=true;trailRafId=requestAnimationFrame(tick)}};\n"
 "  document.addEventListener('visibilitychange',function(){document.hidden?stopTrailLoop():startTrailLoop()});\n"
 "  trailRafId=requestAnimationFrame(tick);\n"
@@ -1058,6 +1062,12 @@ static const char* g_dashboard_html =
 "\n"
 "/* ===== AUTO REFRESH ===== */\n"
 "setInterval(function(){if(autoRefresh){refresh();loadProcs()}},3000);\n"
+"setInterval(function(){\n"
+"  var stale=Math.round(Date.now()/1000-gLastUpdateTime);\n"
+"  var el=document.getElementById('stale');if(!el)return;\n"
+"  if(stale>60)el.style.color='var(--orange)';else el.style.color=stale>15?'#cc0':'var(--text3)';\n"
+"  el.textContent=autoRefresh?'':(stale>5?' (数据已过期 '+stale+'s)':'');\n"
+"},1000);\n"
 "refresh();\n"
 "\n"
 "function toggleAuto(){\n"
@@ -1080,7 +1090,8 @@ static const char* g_dashboard_html =
 "    document.getElementById('kp-hist').textContent=exited;\n"
 "    gCachedProcs=d.procs;\n"
 "\n"
-"    var now=Date.now()/1000;\n"
+"    var now=Date.now()/1000;gLastUpdateTime=now;\n"
+"    document.getElementById('stale').textContent='';\n"
 "    var prevTotal=0,curTotal=0;\n"
 "\n"
 "    /* accumulate history & compute rates */\n"
@@ -1261,7 +1272,7 @@ static const char* g_dashboard_html =
 "  var t=Math.max(1,Math.ceil(gAllProcs.length/gPageSize)),h='';\n"
 "  h+='<button class=\"pg\" '+(gProcPage<=1?'disabled':'')+' onclick=\"goPage('+(gProcPage-1)+')\">&laquo;</button>';\n"
 "  for(var i=1;i<=t&&i<=8;i++)h+='<button class=\"pg'+(i===gProcPage?' on':'')+'\" onclick=\"goPage('+i+')\">'+i+'</button>';\n"
-"  if(t>8)h+='<span style=\"font-size:11px;color:var(--text3);margin:0 4px\">...'+t+'</span>';\n"
+"  if(t>8)h+='<button class=\"pg\" onclick=\"goPage('+Math.max(9,t-3)+')\" title=\"跳转到后段\">...'+t+'</button>';\n"
 "  h+='<button class=\"pg\" '+(gProcPage>=t?'disabled':'')+' onclick=\"goPage('+(gProcPage+1)+')\">&raquo;</button>';\n"
 "  document.getElementById('pg').innerHTML=h;\n"
 "}\n"
@@ -1505,7 +1516,8 @@ static const char* g_dashboard_html =
 "    if(c)c.style.cursor='crosshair';\n"
 "  });\n"
 "\n"
-"  /* hover crosshair: only on chart canvas */\n"
+"  /* hover crosshair: rAF-debounced, only on chart canvas */\n"
+"  var chartHoverPending=0,chartHoverArgs=null;\n"
 "  document.addEventListener('mousemove',function(e){\n"
 "    if(chartDragging)return;\n"
 "    if(!e.target.closest('#chart'))return;\n"
@@ -1515,20 +1527,25 @@ static const char* g_dashboard_html =
 "    var pad=c._pad;if(!pad||mx<pad.l||mx>pad.l+c._pw)return;\n"
 "    var vis=c._vis,idx=Math.round((mx-pad.l)/c._pw*(vis.length-1));\n"
 "    if(idx<0||idx>=vis.length)return;\n"
-"    drawChart(c._data);\n"
-"    var ctx=c.getContext('2d');\n"
-"    var cx=pad.l+(c._pw/(Math.max(1,vis.length-1)))*idx;\n"
-"    var cy=pad.t+c._ph-((vis[idx].bytes-c._minB)/(c._maxB-c._minB))*c._ph;\n"
-"    ctx.strokeStyle='rgba(0,212,255,.5)';ctx.lineWidth=1;\n"
-"    ctx.beginPath();ctx.moveTo(cx,pad.t);ctx.lineTo(cx,pad.t+c._ph);ctx.stroke();\n"
-"    ctx.beginPath();ctx.arc(cx,cy,4,0,Math.PI*2);ctx.fillStyle='#00d4ff';ctx.fill();\n"
+"    chartHoverArgs=[c,vis,pad,idx];\n"
+"    if(!chartHoverPending){chartHoverPending=1;requestAnimationFrame(function(){\n"
+"      chartHoverPending=0;var a=chartHoverArgs;if(!a)return;\n"
+"      c=a[0];vis=a[1];pad=a[2];idx=a[3];\n"
+"      drawChart(c._data);\n"
+"      var ctx=c.getContext('2d');\n"
+"      var cx=pad.l+(c._pw/(Math.max(1,vis.length-1)))*idx;\n"
+"      var cy=pad.t+c._ph-((vis[idx].bytes-c._minB)/(c._maxB-c._minB))*c._ph;\n"
+"      ctx.strokeStyle='rgba(0,212,255,.5)';ctx.lineWidth=1;\n"
+"      ctx.beginPath();ctx.moveTo(cx,pad.t);ctx.lineTo(cx,pad.t+c._ph);ctx.stroke();\n"
+"      ctx.beginPath();ctx.arc(cx,cy,4,0,Math.PI*2);ctx.fillStyle='#00d4ff';ctx.fill();\n"
 "\n"
-"    /* tooltip */\n"
-"    var d=new Date(vis[idx].t*1000);\n"
-"    var tw=ctx.measureText(d.toLocaleTimeString()+'  '+fmtBytes(vis[idx].bytes)).width;\n"
-"    ctx.fillStyle='rgba(17,22,34,.9)';ctx.fillRect(cx-tw/2-6,cy-16,tw+12,22);\n"
-"    ctx.fillStyle='#e4e7ec';ctx.font=\"11px 'Courier New','Liberation Mono','Consolas',monospace\";ctx.textAlign='center';\n"
-"    ctx.fillText(d.toLocaleTimeString()+'  '+fmtBytes(vis[idx].bytes),cx,cy-2);\n"
+"      /* tooltip */\n"
+"      var d=new Date(vis[idx].t*1000);\n"
+"      var tw=ctx.measureText(d.toLocaleTimeString()+'  '+fmtBytes(vis[idx].bytes)).width;\n"
+"      ctx.fillStyle='rgba(17,22,34,.9)';ctx.fillRect(cx-tw/2-6,cy-16,tw+12,22);\n"
+"      ctx.fillStyle='#e4e7ec';ctx.font=\"11px 'Courier New','Liberation Mono','Consolas',monospace\";ctx.textAlign='center';\n"
+"      ctx.fillText(d.toLocaleTimeString()+'  '+fmtBytes(vis[idx].bytes),cx,cy-2);\n"
+"    })});\n"
 "  });\n"
 "})();\n"
 "\n"
@@ -2484,8 +2501,11 @@ int main(int argc, char** argv)
     int port = 8080;
     if (argc > 1) port = atoi(argv[1]);
 
-    signal(SIGINT,  signal_handler);
-    signal(SIGTERM, signal_handler);
+    struct sigaction sa = {0};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN); /* 防止向已关闭 socket 写入时触发 SIGPIPE */
 
     /* ---- Unix Socket 初始化 ---- */
@@ -2501,12 +2521,12 @@ int main(int argc, char** argv)
     if (bind(unix_fd, (struct sockaddr*)&unix_addr, sizeof(unix_addr)) < 0) {
         perror("unix bind"); close(unix_fd); return 1;
     }
-    if (listen(unix_fd, 32) < 0) { perror("unix listen"); return 1; }
+    if (listen(unix_fd, 32) < 0) { perror("unix listen"); goto cleanup; }
     printf("[mttd] Unix socket: %s\n", MTT_SOCK_PATH);
 
     /* ---- HTTP Socket 初始化 ---- */
     int http_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (http_fd < 0) { perror("tcp socket"); return 1; }
+    if (http_fd < 0) { perror("tcp socket"); goto cleanup; }
 
     int opt = 1;
     setsockopt(http_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -2517,9 +2537,9 @@ int main(int argc, char** argv)
     http_addr.sin_port = htons(port);
 
     if (bind(http_fd, (struct sockaddr*)&http_addr, sizeof(http_addr)) < 0) {
-        perror("http bind"); return 1;
+        perror("http bind"); goto cleanup;
     }
-    if (listen(http_fd, 32) < 0) { perror("http listen"); return 1; }
+    if (listen(http_fd, 32) < 0) { perror("http listen"); goto cleanup; }
     printf("[mttd] HTTP Dashboard: http://0.0.0.0:%d\n", port);
 
     /* ---- 客户端追踪数组 ---- */
@@ -2669,4 +2689,10 @@ int main(int argc, char** argv)
     close(http_fd);
     unlink(MTT_SOCK_PATH);
     return 0;
+
+cleanup:
+    if (unix_fd >= 0) close(unix_fd);
+    if (http_fd >= 0) close(http_fd);
+    unlink(MTT_SOCK_PATH);
+    return 1;
 }
