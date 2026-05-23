@@ -51,4 +51,18 @@ typedef struct {
     pthread_mutex_t lock;                    /* 保护本进程数据的互斥锁 */
 } mttd_proc_t;
 
+/* ---- 运行时注入追踪 ---- */
+
+#define MTT_MAX_INJECTED        64       /* 最多追踪的注入进程数 */
+
+/** 守护进程维护的注入记录 */
+typedef struct {
+    int     pid;                           /* 被注入的目标进程 PID */
+    int     inject_status;                  /* 0=未注入, 1=成功, 2=失败 */
+    char    inject_err[256];               /* 失败时的错误描述 */
+    time_t  inject_time;                   /* 注入时间戳 */
+    unsigned long lib_base;                /* 注入库在目标中的基地址 */
+    int     patched_count;                 /* 成功修补的 GOT 表项数 */
+} mttd_injected_t;
+
 #endif

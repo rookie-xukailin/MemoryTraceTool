@@ -35,6 +35,11 @@
 #include <time.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <dirent.h>
+#include <sys/ptrace.h>
+#include <sys/wait.h>
+#include "injector.h"
+#include "internal.h"
 
 /* ---- 全局状态 ---- */
 
@@ -42,6 +47,13 @@ static mttd_proc_t g_procs[MTT_MAX_PROCS];      /* 被监控进程数组 */
 static int         g_nprocs = 0;                  /* 当前监控的进程数 */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER; /* 保护 g_procs / g_nprocs */
 static volatile int g_running = 1;                /* 信号控制的主循环退出标志 */
+
+/* 运行时注入追踪 */
+static mttd_injected_t g_injected[MTT_MAX_INJECTED]; /* 注入记录数组 */
+static int             g_ninjected = 0;               /* 当前注入数 */
+
+/* 长期监控安全: 全局泄漏记录计数器 */
+static _Atomic size_t g_total_leaks_global = 0;
 
 /* ---- 辅助函数 ---- */
 
@@ -176,6 +188,13 @@ static mttd_proc_t* find_or_create_proc(int pid, const char* name)
  */
 static int add_leak(mttd_proc_t* p, mttd_leak_t* leak)
 {
+    /* 长期监控安全: 全局泄漏记录总数检查 */
+    size_t global = atomic_load(&g_total_leaks_global);
+    if (global >= MTT_DAEMON_MAX_TOTAL_LEAKS) {
+        /* 超过全局上限，静默丢弃（避免守护进程 OOM） */
+        return -1;
+    }
+
     if (p->leak_count >= p->leak_cap) {
         int newcap = p->leak_cap * 2;
         if (newcap > MTT_MAX_LEAKS) {
@@ -189,6 +208,7 @@ static int add_leak(mttd_proc_t* p, mttd_leak_t* leak)
     }
     p->leaks[p->leak_count++] = *leak;
     p->total_leaked += leak->size;
+    atomic_fetch_add(&g_total_leaks_global, 1);
     return 0;
 }
 
@@ -687,12 +707,27 @@ static const char* g_dashboard_html =
 "}\n"
 ".toast.show { opacity: 1; transform: translateY(0); }\n"
 "/* ---- Responsive ---- */\n"
+".inject-table { width:100%%; border-collapse:collapse; }\n"
+".inject-table th { text-align:left; font-size:11px; color:var(--text-secondary); "
+  "padding:6px 10px; border-bottom:1px solid var(--border-light); }\n"
+".inject-table td { padding:6px 10px; font-size:12px; border-bottom:1px solid var(--border-light); }\n"
+".btn-sm { padding:3px 10px; font-size:11px; border-radius:5px; border:1px solid var(--border); "
+  "background:var(--bg); color:var(--text); cursor:pointer; transition:all 0.15s; }\n"
+".btn-sm:hover { background:var(--accent); color:#fff; border-color:var(--accent); }\n"
+".btn-sm:disabled { opacity:0.5; cursor:not-allowed; }\n"
+".badge-ok { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; "
+  "font-weight:500; background:var(--green-bg); color:var(--green); border:1px solid var(--green-border); }\n"
+".badge-fail { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; "
+  "font-weight:500; background:var(--red-bg); color:var(--red); border:1px solid var(--red-border); }\n"
+".badge-pending { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; "
+  "font-weight:500; background:var(--orange-bg); color:var(--orange); }\n"
 "@media (max-width: 768px) {\n"
 "  .summary { grid-template-columns: 1fr; }\n"
 "  .nav { padding: 0 14px; }\n"
 "  .container { padding: 16px; }\n"
 "  table { font-size: 11px; }\n"
 "  thead th, tbody td { padding: 8px 10px; }\n"
+"  .inject-table { font-size:10px; }\n"
 "}\n"
 "</style>\n"
 "</head>\n"
@@ -728,6 +763,38 @@ static const char* g_dashboard_html =
 "      <div class=\"card-label\">泄漏字节数</div>\n"
 "      <div class=\"card-value\" id=\"b\">--</div>\n"
 "      <div class=\"card-sub\">累计未释放内存</div>\n"
+"    </div>\n"
+"  </div>\n"
+"\n"
+"  <div class=\"section\">\n"
+"    <div class=\"section-head\">\n"
+"      <svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\"><circle cx=\"8\" cy=\"8\" r=\"5\" stroke=\"#0969da\" stroke-width=\"1.5\"/><line x1=\"8\" y1=\"5\" x2=\"8\" y2=\"11\" stroke=\"#0969da\" stroke-width=\"1.2\"/><line x1=\"5\" y1=\"8\" x2=\"11\" y2=\"8\" stroke=\"#0969da\" stroke-width=\"1.2\"/></svg>\n"
+"      <h2>运行时注入</h2>\n"
+"      <span class=\"count\" id=\"proc-count-inject\"></span>\n"
+"    </div>\n"
+"    <div style=\"margin-bottom:8px;\">\n"
+"      <input type=\"text\" id=\"proc-filter\" placeholder=\"搜索进程名...\" "
+"        oninput=\"loadProcesses()\" "
+"        style=\"width:240px;padding:5px 10px;border:1px solid var(--border);"
+"        border-radius:5px;font-size:12px;background:var(--bg);color:var(--text)\">\n"
+"      <span style=\"font-size:11px;color:var(--text-tertiary);margin-left:8px\">"
+"        选择一个正在运行的进程，点击「注入」开始监控其内存分配</span>\n"
+"    </div>\n"
+"    <div class=\"table-wrap\">\n"
+"      <table class=\"inject-table\">\n"
+"        <thead>\n"
+"          <tr>\n"
+"            <th style=\"width:80px\">PID</th>\n"
+"            <th>进程名</th>\n"
+"            <th style=\"width:50px\">状态</th>\n"
+"            <th style=\"width:120px\">注入状态</th>\n"
+"            <th style=\"width:80px\">操作</th>\n"
+"          </tr>\n"
+"        </thead>\n"
+"        <tbody id=\"ptb\">\n"
+"          <tr><td colspan=\"5\"><div class=\"empty\"><p>加载中...</p></div></td></tr>\n"
+"        </tbody>\n"
+"      </table>\n"
 "    </div>\n"
 "  </div>\n"
 "\n"
@@ -774,7 +841,7 @@ static const char* g_dashboard_html =
 "var autoRefresh = true;\n"
 "var failCount = 0;\n"
 "\n"
-"setInterval(function() { if (autoRefresh) refresh(); }, 3000);\n"
+"setInterval(function() { if (autoRefresh) { refresh(); loadProcesses(); } }, 3000);\n"
 "refresh();\n"
 "\n"
 "function toggleAuto() {\n"
@@ -890,6 +957,76 @@ static const char* g_dashboard_html =
 "      }\n"
 "    });\n"
 "}\n"
+"\n"
+"function loadProcesses() {\n"
+"  var filter = (document.getElementById('proc-filter').value || '').toLowerCase();\n"
+"  fetch('/api/processes')\n"
+"    .then(function(r) { return r.json(); })\n"
+"    .then(function(d) {\n"
+"      var rows = '';\n"
+"      var shown = 0;\n"
+"      for (var i = 0; i < d.processes.length; i++) {\n"
+"        var p = d.processes[i];\n"
+"        if (filter && p.name.toLowerCase().indexOf(filter) < 0) continue;\n"
+"        shown++;\n"
+"        var stateLabel = p.state === 'R' ? '运行' : (p.state === 'S' ? '睡眠' : p.state);\n"
+"        var injHtml = '';\n"
+"        if (p.injected) {\n"
+"          if (p.inj_status === 1) {\n"
+"            injHtml = '<span class=\"badge-ok\">监控中</span>';\n"
+"          } else if (p.inj_status === 2) {\n"
+"            injHtml = '<span class=\"badge-fail\" title=\"' + escAttr(p.inj_err) + '\">失败</span>';\n"
+"          }\n"
+"        } else {\n"
+"          injHtml = '<span class=\"badge-pending\">未注入</span>';\n"
+"        }\n"
+"        var btnHtml = '';\n"
+"        if (p.injected && p.inj_status === 1) {\n"
+"          btnHtml = '<span class=\"badge-ok\">已注入</span>';\n"
+"        } else {\n"
+"          btnHtml = '<button class=\"btn-sm\" onclick=\"injectProcess(' + p.pid + ', this)\">注入</button>';\n"
+"        }\n"
+"        rows += '<tr>' +\n"
+"          '<td style=\"font-family:var(--mono);font-size:11px\">' + p.pid + '</td>' +\n"
+"          '<td>' + esc(p.name) + '</td>' +\n"
+"          '<td style=\"font-size:11px\">' + stateLabel + '</td>' +\n"
+"          '<td>' + injHtml + '</td>' +\n"
+"          '<td>' + btnHtml + '</td>' +\n"
+"          '</tr>';\n"
+"      }\n"
+"      document.getElementById('ptb').innerHTML = rows ||\n"
+"        '<tr><td colspan=\"5\"><div class=\"empty\"><p>' + (filter ? '无匹配进程' : '无可用进程') + '</p></div></td></tr>';\n"
+"      document.getElementById('proc-count-inject').textContent = shown > 0 ? '(' + shown + ')' : '';\n"
+"    })\n"
+"    .catch(function() {\n"
+"      document.getElementById('ptb').innerHTML = '<tr><td colspan=\"5\"><div class=\"empty\"><p>加载失败</p></div></td></tr>';\n"
+"    });\n"
+"}\n"
+"\n"
+"function injectProcess(pid, btn) {\n"
+"  btn.disabled = true;\n"
+"  btn.textContent = '...';\n"
+"  toast('正在向 PID ' + pid + ' 注入...');\n"
+"  fetch('/api/inject?pid=' + pid)\n"
+"    .then(function(r) { return r.json(); })\n"
+"    .then(function(d) {\n"
+"      if (d.status === 'ok') {\n"
+"        toast('PID ' + pid + ' 注入成功！(' + d.patched + ' 个GOT表项已修补)');\n"
+"        loadProcesses();\n"
+"      } else {\n"
+"        toast('注入失败: ' + d.error);\n"
+"        btn.disabled = false;\n"
+"        btn.textContent = '重试';\n"
+"      }\n"
+"    })\n"
+"    .catch(function() {\n"
+"      toast('注入请求失败（网络错误）');\n"
+"      btn.disabled = false;\n"
+"      btn.textContent = '重试';\n"
+"    });\n"
+"}\n"
+"\n"
+"loadProcesses();\n"
 "\n"
 "function parseFrame(raw) {\n"
 "  if (!raw) return { fn: '?', lib: '', bin: '', off: '' };\n"
@@ -1211,6 +1348,326 @@ static void send_addr2line(int fd, const char* bin, const char* offset)
     send_all(fd, body, strlen(body));
 }
 
+/* ---- 注入 API 端点 ---- */
+
+/** libmemorytracetool.so 的默认搜索路径（相对于 mttd 可执行文件） */
+static const char* default_lib_paths[] = {
+    "lib/libmemorytracetool.so",
+    "../lib/libmemorytracetool.so",
+    "/usr/local/lib/libmemorytracetool.so",
+    NULL
+};
+
+/** 解析出注入库的绝对路径 */
+static int resolve_lib_path(char* out, size_t out_sz)
+{
+    (void)out_sz;
+    for (int i = 0; default_lib_paths[i]; i++) {
+        if (realpath(default_lib_paths[i], out)) return 0;
+    }
+    /* fallback: 假设在 build 目录下 ../lib/libmemorytracetool.so */
+    if (realpath("lib/libmemorytracetool.so", out)) return 0;
+    return -1;
+}
+
+/**
+ * GET /api/processes — 扫描 /proc 返回运行中进程列表（含注入状态）。
+ *
+ * 过滤规则: 只显示用户态进程（有 comm）、排除内核线程。
+ * 每条记录标注是否已被注入以及注入状态。
+ *
+ * @param fd  HTTP 客户端 socket
+ */
+static void send_api_processes(int fd)
+{
+    char buf[65536];
+    int pos = 0;
+    int size = (int)sizeof(buf);
+
+    const char* hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n";
+    int hdr_len = (int)strlen(hdr);
+    if (pos + hdr_len < size) { memcpy(buf + pos, hdr, hdr_len); pos += hdr_len; }
+
+    safe_append(buf, &pos, size, "{\"processes\":[");
+    int first = 1;
+
+    DIR* dir = opendir("/proc");
+    if (dir) {
+        struct dirent* de;
+        while ((de = readdir(dir))) {
+            /* 只处理数字目录（PID） */
+            if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+            int pid = atoi(de->d_name);
+            if (pid <= 1) continue;
+
+            char comm_path[64], comm[256] = "";
+            snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+            FILE* fc = fopen(comm_path, "r");
+            if (!fc) continue;
+            if (!fgets(comm, sizeof(comm), fc)) { fclose(fc); continue; }
+            fclose(fc);
+            /* 去掉尾部换行 */
+            size_t cl = strlen(comm);
+            while (cl > 0 && (comm[cl-1] == '\n' || comm[cl-1] == '\r'))
+                comm[--cl] = '\0';
+
+            /* 跳过内核线程: /proc/<pid>/exe 不可读 */
+            char exe_path[64];
+            snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", pid);
+            if (access(exe_path, F_OK) != 0) continue;
+
+            /* 检查进程状态（跳过僵尸） */
+            char stat_path[64];
+            snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
+            FILE* fs = fopen(stat_path, "r");
+            if (!fs) continue;
+            char state = '?';
+            /* stat 格式: pid (comm) state ... */
+            fscanf(fs, "%*d %*s %c", &state);
+            fclose(fs);
+            if (state == 'Z' || state == 'X') continue; /* 跳过僵尸和已死进程 */
+
+            /* 检查注入状态 */
+            int inj_status = 0;  /* 0=未注入，1=成功，2=失败 */
+            const char* inj_err = "";
+            for (int i = 0; i < g_ninjected; i++) {
+                if (g_injected[i].pid == pid) {
+                    inj_status = g_injected[i].inject_status;
+                    inj_err = g_injected[i].inject_err;
+                    break;
+                }
+            }
+
+            if (!first) safe_append(buf, &pos, size, ",");
+            first = 0;
+            safe_append(buf, &pos, size,
+                "{\"pid\":%d,\"name\":\"%s\",\"state\":\"%c\","
+                "\"injected\":%s,\"inj_status\":%d,\"inj_err\":\"%s\"}",
+                pid, comm, state,
+                inj_status == 1 ? "true" : "false",
+                inj_status, inj_err);
+        }
+        closedir(dir);
+    }
+    safe_append(buf, &pos, size, "]}");
+
+    send_all(fd, buf, pos);
+}
+
+/**
+ * GET /api/inject?pid=N — 向目标进程注入 libmemorytracetool.so。
+ *
+ * 通过 fork() 子进程执行 ptrace 注入，避免阻塞主事件循环。
+ * 超时保护: alarm(MTT_INJECT_TIMEOUT_SEC) 防止注入挂死。
+ *
+ * @param fd   HTTP 客户端 socket
+ * @param pid  目标进程 PID
+ */
+static void handle_api_inject(int fd, int pid)
+{
+    char resp[2048];
+    int valid = 1;
+    const char* err_msg = "";
+
+    /* 验证 */
+    if (pid <= 1) {
+        valid = 0; err_msg = "Invalid PID";
+    } else if (pid == getpid()) {
+        valid = 0; err_msg = "Cannot inject into self (the daemon)";
+    } else {
+        /* 检查是否已注入 */
+        for (int i = 0; i < g_ninjected; i++) {
+            if (g_injected[i].pid == pid && g_injected[i].inject_status == 1) {
+                snprintf(resp, sizeof(resp),
+                    "{\"pid\":%d,\"status\":\"already_injected\","
+                    "\"error\":\"Already injected at %s\"}",
+                    pid, ctime(&g_injected[i].inject_time));
+                valid = 0;
+                break;
+            }
+        }
+        if (valid) {
+            char proc_path[64];
+            snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
+            if (access(proc_path, F_OK) != 0) {
+                valid = 0; err_msg = "PID not found";
+            }
+        }
+    }
+
+    if (!valid && err_msg[0]) {
+        int n = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+            "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+            "{\"pid\":%d,\"status\":\"fail\",\"error\":\"%s\"}", pid, err_msg);
+        send_all(fd, resp, n);
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+        return;
+    }
+    if (!valid) {
+        /* already_injected 已写入 resp */
+        int n = (int)strlen(resp);
+        char hdr[256];
+        int hdrlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+            "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+            "Connection: close\r\n\r\n", n);
+        send_all(fd, hdr, hdrlen);
+        send_all(fd, resp, n);
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+        return;
+    }
+
+    /* 解析库路径 */
+    char lib_path[512];
+    if (resolve_lib_path(lib_path, sizeof(lib_path)) != 0) {
+        int n = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+            "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+            "{\"pid\":%d,\"status\":\"fail\",\"error\":\"Cannot find libmemorytracetool.so\"}",
+            pid);
+        send_all(fd, resp, n);
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+        return;
+    }
+
+    /* fork 子进程执行注入（避免 ptrace 阻塞主事件循环） */
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        int n = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 500 Internal Error\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+            "{\"pid\":%d,\"status\":\"fail\",\"error\":\"pipe() failed\"}", pid);
+        send_all(fd, resp, n);
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+        return;
+    }
+
+    pid_t child = fork();
+    if (child == -1) {
+        close(pipefd[0]); close(pipefd[1]);
+        int n = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 500 Internal Error\r\nContent-Type: application/json\r\n"
+            "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+            "{\"pid\":%d,\"status\":\"fail\",\"error\":\"fork() failed\"}", pid);
+        send_all(fd, resp, n);
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+        return;
+    }
+
+    if (child == 0) {
+        /* ---- 子进程: 执行注入 ---- */
+        close(pipefd[0]);
+        alarm(MTT_INJECT_TIMEOUT_SEC);
+        inject_result_t r = inject_library(pid, lib_path);
+        alarm(0);
+        /* 通过管道将结果发回父进程 */
+        ssize_t w = write(pipefd[1], &r, sizeof(r));
+        (void)w;
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    /* ---- 父进程: 等待结果 ---- */
+    close(pipefd[1]);
+    inject_result_t result;
+    memset(&result, 0, sizeof(result));
+    result.status = INJECT_ERR_TIMEOUT;
+    snprintf(result.err_msg, sizeof(result.err_msg), "Injection timed out");
+
+    ssize_t rbytes = read(pipefd[0], &result, sizeof(result));
+    close(pipefd[0]);
+
+    /* 等待子进程结束 */
+    int wstatus;
+    waitpid(child, &wstatus, 0);
+
+    if (rbytes != sizeof(result)) {
+        /* 子进程可能崩溃或管道中断 */
+        int n = snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+            "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+            "{\"pid\":%d,\"status\":\"fail\",\"error\":\"Injector child failed\"}",
+            pid);
+        send_all(fd, resp, n);
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+        return;
+    }
+
+    /* 记录注入结果 */
+    if (g_ninjected < MTT_MAX_INJECTED) {
+        g_injected[g_ninjected].pid = pid;
+        g_injected[g_ninjected].inject_time = time(NULL);
+        g_injected[g_ninjected].inject_status = (result.status == INJECT_OK) ? 1 : 2;
+        g_injected[g_ninjected].lib_base = result.lib_base;
+        g_injected[g_ninjected].patched_count = result.patched_count;
+        snprintf(g_injected[g_ninjected].inject_err,
+                 sizeof(g_injected[g_ninjected].inject_err),
+                 "%s", result.err_msg);
+        g_ninjected++;
+    }
+
+    char hdr[256];
+    int body_len = snprintf(resp, sizeof(resp),
+        "{\"pid\":%d,\"status\":\"%s\",\"error\":\"%s\",\"patched\":%d}",
+        pid,
+        result.status == INJECT_OK ? "ok" : "fail",
+        result.err_msg, result.patched_count);
+    int hdrlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+        "Connection: close\r\n\r\n", body_len);
+    send_all(fd, hdr, hdrlen);
+    send_all(fd, resp, body_len);
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+}
+
+/**
+ * GET /api/injected — 返回所有注入记录。
+ */
+static void send_api_injected(int fd)
+{
+    char buf[16384];
+    int pos = 0;
+    int size = (int)sizeof(buf);
+
+    const char* hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Connection: close\r\n\r\n";
+    int hdr_len = (int)strlen(hdr);
+    if (pos + hdr_len < size) { memcpy(buf + pos, hdr, hdr_len); pos += hdr_len; }
+
+    safe_append(buf, &pos, size, "{\"injected\":[");
+    for (int i = 0; i < g_ninjected; i++) {
+        if (i > 0) safe_append(buf, &pos, size, ",");
+        safe_append(buf, &pos, size,
+            "{\"pid\":%d,\"inject_status\":%d,\"lib_base\":\"0x%lx\","
+            "\"patched\":%d,\"time\":%ld,\"error\":\"%s\"}",
+            g_injected[i].pid,
+            g_injected[i].inject_status,
+            g_injected[i].lib_base,
+            g_injected[i].patched_count,
+            (long)g_injected[i].inject_time,
+            g_injected[i].inject_err);
+    }
+    safe_append(buf, &pos, size, "]}");
+
+    send_all(fd, buf, pos);
+}
+
 /**
  * 处理 HTTP 请求并路由。
  *
@@ -1219,6 +1676,9 @@ static void send_addr2line(int fd, const char* bin, const char* offset)
  * 支持的路由：
  *   GET /api/data       → JSON 泄漏数据（send_api_data）
  *   GET /api/addr2line  → addr2line 源码解析（send_addr2line）
+ *   GET /api/processes  → 进程列表（send_api_processes）
+ *   GET /api/inject     → 运行时注入（handle_api_inject）
+ *   GET /api/injected   → 注入记录（send_api_injected）
  *   其他                → 看板 HTML 页面（g_dashboard_html）
  */
 static void handle_http(int fd)
@@ -1272,6 +1732,28 @@ static void handle_http(int fd)
                 "Connection: close\r\n\r\n";
             send_all(fd, err, strlen(err));
         }
+    } else if (strncmp(buf, "GET /api/processes", 18) == 0) {
+        send_api_processes(fd);
+    } else if (strncmp(buf, "GET /api/inject", 15) == 0) {
+        /* 解析 ?pid=N */
+        int pid = 0;
+        char* params = strchr(buf, '?');
+        if (params) {
+            char* p = strstr(params, "pid=");
+            if (p) pid = atoi(p + 4);
+        }
+        if (pid > 1)
+            handle_api_inject(fd, pid);
+        else {
+            const char* err =
+                "HTTP/1.1 400 Bad Request\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n\r\n"
+                "{\"error\":\"missing pid parameter\"}";
+            send_all(fd, err, strlen(err));
+        }
+    } else if (strncmp(buf, "GET /api/injected", 17) == 0) {
+        send_api_injected(fd);
     } else if (strncmp(buf, "GET /api/data", 13) == 0) {
         send_api_data(fd);
     } else {
