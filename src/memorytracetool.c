@@ -466,13 +466,14 @@ void mtt_set_sample_period(unsigned period)
 {
     mtt_ensure_init();
     if (period <= MTT_SAMPLE_MAX_PERIOD)
-        g_state.sample_period = period;
+        atomic_store(&g_state.sample_period, period);
 }
 
 /** 获取采样周期 */
 unsigned mtt_get_sample_period(void)
 {
-    return g_state.sample_period;
+    mtt_ensure_init();
+    return atomic_load(&g_state.sample_period);
 }
 
 /** 设置哈希表容量上限 */
@@ -491,8 +492,8 @@ size_t mtt_get_skipped_overcap(void) { return atomic_load(&g_state.skipped_overc
 
 /* ---- 常驻进程信号驱动报告 ---- */
 
-/* 信号处理器安装标志（原子类型，保证 sig_atomic_t 的读写可见性） */
-static volatile sig_atomic_t g_signal_installed = 0;
+/* 信号处理器安装标志（原子 CAS 防止重复安装） */
+static atomic_int g_signal_installed = 0;
 
 /* 信号线程退出控制 */
 static volatile int g_signal_thread_stop = 0;
@@ -533,8 +534,9 @@ static void* signal_thread_fn(void* arg)
  */
 void mtt_install_signal_handler(void)
 {
-    if (g_signal_installed) return;
-    g_signal_installed = 1;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_signal_installed, &expected, 1))
+        return;
 
     /* 阻塞 SIGUSR1，使其被 sigwait 线程捕获 */
     sigset_t set;
@@ -673,6 +675,14 @@ void* mtt_realloc(void* ptr, size_t size, const char* file, int line)
     void* new_ptr = raw_malloc(size);
     if (!new_ptr) return NULL;
 
+    /* 缺陷修复 #5: 先创建新追踪记录，失败则放弃本次 realloc。
+     * 避免旧记录已删除但新记录创建失败时的追踪状态损坏。 */
+    mtt_entry_t* e = mtt_entry_new(new_ptr, size, file, line);
+    if (!e) {
+        raw_free(new_ptr);
+        return NULL;
+    }
+
     /* 从追踪表中删除旧记录 */
     mtt_stripe_lock(s, ptr);
     mtt_entry_t* old = mtt_entry_find(s, ptr);
@@ -685,13 +695,6 @@ void* mtt_realloc(void* ptr, size_t size, const char* file, int line)
     mtt_stripe_unlock(s, ptr);
 
     memcpy(new_ptr, ptr, old_size < size ? old_size : size);
-
-    /* realloc 始终创建追踪记录（不受采样影响，保证追踪一致性） */
-    mtt_entry_t* e = mtt_entry_new(new_ptr, size, file, line);
-    if (!e) {
-        raw_free(ptr);
-        return new_ptr;
-    }
 
     mtt_stripe_lock(s, new_ptr);
     e->alloc_num = ++s->alloc_seq;

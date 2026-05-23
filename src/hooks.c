@@ -173,6 +173,13 @@ void* realloc(void* ptr, size_t size)
     void* new_ptr = raw_malloc(size);
     if (!new_ptr) return NULL;
 
+    /* 缺陷修复 #5: 先创建新追踪记录，失败则放弃本次 realloc */
+    mtt_entry_t* e = mtt_entry_new(new_ptr, size, "?", 0);
+    if (!e) {
+        raw_free(new_ptr);
+        return NULL;
+    }
+
     /* 从追踪表删除旧记录 */
     mtt_stripe_lock(s, ptr);
     mtt_entry_t* old = mtt_entry_find(s, ptr);
@@ -185,12 +192,6 @@ void* realloc(void* ptr, size_t size)
     mtt_stripe_unlock(s, ptr);
 
     memcpy(new_ptr, ptr, old_size < size ? old_size : size);
-
-    mtt_entry_t* e = mtt_entry_new(new_ptr, size, "?", 0);
-    if (!e) {
-        raw_free(ptr);
-        return new_ptr;
-    }
 
     mtt_stripe_lock(s, new_ptr);
     e->alloc_num = ++s->alloc_seq;
