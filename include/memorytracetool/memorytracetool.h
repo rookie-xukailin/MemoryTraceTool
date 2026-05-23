@@ -8,6 +8,12 @@
  *   Preload 模式: LD_PRELOAD=libmemorytracetool.so ./your_program
  *                无需修改源码，但无文件:行号信息。
  *
+ * 环境变量控制（不影响代码，仅需设置环境变量）：
+ *   MTT_SAMPLE=N       — 每 N 次分配记录 1 次，0=全量，默认 256
+ *   MTT_DISABLE=1      — 完全禁用追踪（紧急开关，降低开销为零）
+ *   MTT_PROC_FILTER=name — 仅追踪进程名为 name 的进程，其他进程自动禁用
+ *   MTT_MAX_ENTRIES=N  — 哈希表最大条目数，默认 65536
+ *
  * 重要：Macro 模式下，系统头文件（stdlib.h、string.h 等）必须
  * 放在 #define MEMORYTRACETOOL_ENABLE 之前，否则会导致语法错误。
  */
@@ -56,6 +62,21 @@ void  mtt_install_signal_handler(void);
  * 适用于在程序逻辑中主动触发的周期性报告。
  */
 void  mtt_client_report(void);
+
+/** 设置采样周期（0=全量追踪，N>0=每N次分配记录1次），线程安全 */
+void  mtt_set_sample_period(unsigned period);
+
+/** 获取当前采样周期 */
+unsigned mtt_get_sample_period(void);
+
+/** 设置哈希表最大条目数，超过后新分配不再记录 */
+void  mtt_set_max_entries(unsigned limit);
+
+/** 获取跳过的采样统计 */
+size_t mtt_get_skipped_sampled(void);
+
+/** 获取因超容量跳过的统计 */
+size_t mtt_get_skipped_overcap(void);
 
 /*
  * ============================================================

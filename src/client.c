@@ -13,6 +13,12 @@
  * 本文件提供两个入口：
  *   - mtt_client_report():       中间报告，关闭连接时不含 BYE
  *   - mtt_client_report_final(): 最终报告，发送 BYE 后关闭
+ *
+ * 缺陷修复 #1: 使用 send_all 替换裸 send 防止部分写入。
+ * 缺陷修复 #2: 添加 shutdown() 优雅关闭连接。
+ * 缺陷修复 #3: 修复 backtrace_symbols 返回值释放方式。
+ * 缺陷修复 #4: 修复 socket 泄漏（错误路径 close 保护）。
+ * 缺陷修复 #23: 遍历桶时逐锁收集记录，安全读取链表。
  */
 #define _GNU_SOURCE
 #include "internal.h"
@@ -27,21 +33,36 @@
 #include <execinfo.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <errno.h>
 
 /* 缓存的套接字文件描述符，避免重复连接 */
 static int g_sock_fd = -1;
 
 /**
+ * 安全的整行发送（处理部分写入和 EINTR）。
+ *
+ * 缺陷修复 #1: 替换裸 send() 调用，确保完整发送。
+ */
+static int send_all(int fd, const void* buf, size_t len)
+{
+    const char* p = (const char*)buf;
+    size_t remaining = len;
+    while (remaining > 0) {
+        ssize_t n = send(fd, p, remaining, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += n;
+        remaining -= (size_t)n;
+    }
+    return 0;
+}
+
+/**
  * 使用 dladdr 将栈帧地址解析为人类可读的符号名称。
  *
  * 格式: "显示名|二进制路径|文件偏移"
- * - 显示名用于前端展示（如 "main (myapp)"）
- * - 二进制路径和文件偏移用于 addr2line 源码解析
- * dladdr 失败时退化为 backtrace_symbols 的输出。
- *
- * @param addr      backtrace 返回的原始栈帧地址
- * @param out       输出缓冲区
- * @param out_size  输出缓冲区大小
  */
 static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
 {
@@ -68,13 +89,10 @@ static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
             char* fallback = NULL;
             char** syms = backtrace_symbols(&addr, 1);
             if (syms && syms[0]) {
-                /* 尝试从 backtrace_symbols 输出中提取函数名
-                 * 格式通常为: path(func+off) [addr] 或 path(+off) [addr] */
                 char* paren = strchr(syms[0], '(');
                 char* plus  = strchr(syms[0], '+');
                 if (paren && plus && plus > paren) {
-                    /* 有函数名: path(func+off) */
-                    size_t name_len = plus - paren - 1;
+                    size_t name_len = (size_t)(plus - paren - 1);
                     if (name_len > 0 && name_len < 256) {
                         fallback = raw_malloc(name_len + 1);
                         if (fallback) {
@@ -91,7 +109,8 @@ static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
                     snprintf(out, out_size, "%s(+%#tx)|%s|%#tx",
                              basename, file_off, fullpath, file_off);
                 }
-                raw_free(syms);
+                /* 缺陷修复 #3: 使用 free() 释放 backtrace_symbols 返回的内存 */
+                free(syms);
             } else {
                 snprintf(out, out_size, "%s(+%#tx)|%s|%#tx",
                          basename, file_off, fullpath, file_off);
@@ -102,7 +121,7 @@ static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
         char** syms = backtrace_symbols(&addr, 1);
         if (syms && syms[0]) {
             snprintf(out, out_size, "%s||", syms[0]);
-            raw_free(syms);
+            free(syms);
         } else {
             snprintf(out, out_size, "%p||", addr);
         }
@@ -111,12 +130,6 @@ static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
 
 /**
  * 连接到 mttd 守护进程的 Unix Domain Socket。
- *
- * 连接成功后发送 HELLO 消息，其中包含进程 PID 和从
- * /proc/<pid>/exe 读取的进程名。在连接建立后缓存 socket fd，
- * 后续中间报告可能复用此连接（当前实现每次关闭后重建）。
- *
- * @return socket fd (>=0) 表示成功，-1 表示守护进程不可达
  */
 static int connect_daemon(void)
 {
@@ -144,32 +157,29 @@ static int connect_daemon(void)
         exe_name[len] = '\0';
         const char* base = strrchr(exe_name, '/');
         if (base) {
-            /* memmove 处理重叠内存（同一数组内移动） */
             memmove(exe_name, base + 1, strlen(base + 1) + 1);
         }
     } else {
-        /* /proc/<pid>/exe 不可读时的 fallback */
         snprintf(exe_name, sizeof(exe_name), "process_%d", getpid());
     }
 
     char msg[512];
     int n = snprintf(msg, sizeof(msg), "HELLO %d %s\n", getpid(), exe_name);
-    send(g_sock_fd, msg, n, MSG_NOSIGNAL);
+    if (n > 0 && n < (int)sizeof(msg))
+        send_all(g_sock_fd, msg, (size_t)n);
 
     return g_sock_fd;
 }
 
 /**
- * 发送中间泄漏报告到守护进程。
+ * 通用的泄漏报告发送函数。
  *
- * 遍历所有哈希桶收集当前泄漏记录，序列化后发送。
- * 关闭连接时**不发送** BYE 消息 — 守护进程会保持该进程状态为 ACTIVE。
+ * 缺陷修复 #23: 逐锁收集记录到临时数组，避免无锁遍历链表。
+ * 每个分段锁只持有一小段时间，收集完即释放。
  *
- * 适用于：
- *   - SIGUSR1 信号触发（常驻进程周期性报告）
- *   - 程序逻辑中主动调用的 mtt_report_to_daemon()
+ * @param is_final  1=最终报告（发送BYE），0=中间报告
  */
-void mtt_client_report(void)
+static void do_client_report(int is_final)
 {
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
@@ -177,17 +187,23 @@ void mtt_client_report(void)
     int fd = connect_daemon();
     if (fd < 0) return; /* 守护进程不可达，静默跳过 */
 
-    /* 收集所有泄漏记录到临时数组（避免在遍历时被锁阻塞） */
+    /* 收集所有泄漏记录（逐锁遍历，避免长时间持锁） */
     int nleaks = 0;
     mtt_entry_t** entries = raw_malloc(MTT_MAX_LEAKS_PER_PROC * sizeof(mtt_entry_t*));
-    if (!entries) return;
+    if (!entries) { shutdown(fd, SHUT_RDWR); close(fd); g_sock_fd = -1; return; }
 
-    for (unsigned b = 0; b < s->bucket_count && nleaks < MTT_MAX_LEAKS_PER_PROC; b++) {
-        mtt_entry_t* e = s->buckets[b];
-        while (e && nleaks < MTT_MAX_LEAKS_PER_PROC) {
-            entries[nleaks++] = e;
-            e = e->next;
+    for (unsigned lock_idx = 0; lock_idx < MTT_LOCK_STRIPES
+         && nleaks < MTT_MAX_LEAKS_PER_PROC; lock_idx++) {
+        pthread_mutex_lock(&s->bucket_locks[lock_idx]);
+        for (unsigned b = lock_idx; b < s->bucket_count
+             && nleaks < MTT_MAX_LEAKS_PER_PROC; b += MTT_LOCK_STRIPES) {
+            mtt_entry_t* e = s->buckets[b];
+            while (e && nleaks < MTT_MAX_LEAKS_PER_PROC) {
+                entries[nleaks++] = e;
+                e = e->next;
+            }
         }
+        pthread_mutex_unlock(&s->bucket_locks[lock_idx]);
     }
 
     /* 序列化并发送每条泄漏 */
@@ -197,19 +213,25 @@ void mtt_client_report(void)
         char line[4096];
         int n = snprintf(line, sizeof(line),
             "LEAK %zu %s %d %d\n", e->size, e->file, e->line, e->stack_frames);
-        send(fd, line, n, MSG_NOSIGNAL);
+        if (n > 0 && n < (int)sizeof(line))
+            send_all(fd, line, (size_t)n);
 
-        /* 解析调用栈帧地址为可读符号，携带原始地址供 addr2line 解析 */
+        /* 解析调用栈帧地址为可读符号 */
         for (int j = 0; j < e->stack_frames; j++) {
             char resolved[MTT_SYMBOL_MAX];
             resolve_frame_symbol(e->stack[j], resolved, sizeof(resolved));
-            int n2 = snprintf(line, sizeof(line),
-                "FRAME %d %s\n", j, resolved);
-            send(fd, line, n2, MSG_NOSIGNAL);
+            n = snprintf(line, sizeof(line), "FRAME %d %s\n", j, resolved);
+            if (n > 0 && n < (int)sizeof(line))
+                send_all(fd, line, (size_t)n);
         }
     }
 
-    /* 关闭连接但不发送 BYE — 进程仍在运行 */
+    if (is_final) {
+        send_all(fd, "BYE\n", 4);
+    }
+
+    /* 缺陷修复 #2: shutdown 后关闭，确保数据发送完毕 */
+    shutdown(fd, SHUT_RDWR);
     close(fd);
     g_sock_fd = -1;
 
@@ -217,55 +239,17 @@ void mtt_client_report(void)
 }
 
 /**
+ * 发送中间泄漏报告到守护进程。
+ */
+void mtt_client_report(void)
+{
+    do_client_report(0);
+}
+
+/**
  * 发送最终泄漏报告到守护进程（进程退出时调用）。
- *
- * 与 mtt_client_report 的区别在于关闭连接前会发送 BYE 消息，
- * 守护进程收到 BYE 后将该进程标记为 DONE（不再活跃）。
- *
- * 由 atexit 回调或进程退出路径调用。
  */
 void mtt_client_report_final(void)
 {
-    mtt_ensure_init();
-    mtt_state_t* s = mtt_state_get();
-
-    int fd = connect_daemon();
-    if (fd < 0) return;
-
-    /* 收集所有泄漏记录 */
-    int nleaks = 0;
-    mtt_entry_t** entries = raw_malloc(MTT_MAX_LEAKS_PER_PROC * sizeof(mtt_entry_t*));
-    if (!entries) return;
-
-    for (unsigned b = 0; b < s->bucket_count && nleaks < MTT_MAX_LEAKS_PER_PROC; b++) {
-        mtt_entry_t* e = s->buckets[b];
-        while (e && nleaks < MTT_MAX_LEAKS_PER_PROC) {
-            entries[nleaks++] = e;
-            e = e->next;
-        }
-    }
-
-    for (int i = 0; i < nleaks; i++) {
-        mtt_entry_t* e = entries[i];
-
-        char line[4096];
-        int n = snprintf(line, sizeof(line),
-            "LEAK %zu %s %d %d\n", e->size, e->file, e->line, e->stack_frames);
-        send(fd, line, n, MSG_NOSIGNAL);
-
-        for (int j = 0; j < e->stack_frames; j++) {
-            char resolved[MTT_SYMBOL_MAX];
-            resolve_frame_symbol(e->stack[j], resolved, sizeof(resolved));
-            int n2 = snprintf(line, sizeof(line),
-                "FRAME %d %s\n", j, resolved);
-            send(fd, line, n2, MSG_NOSIGNAL);
-        }
-    }
-
-    /* 发送 BYE 标记进程退出 */
-    send(fd, "BYE\n", 4, MSG_NOSIGNAL);
-    close(fd);
-    g_sock_fd = -1;
-
-    raw_free(entries);
+    do_client_report(1);
 }
