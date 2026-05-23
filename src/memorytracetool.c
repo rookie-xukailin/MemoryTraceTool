@@ -758,8 +758,10 @@ void mtt_report_to_fd(int fd)
     mtt_ensure_init();
     mtt_state_t* s = &g_state;
 
-    FILE* fp = fdopen(dup(fd), "w");
-    if (!fp) return;
+    int dupfd = dup(fd);
+    if (dupfd < 0) return;
+    FILE* fp = fdopen(dupfd, "w");
+    if (!fp) { close(dupfd); return; }
 
     size_t alloc_count = atomic_load(&s->alloc_count);
     size_t free_count  = atomic_load(&s->free_count);
