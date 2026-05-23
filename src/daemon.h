@@ -22,6 +22,7 @@
 /* 连接管理常量 */
 #define MTT_CLIENT_TIMEOUT_S 30                /* 客户端空闲超时（秒） */
 #define MTT_UNIX_BUF_SZ      16384             /* Unix socket 缓冲区大小 */
+#define MTT_LOG_DIR          "/var/log/mtt"    /* 持久化日志目录（fallback: /tmp/mtt-logs） */
 
 /* ---- 守护进程端泄漏记录 ---- */
 

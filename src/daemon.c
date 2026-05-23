@@ -38,6 +38,7 @@
 #include <dirent.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include "injector.h"
 #include "internal.h"
 
@@ -176,6 +177,8 @@ static mttd_proc_t* find_or_create_proc(int pid, const char* name)
     return p;
 }
 
+static void persist_proc(mttd_proc_t* p);
+
 /**
  * 向进程记录添加一条泄漏信息。
  *
@@ -209,6 +212,7 @@ static int add_leak(mttd_proc_t* p, mttd_leak_t* leak)
     p->leaks[p->leak_count++] = *leak;
     p->total_leaked += leak->size;
     atomic_fetch_add(&g_total_leaks_global, 1);
+    persist_proc(p);
     return 0;
 }
 
@@ -225,6 +229,146 @@ static void set_recv_timeout(int fd, int seconds)
 {
     struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+}
+
+/* ---- 持久化与存活检测 ---- */
+
+/** 获取持久化日志目录（优先 /var/log/mtt，fallback /tmp/mtt-logs） */
+static const char* get_log_dir(void)
+{
+    static char dir[256] = {0};
+    if (dir[0]) return dir;
+
+    const char* primary = MTT_LOG_DIR;
+    if (mkdir(primary, 0755) == 0 || access(primary, W_OK) == 0) {
+        snprintf(dir, sizeof(dir), "%s", primary);
+        return dir;
+    }
+    /* fallback */
+    const char* fb = "/tmp/mtt-logs";
+    mkdir(fb, 0755);
+    snprintf(dir, sizeof(dir), "%s", fb);
+    return dir;
+}
+
+/** 将进程泄漏数据序列化为 JSON 并写入持久化文件 */
+static void persist_proc(mttd_proc_t* p)
+{
+    const char* logdir = get_log_dir();
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%d.json", logdir, p->pid);
+
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+
+    fprintf(f, "{\"pid\":%d,\"name\":\"%s\",\"active\":%d,\"total_leaked\":%zu,"
+            "\"last_seen\":%ld,\"leaks\":[",
+            p->pid, p->name, p->active, p->total_leaked, (long)p->last_seen);
+
+    for (int i = 0; i < p->leak_count; i++) {
+        mttd_leak_t* l = &p->leaks[i];
+        fprintf(f, "%s{\"size\":%zu,\"file\":\"%s\",\"line\":%d,\"nframes\":%d,\"frames\":[",
+                i > 0 ? "," : "", l->size, l->file, l->line, l->nframes);
+        for (int j = 0; j < l->nframes; j++) {
+            fprintf(f, "%s\"", j > 0 ? "," : "");
+            /* 转义 JSON 特殊字符 */
+            for (char* s = l->frames[j]; *s; s++) {
+                if (*s == '"' || *s == '\\') fputc('\\', f);
+                fputc(*s, f);
+            }
+            fputc('"', f);
+        }
+        fprintf(f, "]}");
+    }
+    fprintf(f, "]}\n");
+    fclose(f);
+}
+
+/** 启动时从持久化目录加载历史记录 */
+static void load_persisted(void)
+{
+    const char* logdir = get_log_dir();
+    DIR* d = opendir(logdir);
+    if (!d) return;
+
+    struct dirent* de;
+    while ((de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", logdir, de->d_name);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz <= 0 || sz > 1048576) { fclose(f); continue; } /* 跳过空文件或 >1MB */
+
+        char* json = malloc((size_t)sz + 1);
+        if (!json) { fclose(f); continue; }
+        size_t nread = fread(json, 1, (size_t)sz, f);
+        fclose(f);
+        if (nread <= 0) { free(json); continue; }
+        json[nread] = '\0';
+
+        /* 简易 JSON 解析：提取 pid/name/active */
+        int pid = 0;
+        char name[256] = {0};
+        char* pp = json;
+        char* pidp = strstr(pp, "\"pid\":");
+        if (pidp) pid = atoi(pidp + 6);
+        char* namep = strstr(pp, "\"name\":\"");
+        if (namep) {
+            namep += 8;
+            int ni = 0;
+            while (*namep && *namep != '"' && ni < 254) name[ni++] = *namep++;
+            name[ni] = '\0';
+        }
+        char* actp = strstr(pp, "\"active\":");
+        int persisted_active = actp ? atoi(actp + 9) : 1;
+
+        free(json);
+
+        if (pid <= 1) continue;
+
+        /* 检查是否已有此 PID 的记录 */
+        int exists = 0;
+        for (int i = 0; i < g_nprocs; i++) {
+            if (g_procs[i].pid == pid) { exists = 1; break; }
+        }
+        if (exists) continue;
+
+        /* 创建记录（标记为非活跃，等待 HELLO 恢复） */
+        if (g_nprocs < MTT_MAX_PROCS) {
+            mttd_proc_t* p = &g_procs[g_nprocs++];
+            memset(p, 0, sizeof(*p));
+            p->pid = pid;
+            snprintf(p->name, sizeof(p->name), "%s", name[0] ? name : "?");
+            p->active = persisted_active; /* 使用持久化的状态 */
+            p->last_seen = time(NULL);
+            p->leak_cap = 32;
+            p->leaks = malloc(p->leak_cap * sizeof(mttd_leak_t));
+            pthread_mutex_init(&p->lock, NULL);
+            printf("[mttd] 已加载历史记录: PID %d (%s)\n", pid, name);
+        }
+    }
+    closedir(d);
+}
+
+/** 检查已监控进程是否仍然存活 */
+static void check_liveness(void)
+{
+    for (int i = 0; i < g_nprocs; i++) {
+        if (!g_procs[i].active) continue;
+        char proc_path[64];
+        snprintf(proc_path, sizeof(proc_path), "/proc/%d", g_procs[i].pid);
+        if (access(proc_path, F_OK) != 0) {
+            pthread_mutex_lock(&g_procs[i].lock);
+            g_procs[i].active = 0;
+            pthread_mutex_unlock(&g_procs[i].lock);
+            persist_proc(&g_procs[i]);
+        }
+    }
 }
 
 /* 每个 Unix 客户端的解析上下文（消除 static 变量冲突） */
@@ -350,836 +494,1032 @@ static const char* g_dashboard_html =
 "<head>\n"
 "<meta charset=\"UTF-8\">\n"
 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
-"<title>MemoryTraceTool - 内存泄漏监控</title>\n"
+"<title>MemoryTraceTool</title>\n"
 "<style>\n"
-":root {\n"
-"  --bg: #ffffff;\n"
-"  --bg-secondary: #f6f8fa;\n"
-"  --bg-tertiary: #f3f4f6;\n"
-"  --border: #d0d7de;\n"
-"  --border-light: #e8ecf0;\n"
-"  --text: #1f2328;\n"
-"  --text-secondary: #656d76;\n"
-"  --text-tertiary: #8b949e;\n"
-"  --accent: #0969da;\n"
-"  --accent-light: #ddf4ff;\n"
-"  --green: #1a7f37;\n"
-"  --green-bg: #dafbe1;\n"
-"  --green-border: #aceebb;\n"
-"  --red: #cf222e;\n"
-"  --red-bg: #ffebe9;\n"
-"  --red-border: #ffc1ba;\n"
-"  --orange: #9a6700;\n"
-"  --orange-bg: #fff8c5;\n"
-"  --purple: #8250df;\n"
-"  --shadow-sm: 0 1px 2px rgba(31,35,40,0.04);\n"
-"  --shadow-md: 0 3px 8px rgba(31,35,40,0.06);\n"
-"  --shadow-lg: 0 8px 24px rgba(31,35,40,0.08);\n"
-"  --radius: 8px;\n"
-"  --radius-sm: 6px;\n"
-"  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif;\n"
-"  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', ui-monospace, monospace;\n"
+":root{\n"
+"  --bg:#080b12;\n"
+"  --surface:#111622;\n"
+"  --surface-hover:#181d2a;\n"
+"  --border:rgba(0,212,255,.07);\n"
+"  --border-strong:rgba(0,212,255,.13);\n"
+"  --text:#e4e7ec;\n"
+"  --text2:#8892a4;\n"
+"  --text3:#5e6676;\n"
+"  --accent:#00d4ff;\n"
+"  --green:#00e676;\n"
+"  --red:#ff3b3b;\n"
+"  --orange:#ffb800;\n"
+"  --purple:#b388ff;\n"
+"  --font:-apple-system,BlinkMacSystemFont,'Segoe UI','Noto Sans',system-ui,sans-serif;\n"
+"  --mono:'Courier New','Liberation Mono','Consolas',monospace;\n"
+"  --radius:4px;\n"
 "}\n"
-"* { margin: 0; padding: 0; box-sizing: border-box; }\n"
-"body {\n"
-"  font-family: var(--font);\n"
-"  background: var(--bg-secondary);\n"
-"  color: var(--text);\n"
-"  min-height: 100vh;\n"
-"  line-height: 1.5;\n"
-"  -webkit-font-smoothing: antialiased;\n"
+"*{margin:0;padding:0;box-sizing:border-box}\n"
+"body{\n"
+"  font-family:var(--font);font-size:14px;\n"
+"  background:var(--bg);color:var(--text);\n"
+"  min-height:100vh;display:flex;\n"
+"  -webkit-font-smoothing:antialiased;\n"
+"  cursor:crosshair;\n"
 "}\n"
-"/* ---- Navbar ---- */\n"
-".nav {\n"
-"  background: var(--bg);\n"
-"  border-bottom: 1px solid var(--border);\n"
-"  padding: 0 24px;\n"
-"  height: 56px;\n"
-"  display: flex;\n"
-"  align-items: center;\n"
-"  justify-content: space-between;\n"
-"  position: sticky;\n"
-"  top: 0;\n"
-"  z-index: 100;\n"
-"  box-shadow: var(--shadow-sm);\n"
+"\n"
+"/* ===== SIDEBAR ===== */\n"
+".sidebar{\n"
+"  width:220px;min-width:220px;\n"
+"  background:var(--surface);border-right:1px solid var(--border);\n"
+"  display:flex;flex-direction:column;position:sticky;top:0;height:100vh;z-index:100;\n"
+"  transition:width .2s,min-width .2s;\n"
 "}\n"
-".nav-brand {\n"
-"  display: flex;\n"
-"  align-items: center;\n"
-"  gap: 10px;\n"
-"  font-size: 15px;\n"
-"  font-weight: 600;\n"
-"  color: var(--text);\n"
-"  letter-spacing: -.2px;\n"
+".sidebar.folded{width:50px;min-width:50px}\n"
+".sb-brand{\n"
+"  padding:14px 16px;display:flex;align-items:center;gap:9px;\n"
+"  font-size:15px;font-weight:700;letter-spacing:-.2px;\n"
+"  border-bottom:1px solid var(--border);\n"
 "}\n"
-".nav-brand .logo {\n"
-"  width: 28px; height: 28px;\n"
-"  background: linear-gradient(135deg, var(--accent), #0550ae);\n"
-"  border-radius: 7px;\n"
-"  display: flex;\n"
-"  align-items: center;\n"
-"  justify-content: center;\n"
-"  color: #fff;\n"
-"  font-size: 14px;\n"
-"  font-weight: 700;\n"
+".sb-dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);flex-shrink:0;transition:all .3s}\n"
+".sb-dot.off{background:#444;box-shadow:none}\n"
+".sidebar.folded .sb-text{display:none}\n"
+".sidebar.folded .sb-brand{justify-content:center;padding:14px 8px}\n"
+".sb-nav{flex:1;padding:8px 0;display:flex;flex-direction:column;gap:1px}\n"
+".sb-item{\n"
+"  display:flex;align-items:center;gap:9px;padding:7px 16px;\n"
+"  font-size:14px;color:var(--text2);cursor:pointer;transition:all .12s;\n"
+"  border-left:2px solid transparent;user-select:none;white-space:nowrap;\n"
 "}\n"
-".nav-actions {\n"
-"  display: flex;\n"
-"  align-items: center;\n"
-"  gap: 10px;\n"
+".sb-item:hover{color:var(--text);background:var(--surface-hover)}\n"
+".sb-item.on{color:var(--accent);border-left-color:var(--accent)}\n"
+".sb-item svg{flex-shrink:0;opacity:.55}\n"
+".sb-item.on svg,.sb-item:hover svg{opacity:1}\n"
+".sidebar.folded .sb-item{padding:7px 10px;justify-content:center}\n"
+".sidebar.folded .sb-label{display:none}\n"
+".sb-toggle{\n"
+"  padding:10px 16px;border-top:1px solid var(--border);\n"
+"  font-size:12px;color:var(--text3);cursor:pointer;user-select:none;text-align:center;transition:color .15s;\n"
 "}\n"
-".nav-dot {\n"
-"  width: 7px; height: 7px;\n"
-"  border-radius: 50%;\n"
-"  background: var(--green);\n"
-"  box-shadow: 0 0 0 3px var(--green-bg);\n"
-"  transition: all .3s;\n"
+".sb-toggle:hover{color:var(--text)}\n"
+".sidebar.folded .sb-toggle{padding:10px 6px}\n"
+"\n"
+"/* ===== MAIN ===== */\n"
+".main{flex:1;display:flex;flex-direction:column;min-width:0}\n"
+".topbar{\n"
+"  padding:10px 22px;background:var(--surface);border-bottom:1px solid var(--border);\n"
+"  display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50;\n"
 "}\n"
-".nav-dot.off {\n"
-"  background: var(--text-tertiary);\n"
-"  box-shadow: 0 0 0 3px var(--bg-secondary);\n"
+".topbar-left{display:flex;align-items:center;gap:10px}\n"
+".topbar-time{font-family:var(--mono);font-size:12px;color:var(--accent);font-variant-numeric:tabular-nums}\n"
+".topbar-status{font-size:12px;color:var(--text2);letter-spacing:.3px}\n"
+"\n"
+".btn{\n"
+"  background:transparent;border:1px solid var(--border-strong);color:var(--text);\n"
+"  padding:5px 13px;border-radius:var(--radius);cursor:pointer;font-size:12px;\n"
+"  font-family:var(--font);transition:all .12s;white-space:nowrap;\n"
+"  position:relative;overflow:hidden;letter-spacing:.2px;\n"
 "}\n"
-".nav-age {\n"
-"  font-family: var(--mono);\n"
-"  font-size: 11px;\n"
-"  color: var(--text-secondary);\n"
-"  margin-right: 4px;\n"
+".btn:hover{background:var(--surface-hover);border-color:var(--accent);color:var(--accent)}\n"
+".btn:active{transform:scale(.97)}\n"
+".btn.warn{border-color:var(--orange);color:var(--orange)}\n"
+".btn.warn:hover{background:rgba(255,184,0,.08)}\n"
+"\n"
+"/* ripple */\n"
+".ripple{\n"
+"  position:absolute;border-radius:50%;background:rgba(0,212,255,.2);\n"
+"  transform:scale(0);animation:ripple .45s ease-out;pointer-events:none;\n"
 "}\n"
-".btn {\n"
-"  background: var(--bg);\n"
-"  border: 1px solid var(--border);\n"
-"  color: var(--text);\n"
-"  padding: 5px 14px;\n"
-"  border-radius: var(--radius-sm);\n"
-"  cursor: pointer;\n"
-"  font-size: 12px;\n"
-"  font-weight: 500;\n"
-"  font-family: var(--font);\n"
-"  transition: all .15s;\n"
-"  white-space: nowrap;\n"
+"@keyframes ripple{to{transform:scale(4);opacity:0}}\n"
+"\n"
+".content{padding:18px 22px;flex:1}\n"
+"/* ===== TAB PANELS ===== */\n"
+".tab-panel{animation:fadeIn .2s ease}\n"
+"@keyframes fadeIn{from{opacity:.6;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}\n"
+"\n"
+"\n"
+"/* ===== KPI ===== */\n"
+".kpi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px}\n"
+".kpi{\n"
+"  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);\n"
+"  padding:14px 18px;transition:border-color .15s;position:relative;overflow:hidden;\n"
 "}\n"
-".btn:hover { background: var(--bg-secondary); border-color: #b0b8c1; }\n"
-".btn:active { background: var(--bg-tertiary); }\n"
-".btn.paused { border-color: var(--orange); color: var(--orange); background: var(--orange-bg); }\n"
-".sort-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }\n"
-".sort-btn.active:hover { background: var(--accent); border-color: var(--accent); }\n"
-"/* ---- Layout ---- */\n"
-".container { max-width: 1280px; margin: 0 auto; padding: 24px; }\n"
-"/* ---- Summary cards ---- */\n"
-".summary {\n"
-"  display: grid;\n"
-"  grid-template-columns: repeat(3, 1fr);\n"
-"  gap: 16px;\n"
-"  margin-bottom: 24px;\n"
+".kpi::after{\n"
+"  content:'';position:absolute;top:0;left:0;right:0;height:1px;\n"
+"  background:linear-gradient(90deg,transparent,rgba(0,212,255,.06),transparent);\n"
 "}\n"
-".card {\n"
-"  background: var(--bg);\n"
-"  border: 1px solid var(--border-light);\n"
-"  border-radius: var(--radius);\n"
-"  padding: 20px 24px;\n"
-"  box-shadow: var(--shadow-sm);\n"
-"  transition: box-shadow .2s, border-color .2s;\n"
+".kpi:hover{border-color:var(--border-strong)}\n"
+".kpi-label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;font-weight:600;margin-bottom:4px}\n"
+".kpi-val{font-size:28px;font-weight:700;font-family:var(--mono);letter-spacing:-.5px;line-height:1.1;font-variant-numeric:tabular-nums}\n"
+".kpi-sub{font-size:11px;color:var(--text3);margin-top:4px}\n"
+".kpi:nth-child(1){border-left:2px solid var(--accent)}.kpi:nth-child(1) .kpi-val{color:var(--accent)}\n"
+".kpi:nth-child(2){border-left:2px solid var(--orange)}.kpi:nth-child(2) .kpi-val{color:var(--orange)}\n"
+".kpi:nth-child(3){border-left:2px solid var(--red)}.kpi:nth-child(3) .kpi-val{color:var(--red)}\n"
+".kpi:nth-child(4){border-left:2px solid var(--purple)}.kpi:nth-child(4) .kpi-val{color:var(--purple)}\n"
+"\n"
+"/* ===== PANELS ===== */\n"
+".sec{margin-bottom:14px}\n"
+".sec-head{display:flex;align-items:center;gap:8px;margin-bottom:6px}\n"
+".sec-head h2{font-size:14px;font-weight:600;letter-spacing:.2px}\n"
+".sec-head .cnt{font-size:11px;color:var(--text3)}\n"
+"\n"
+".panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}\n"
+".panel-row{display:grid;grid-template-columns:1fr;gap:14px;margin-bottom:14px}\n"
+"\n"
+"/* ===== TABLE ===== */\n"
+"table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}\n"
+"thead th{\n"
+"  text-align:left;padding:8px 12px;background:rgba(0,0,0,.25);\n"
+"  font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;\n"
+"  letter-spacing:.4px;border-bottom:1px solid var(--border);white-space:nowrap;\n"
+"  font-family:var(--font);\n"
 "}\n"
-".card:hover { box-shadow: var(--shadow-md); border-color: var(--border); }\n"
-".card-label { font-size: 11px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: .5px; font-weight: 600; margin-bottom: 6px; }\n"
-".card-value {\n"
-"  font-size: 32px;\n"
-"  font-weight: 700;\n"
-"  font-family: var(--mono);\n"
-"  letter-spacing: -1px;\n"
-"  line-height: 1.1;\n"
+"tbody td{\n"
+"  padding:8px 12px;font-size:13px;border-bottom:1px solid var(--border);\n"
+"  white-space:nowrap;font-family:var(--mono);font-variant-numeric:tabular-nums;\n"
 "}\n"
-".card-sub { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }\n"
-".card-procs { border-left: 3px solid var(--accent); }\n"
-".card-leaks { border-left: 3px solid var(--orange); }\n"
-".card-bytes { border-left: 3px solid var(--red); }\n"
-".card-procs .card-value { color: var(--accent); }\n"
-".card-leaks .card-value { color: var(--orange); }\n"
-".card-bytes .card-value { color: var(--red); }\n"
-"/* ---- Section ---- */\n"
-".section { margin-bottom: 24px; }\n"
-".section-head {\n"
-"  display: flex;\n"
-"  align-items: center;\n"
-"  gap: 8px;\n"
-"  margin-bottom: 12px;\n"
+"tbody tr:last-child td{border-bottom:none}\n"
+"tbody tr{transition:background .08s;cursor:default}\n"
+"tbody tr:nth-child(even){background:rgba(255,255,255,.012)}\n"
+"tbody tr:hover{background:var(--surface-hover)}\n"
+"tbody tr.clickable{cursor:pointer}\n"
+"tbody tr.clickable:hover td{color:var(--accent)}\n"
+"\n"
+"/* 可注入进程表保持紧凑字体 */\n"
+".inj-table thead th{font-size:10px;padding:6px 8px}\n"
+".inj-table tbody td{font-size:12px;padding:5px 8px}\n"
+"\n"
+"\n"
+".badge{\n"
+"  display:inline-flex;align-items:center;gap:4px;padding:1px 7px;\n"
+"  border-radius:3px;font-size:11px;font-weight:600;font-family:var(--font);\n"
 "}\n"
-".section-head h2 {\n"
-"  font-size: 14px;\n"
-"  font-weight: 600;\n"
-"  color: var(--text);\n"
+".badge-live{background:rgba(0,230,118,.08);color:var(--green);border:1px solid rgba(0,230,118,.18)}\n"
+".badge-live::before{content:'';width:5px;height:5px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}\n"
+".badge-gone{background:rgba(255,255,255,.03);color:var(--text3)}\n"
+"@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}\n"
+".badge-ok{background:rgba(0,230,118,.06);color:var(--green);font-size:11px;padding:1px 7px;border-radius:3px;font-family:var(--font)}\n"
+".badge-fail{background:rgba(255,59,59,.06);color:var(--red);font-size:11px;padding:1px 7px;border-radius:3px;font-family:var(--font)}\n"
+".badge-pend{background:rgba(255,184,0,.06);color:var(--orange);font-size:11px;padding:1px 7px;border-radius:3px;font-family:var(--font)}\n"
+"\n"
+".btn-sm{\n"
+"  padding:2px 8px;font-size:11px;border-radius:3px;font-family:var(--font);\n"
+"  border:1px solid var(--border-strong);background:transparent;color:var(--text);\n"
+"  cursor:pointer;transition:all .12s;position:relative;overflow:hidden;\n"
 "}\n"
-".section-head .count {\n"
-"  font-size: 12px;\n"
-"  color: var(--text-secondary);\n"
-"  font-weight: 400;\n"
+".btn-sm:hover{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}\n"
+".btn-sm:disabled{opacity:.35;cursor:not-allowed}\n"
+".btn-sm:disabled:hover{background:transparent;color:var(--text);border-color:var(--border-strong)}\n"
+"\n"
+".cmdline{font-family:var(--mono);font-size:12px;color:var(--text3);max-width:220px;overflow:hidden;text-overflow:ellipsis;display:inline-block}\n"
+"\n"
+"/* ===== CONTROLS ===== */\n"
+".ctrls{display:flex;gap:6px;align-items:center;margin-bottom:6px;flex-wrap:wrap}\n"
+".ctrls input{\n"
+"  width:200px;padding:4px 9px;border:1px solid var(--border);border-radius:3px;\n"
+"  font-size:12px;background:var(--bg);color:var(--text);font-family:var(--font);\n"
+"  transition:border-color .15s;\n"
 "}\n"
-"/* ---- Table ---- */\n"
-".table-wrap {\n"
-"  background: var(--bg);\n"
-"  border: 1px solid var(--border-light);\n"
-"  border-radius: var(--radius);\n"
-"  overflow: hidden;\n"
-"  box-shadow: var(--shadow-sm);\n"
+".ctrls input:focus{outline:none;border-color:var(--accent)}\n"
+".ctrls input::placeholder{color:var(--text3)}\n"
+".sort{font-size:11px;padding:2px 9px}\n"
+".sort.on{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}\n"
+"\n"
+"/* ===== LEAK LIST ===== */\n"
+".leak-card{\n"
+"  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);\n"
+"  margin-bottom:6px;overflow:hidden;transition:border-color .15s;\n"
 "}\n"
-"table { width: 100%; border-collapse: collapse; }\n"
-"thead th {\n"
-"  text-align: left;\n"
-"  padding: 10px 16px;\n"
-"  background: var(--bg-secondary);\n"
-"  font-size: 11px;\n"
-"  font-weight: 600;\n"
-"  color: var(--text-secondary);\n"
-"  text-transform: uppercase;\n"
-"  letter-spacing: .4px;\n"
-"  border-bottom: 1px solid var(--border);\n"
-"  white-space: nowrap;\n"
+".leak-card:hover{border-color:var(--border-strong)}\n"
+".leak-hdr{\n"
+"  padding:8px 14px;display:flex;align-items:center;gap:10px;font-size:13px;\n"
+"  border-bottom:1px solid var(--border);\n"
 "}\n"
-"tbody td {\n"
-"  padding: 10px 16px;\n"
-"  font-size: 13px;\n"
-"  border-bottom: 1px solid var(--border-light);\n"
-"  white-space: nowrap;\n"
+".leak-hdr .sz{color:var(--red);font-weight:600;font-family:var(--mono);font-size:14px;min-width:64px;font-variant-numeric:tabular-nums}\n"
+".leak-hdr .loc{color:var(--accent);font-family:var(--mono);font-size:13px}\n"
+".leak-hdr .n{color:var(--orange);font-size:11px;margin-left:auto;font-weight:600}\n"
+".leak-hdr .info{color:var(--text3);font-size:11px;margin-left:8px}\n"
+"\n"
+".call-tree{padding:2px 0;position:relative}\n"
+".call-tree::before{\n"
+"  content:'';position:absolute;left:26px;top:8px;bottom:8px;width:1.5px;\n"
+"  background:linear-gradient(to bottom,#222 0%,var(--purple) 25%,var(--accent) 65%,var(--red) 100%);\n"
+"  border-radius:1px;\n"
 "}\n"
-"tbody tr:last-child td { border-bottom: none; }\n"
-"tbody tr { transition: background .1s; }\n"
-"tbody tr:hover { background: var(--bg-secondary); }\n"
-"/* ---- Badges ---- */\n"
-".badge {\n"
-"  display: inline-flex;\n"
-"  align-items: center;\n"
-"  gap: 5px;\n"
-"  padding: 2px 10px;\n"
-"  border-radius: 12px;\n"
-"  font-size: 11px;\n"
-"  font-weight: 600;\n"
-"  line-height: 1.6;\n"
+".cn{\n"
+"  padding:6px 8px 6px 46px;position:relative;font-family:var(--mono);font-size:13px;\n"
+"  line-height:1.35;transition:background .1s;\n"
 "}\n"
-".badge-live {\n"
-"  background: var(--green-bg);\n"
-"  color: var(--green);\n"
-"  border: 1px solid var(--green-border);\n"
+".cn::before{content:'';position:absolute;left:26px;top:50%;width:10px;height:1.5px;background:var(--border-strong);border-radius:1px}\n"
+".cn .fn{color:var(--text)}\n"
+".cn .lib{color:var(--text3);font-size:11px;margin-left:4px}\n"
+".cn.top .fn{color:var(--purple)}\n"
+".cn.lk .fn{color:var(--red);font-weight:700}\n"
+".cn.lk{background:rgba(255,59,59,.05);border-left:2px solid var(--red)}\n"
+".cn .tag{display:inline-block;background:rgba(255,59,59,.1);color:var(--red);font-size:10px;padding:0 5px;border-radius:2px;margin-left:5px;font-weight:600}\n"
+".cn[onclick]:hover{background:rgba(0,212,255,.05);border-radius:3px;cursor:pointer}\n"
+".cn .src-tip{color:var(--green);font-size:10px;margin-left:4px}\n"
+"\n"
+"/* ===== PAGER ===== */\n"
+".pager{display:flex;align-items:center;justify-content:center;gap:2px;margin-top:6px}\n"
+".pg{\n"
+"  background:transparent;border:1px solid var(--border);color:var(--text2);\n"
+"  padding:2px 7px;border-radius:3px;cursor:pointer;font-size:11px;\n"
+"  font-family:var(--mono);font-variant-numeric:tabular-nums;transition:all .12s;\n"
 "}\n"
-".badge-live::before {\n"
-"  content: '';\n"
-"  width: 6px; height: 6px;\n"
-"  border-radius: 50%;\n"
-"  background: var(--green);\n"
-"  animation: pulse 2s ease-in-out infinite;\n"
+".pg:hover{background:var(--surface-hover);color:var(--text)}\n"
+".pg.on{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}\n"
+".pg:disabled{opacity:.25;cursor:not-allowed}\n"
+"\n"
+"/* ===== DETAIL PANEL ===== */\n"
+".overlay{\n"
+"  position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;\n"
+"  opacity:0;pointer-events:none;transition:opacity .25s;\n"
 "}\n"
-"@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }\n"
-".badge-done {\n"
-"  background: var(--bg-tertiary);\n"
-"  color: var(--text-secondary);\n"
+".overlay.show{opacity:1;pointer-events:auto}\n"
+"\n"
+".detail{\n"
+"  position:fixed;top:50%;left:50%;width:700px;max-height:85vh;z-index:210;\n"
+"  background:var(--surface);border:1px solid var(--border-strong);\n"
+"  border-radius:8px;\n"
+"  transform:translate(-50%,-50%) scale(.9);\n"
+"  transition:transform .25s cubic-bezier(.4,0,.2,1),opacity .25s;\n"
+"  display:flex;flex-direction:column;overflow:hidden;\n"
+"  box-shadow:0 8px 48px rgba(0,0,0,.5);\n"
+"  opacity:0;pointer-events:none;\n"
 "}\n"
-".hot-fn {\n"
-"  font-family: var(--mono);\n"
-"  font-size: 11px;\n"
-"  color: var(--accent);\n"
-"  max-width: 300px;\n"
-"  overflow: hidden;\n"
-"  text-overflow: ellipsis;\n"
-"  display: inline-block;\n"
+".detail.show{transform:translate(-50%,-50%) scale(1);opacity:1;pointer-events:auto}\n"
+".detail-head{\n"
+"  padding:16px 24px;border-bottom:1px solid var(--border);\n"
+"  display:flex;align-items:center;justify-content:space-between;\n"
+"  flex-shrink:0;\n"
 "}\n"
-"/* ---- Leak cards ---- */\n"
-".leak-card {\n"
-"  background: var(--bg);\n"
-"  border: 1px solid var(--border-light);\n"
-"  border-radius: var(--radius-sm);\n"
-"  margin-bottom: 6px;\n"
-"  overflow: hidden;\n"
-"  box-shadow: var(--shadow-sm);\n"
-"  transition: box-shadow .15s, border-color .15s;\n"
+".detail-head h3{font-size:16px;font-weight:600;font-family:var(--mono)}\n"
+".detail-head .close{\n"
+"  background:rgba(255,255,255,.05);border:1px solid var(--border-strong);\n"
+"  color:var(--text2);cursor:pointer;\n"
+"  font-size:16px;padding:4px 10px;border-radius:4px;transition:all .15s;\n"
 "}\n"
-".leak-card:hover { border-color: var(--border); box-shadow: var(--shadow-md); }\n"
-".leak-card.open { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent-light); }\n"
-".leak-header {\n"
-"  padding: 12px 16px;\n"
-"  cursor: pointer;\n"
-"  display: flex;\n"
-"  align-items: center;\n"
-"  gap: 12px;\n"
-"  font-size: 13px;\n"
-"  user-select: none;\n"
-"  transition: background .1s;\n"
+".detail-head .close:hover{background:rgba(255,59,59,.1);color:var(--red);border-color:var(--red)}\n"
+".detail-body{flex:1;overflow-y:auto;padding:16px 24px}\n"
+".detail-body::-webkit-scrollbar{width:4px}\n"
+".detail-body::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:2px}\n"
+"\n"
+".detail-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:14px}\n"
+".ds{background:rgba(0,0,0,.15);padding:10px 14px;border-radius:var(--radius);text-align:center}\n"
+".ds-val{font-family:var(--mono);font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}\n"
+".ds-label{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.4px;margin-top:2px}\n"
+".ds:nth-child(1) .ds-val{color:var(--accent)}\n"
+".ds:nth-child(2) .ds-val{color:var(--red)}\n"
+".ds:nth-child(3) .ds-val{color:var(--orange)}\n"
+".ds:nth-child(4) .ds-val{color:var(--green)}\n"
+"\n"
+".chart-wrap{\n"
+"  background:rgba(0,0,0,.2);border:1px solid var(--border);\n"
+"  border-radius:var(--radius);padding:8px;margin-bottom:14px;position:relative;user-select:none;\n"
 "}\n"
-".leak-header:hover { background: var(--bg-secondary); }\n"
-".leak-header .arrow {\n"
-"  font-size: 10px;\n"
-"  color: var(--text-tertiary);\n"
-"  transition: transform .2s;\n"
-"  flex-shrink: 0;\n"
+".chart-wrap canvas{display:block;width:100%;height:auto;cursor:crosshair}\n"
+".chart-tip{font-size:10px;color:var(--text3);text-align:center;margin-top:4px;letter-spacing:.2px}\n"
+"\n"
+".leak-sec h4{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.4px;margin-bottom:6px}\n"
+"\n"
+"/* ===== TOAST ===== */\n"
+".toast{\n"
+"  position:fixed;bottom:20px;right:20px;\n"
+"  background:var(--surface);color:var(--text);padding:7px 16px;border-radius:3px;\n"
+"  font-size:12px;opacity:0;transform:translateY(4px);transition:all .2s;\n"
+"  pointer-events:none;z-index:300;border:1px solid var(--border);\n"
 "}\n"
-".leak-card.open .leak-header .arrow { transform: rotate(90deg); }\n"
-".leak-header .sz {\n"
-"  color: var(--red);\n"
-"  font-weight: 600;\n"
-"  font-family: var(--mono);\n"
-"  font-size: 13px;\n"
-"  white-space: nowrap;\n"
-"  min-width: 70px;\n"
+".toast.show{opacity:1;transform:translateY(0)}\n"
+"\n"
+"/* ===== CURSOR TRAIL ===== */\n"
+".trail{\n"
+"  position:fixed;pointer-events:none;z-index:9999;\n"
+"  font-family:'Segoe UI','Noto Sans',system-ui,sans-serif;\n"
+"  font-size:18px;font-weight:700;\n"
+"  color:rgba(0,212,255,.6);\n"
+"  letter-spacing:3px;white-space:nowrap;\n"
+"  text-shadow:0 0 14px rgba(0,212,255,.5),0 0 28px rgba(0,212,255,.2);\n"
+"  transition:opacity .25s;\n"
+"  will-change:transform,opacity;\n"
 "}\n"
-".leak-header .loc {\n"
-"  color: var(--accent);\n"
-"  font-family: var(--mono);\n"
-"  font-size: 12px;\n"
+"\n"
+"/* ===== EMPTY ===== */\n"
+".empty{text-align:center;padding:32px 16px;color:var(--text3);font-size:13px}\n"
+"\n"
+"/* ===== MODAL ===== */\n"
+".modal-overlay{\n"
+"  position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:400;\n"
+"  opacity:0;pointer-events:none;transition:opacity .2s;\n"
 "}\n"
-".leak-header .proc-info {\n"
-"  color: var(--text-tertiary);\n"
-"  font-size: 11px;\n"
-"  margin-left: auto;\n"
-"  white-space: nowrap;\n"
+".modal-overlay.show{opacity:1;pointer-events:auto}\n"
+".modal-dialog{\n"
+"  position:fixed;top:50%;left:50%;transform:translate(-50%,-50%) scale(.9);\n"
+"  background:var(--surface);border:1px solid var(--border-strong);\n"
+"  border-radius:8px;padding:32px 36px;z-index:410;\n"
+"  max-width:540px;width:92%;\n"
+"  opacity:0;pointer-events:none;transition:all .2s cubic-bezier(.4,0,.2,1);\n"
 "}\n"
-".leak-body { display: none; padding: 0 16px 16px; }\n"
-".leak-card.open .leak-body { display: block; }\n"
-".leak-body-divider {\n"
-"  border-top: 1px solid var(--border-light);\n"
-"  margin-bottom: 12px;\n"
+".modal-dialog.show{opacity:1;pointer-events:auto;transform:translate(-50%,-50%) scale(1)}\n"
+".modal-icon{\n"
+"  width:48px;height:48px;border-radius:50%;background:rgba(255,59,59,.12);\n"
+"  color:var(--red);font-size:24px;font-weight:700;\n"
+"  display:flex;align-items:center;justify-content:center;\n"
+"  margin:0 auto 12px;font-family:var(--mono);\n"
 "}\n"
-".call-tree {\n"
-"  padding: 4px 0 0 12px;\n"
-"  border-left: 2px solid var(--border-light);\n"
-"  margin-left: 8px;\n"
-"}\n"
-".call-node {\n"
-"  padding: 5px 0 5px 16px;\n"
-"  position: relative;\n"
-"  font-family: var(--mono);\n"
-"  font-size: 12px;\n"
-"  line-height: 1.5;\n"
-"}\n"
-".call-node::before {\n"
-"  content: '';\n"
-"  position: absolute;\n"
-"  left: 0; top: 50%;\n"
-"  width: 10px; height: 1.5px;\n"
-"  background: var(--border);\n"
-"  border-radius: 1px;\n"
-"}\n"
-".call-node .fn { color: var(--text); font-weight: 500; }\n"
-".call-node .lib { color: var(--text-tertiary); font-size: 11px; margin-left: 4px; }\n"
-".call-node.entry .fn { color: var(--purple); font-weight: 600; }\n"
-".call-node.leak-site { font-weight: 600; }\n"
-".call-node.leak-site .fn { color: var(--red); font-weight: 700; }\n"
-".call-node[onclick]:hover { background: var(--accent-light); border-radius: 4px; cursor: pointer; }\n"
-".call-node .source-tip {\n"
-"  color: var(--green);\n"
-"  font-size: 11px;\n"
-"  margin-left: 6px;\n"
-"  font-weight: 500;\n"
-"}\n"
-".call-node.leak-site .tag {\n"
-"  display: inline-block;\n"
-"  background: var(--red-bg);\n"
-"  color: var(--red);\n"
-"  font-size: 10px;\n"
-"  padding: 1px 6px;\n"
-"  border-radius: 3px;\n"
-"  margin-left: 8px;\n"
-"  font-weight: 600;\n"
-"  letter-spacing: .3px;\n"
-"  border: 1px solid var(--red-border);\n"
-"}\n"
-"/* ---- Empty state ---- */\n"
-".empty {\n"
-"  text-align: center;\n"
-"  padding: 48px 20px;\n"
-"  color: var(--text-tertiary);\n"
-"  font-size: 13px;\n"
-"}\n"
-".empty-icon { font-size: 28px; margin-bottom: 8px; opacity: .4; }\n"
-".empty p { margin-top: 4px; }\n"
-"/* ---- Toast ---- */\n"
-".toast {\n"
-"  position: fixed;\n"
-"  bottom: 24px;\n"
-"  right: 24px;\n"
-"  background: var(--text);\n"
-"  color: #fff;\n"
-"  padding: 10px 20px;\n"
-"  border-radius: var(--radius-sm);\n"
-"  font-size: 12px;\n"
-"  font-weight: 500;\n"
-"  opacity: 0;\n"
-"  transform: translateY(8px);\n"
-"  transition: all .25s;\n"
-"  pointer-events: none;\n"
-"  z-index: 200;\n"
-"  box-shadow: var(--shadow-lg);\n"
-"}\n"
-".toast.show { opacity: 1; transform: translateY(0); }\n"
-"/* ---- Responsive ---- */\n"
-".inject-table { width:100%%; border-collapse:collapse; }\n"
-".inject-table th { text-align:left; font-size:11px; color:var(--text-secondary); "
-  "padding:6px 10px; border-bottom:1px solid var(--border-light); }\n"
-".inject-table td { padding:6px 10px; font-size:12px; border-bottom:1px solid var(--border-light); }\n"
-".btn-sm { padding:3px 10px; font-size:11px; border-radius:5px; border:1px solid var(--border); "
-  "background:var(--bg); color:var(--text); cursor:pointer; transition:all 0.15s; }\n"
-".btn-sm:hover { background:var(--accent); color:#fff; border-color:var(--accent); }\n"
-".btn-sm:disabled { opacity:0.5; cursor:not-allowed; }\n"
-".badge-ok { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; "
-  "font-weight:500; background:var(--green-bg); color:var(--green); border:1px solid var(--green-border); }\n"
-".badge-fail { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; "
-  "font-weight:500; background:var(--red-bg); color:var(--red); border:1px solid var(--red-border); }\n"
-".badge-pending { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px; "
-  "font-weight:500; background:var(--orange-bg); color:var(--orange); }\n"
-"@media (max-width: 768px) {\n"
-"  .summary { grid-template-columns: 1fr; }\n"
-"  .nav { padding: 0 14px; }\n"
-"  .container { padding: 16px; }\n"
-"  table { font-size: 11px; }\n"
-"  thead th, tbody td { padding: 8px 10px; }\n"
-"  .inject-table { font-size:10px; }\n"
-"}\n"
+".modal-title{font-size:17px;font-weight:600;text-align:center;margin-bottom:10px;color:var(--text)}\n"
+".modal-body{font-size:13px;color:var(--text2);text-align:center;line-height:1.6;margin-bottom:18px}\n"
+".modal-warn{color:var(--red);font-weight:600}\n"
+".modal-actions{display:flex;gap:12px;justify-content:center;margin-top:4px}\n"
+"\n"
+"\n"
+"/* ===== RESPONSIVE ===== */\n"
+"\n"
+"@media(max-width:700px){.sidebar{display:none}.kpi-row{grid-template-columns:1fr}.detail{width:100vw}}\n"
 "</style>\n"
 "</head>\n"
 "<body>\n"
 "\n"
-"<nav class=\"nav\">\n"
-"  <div class=\"nav-brand\">\n"
-"    <div class=\"logo\">M</div>\n"
-"    <span>MemoryTraceTool</span>\n"
+"<!-- SIDEBAR -->\n"
+"<aside class=\"sidebar\" id=\"sidebar\">\n"
+"  <div class=\"sb-brand\"><div class=\"sb-dot\" id=\"status-dot\"></div><span class=\"sb-text\">MemoryTraceTool</span></div>\n"
+"  <nav class=\"sb-nav\">\n"
+"    <div class=\"sb-item on\" data-panel=\"overview\" onclick=\"switchPanel('overview')\">\n"
+"      <svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"><rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1\"/></svg>\n"
+"      <span class=\"sb-label\">概览</span>\n"
+"    </div>\n"
+"    <div class=\"sb-item\" data-panel=\"ranking\" onclick=\"switchPanel('ranking')\">\n"
+"      <svg width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"><line x1=\"4\" y1=\"20\" x2=\"4\" y2=\"12\"/><line x1=\"10\" y1=\"20\" x2=\"10\" y2=\"7\"/><line x1=\"16\" y1=\"20\" x2=\"16\" y2=\"4\"/><line x1=\"2\" y1=\"20\" x2=\"22\" y2=\"20\"/></svg>\n"
+"      <span class=\"sb-label\">泄漏排行</span>\n"
+"    </div>\n"
+"  </nav>\n"
+"  <div class=\"sb-toggle\" onclick=\"toggleSidebar()\">&laquo;</div>\n"
+"</aside>\n"
+"\n"
+"<!-- MAIN -->\n"
+"<div class=\"main\">\n"
+"<div class=\"topbar\">\n"
+"  <div class=\"topbar-left\">\n"
+"    <span class=\"topbar-time\" id=\"clock\">--:--:--</span>\n"
+"    <span class=\"topbar-status\" id=\"conn-status\">在线</span>\n"
 "  </div>\n"
-"  <div class=\"nav-actions\">\n"
-"    <span class=\"nav-age\" id=\"refresh-age\">--</span>\n"
-"    <div class=\"nav-dot\" id=\"status-dot\" title=\"连接状态\"></div>\n"
+"  <div>\n"
 "    <button class=\"btn\" id=\"btn-pause\" onclick=\"toggleAuto()\">暂停刷新</button>\n"
-"    <button class=\"btn\" onclick=\"refresh()\">立即刷新</button>\n"
+"    <button class=\"btn\" onclick=\"refresh();loadProcs()\">立即刷新</button>\n"
+"    <button class=\"btn warn\" onclick=\"openResetModal()\">重新监控</button>\n"
 "  </div>\n"
-"</nav>\n"
+"</div>\n"
 "\n"
-"<div class=\"container\">\n"
+"<div class=\"content\">\n"
 "\n"
-"  <div class=\"summary\">\n"
-"    <div class=\"card card-procs\">\n"
-"      <div class=\"card-label\">监控进程数</div>\n"
-"      <div class=\"card-value\" id=\"p\">--</div>\n"
-"      <div class=\"card-sub\">当前活跃连接</div>\n"
-"    </div>\n"
-"    <div class=\"card card-leaks\">\n"
-"      <div class=\"card-label\">泄漏总数</div>\n"
-"      <div class=\"card-value\" id=\"l\">--</div>\n"
-"      <div class=\"card-sub\">可疑内存泄漏点</div>\n"
-"    </div>\n"
-"    <div class=\"card card-bytes\">\n"
-"      <div class=\"card-label\">泄漏字节数</div>\n"
-"      <div class=\"card-value\" id=\"b\">--</div>\n"
-"      <div class=\"card-sub\">累计未释放内存</div>\n"
-"    </div>\n"
-"  </div>\n"
+"<div id=\"panel-overview\" class=\"tab-panel\">\n"
 "\n"
-"  <div class=\"section\">\n"
-"    <div class=\"section-head\">\n"
-"      <svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\"><circle cx=\"8\" cy=\"8\" r=\"5\" stroke=\"#0969da\" stroke-width=\"1.5\"/><line x1=\"8\" y1=\"5\" x2=\"8\" y2=\"11\" stroke=\"#0969da\" stroke-width=\"1.2\"/><line x1=\"5\" y1=\"8\" x2=\"11\" y2=\"8\" stroke=\"#0969da\" stroke-width=\"1.2\"/></svg>\n"
-"      <h2>运行时注入</h2>\n"
-"      <span class=\"count\" id=\"proc-count-inject\"></span>\n"
-"    </div>\n"
-"    <div style=\"margin-bottom:8px;\">\n"
-"      <input type=\"text\" id=\"proc-filter\" placeholder=\"搜索进程名...\" "
-"        oninput=\"loadProcesses()\" "
-"        style=\"width:240px;padding:5px 10px;border:1px solid var(--border);"
-"        border-radius:5px;font-size:12px;background:var(--bg);color:var(--text)\">\n"
-"      <span style=\"font-size:11px;color:var(--text-tertiary);margin-left:8px\">"
-"        选择一个正在运行的进程，点击「注入」开始监控其内存分配</span>\n"
-"    </div>\n"
-"    <div class=\"table-wrap\">\n"
-"      <table class=\"inject-table\">\n"
-"        <thead>\n"
-"          <tr>\n"
-"            <th style=\"width:80px\">PID</th>\n"
-"            <th>进程名</th>\n"
-"            <th style=\"width:120px\">注入状态</th>\n"
-"            <th style=\"width:80px\">操作</th>\n"
-"          </tr>\n"
-"        </thead>\n"
-"        <tbody id=\"ptb\">\n"
-"          <tr><td colspan=\"4\"><div class=\"empty\"><p>加载中...</p></div></td></tr>\n"
-"        </tbody>\n"
-"      </table>\n"
-"    </div>\n"
-"  </div>\n"
+"<!-- KPI -->\n"
+"<div class=\"kpi-row\">\n"
+"  <div class=\"kpi\"><div class=\"kpi-label\">监控进程</div><div class=\"kpi-val\" id=\"kp-procs\">--</div><div class=\"kpi-sub\">活跃连接</div></div>\n"
+"  <div class=\"kpi\"><div class=\"kpi-label\">泄漏总数</div><div class=\"kpi-val\" id=\"kp-leaks\">--</div><div class=\"kpi-sub\">可疑泄漏点</div></div>\n"
+"  <div class=\"kpi\"><div class=\"kpi-label\">泄漏字节</div><div class=\"kpi-val\" id=\"kp-bytes\">--</div><div class=\"kpi-sub\">未释放内存</div></div>\n"
+"  <div class=\"kpi\"><div class=\"kpi-label\">持久化</div><div class=\"kpi-val\" id=\"kp-hist\">--</div><div class=\"kpi-sub\">历史进程</div></div>\n"
+"</div>\n"
 "\n"
-"  <div class=\"section\">\n"
-"    <div class=\"section-head\">\n"
-"      <svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\"><rect x=\"1.5\" y=\"1.5\" width=\"13\" height=\"13\" rx=\"2\" stroke=\"#656d76\" stroke-width=\"1.5\"/><line x1=\"5\" y1=\"4.5\" x2=\"5\" y2=\"11.5\" stroke=\"#656d76\" stroke-width=\"1.2\"/><line x1=\"8\" y1=\"4.5\" x2=\"8\" y2=\"11.5\" stroke=\"#656d76\" stroke-width=\"1.2\"/><line x1=\"11\" y1=\"4.5\" x2=\"11\" y2=\"11.5\" stroke=\"#656d76\" stroke-width=\"1.2\"/></svg>\n"
-"      <h2>被监控进程</h2>\n"
-"      <span class=\"count\" id=\"proc-count\"></span>\n"
-"    </div>\n"
-"    <div class=\"table-wrap\">\n"
+"<!-- TWO PANELS -->\n"
+"<div class=\"panel-row\">\n"
+"  <!-- MONITORED -->\n"
+"  <div>\n"
+"    <div class=\"sec-head\"><h2>被监控进程</h2><span class=\"cnt\" id=\"mc-cnt\"></span></div>\n"
+"    <div class=\"panel\">\n"
 "      <table>\n"
-"        <thead>\n"
-"          <tr>\n"
-"            <th>PID</th>\n"
-"            <th>进程名</th>\n"
-"            <th>状态</th>\n"
-"            <th>泄漏数</th>\n"
-"            <th>字节数</th>\n"
-"            <th>最后活跃</th>\n"
-"            <th>热点函数</th>\n"
-"          </tr>\n"
-"        </thead>\n"
-"        <tbody id=\"tb\">\n"
-"          <tr><td colspan=\"7\"><div class=\"empty\"><div class=\"empty-icon\">--</div><p>等待被监控进程接入...</p></div></td></tr>\n"
-"        </tbody>\n"
+"        <thead><tr><th style=\"width:48px\">PID</th><th style=\"width:110px\">进程</th><th style=\"width:60px\">状态</th><th style=\"width:54px\">泄漏</th><th style=\"width:68px\">字节</th><th>热点函数</th><th style=\"width:56px\">活跃</th></tr></thead>\n"
+"        <tbody id=\"mtb\"><tr><td colspan=\"7\"><div class=\"empty\">等待进程接入...</div></td></tr></tbody>\n"
 "      </table>\n"
 "    </div>\n"
 "  </div>\n"
-"\n"
-"  <div class=\"section\">\n"
-"    <div class=\"section-head\">\n"
-"      <svg width=\"16\" height=\"16\" viewBox=\"0 0 16 16\" fill=\"none\"><circle cx=\"8\" cy=\"8\" r=\"5\" stroke=\"#cf222e\" stroke-width=\"1.5\"/><line x1=\"8\" y1=\"5.5\" x2=\"8\" y2=\"8.5\" stroke=\"#cf222e\" stroke-width=\"1.2\"/><circle cx=\"8\" cy=\"10.2\" r=\"0.8\" fill=\"#cf222e\"/></svg>\n"
-"      <h2>可疑泄漏排行</h2>\n"
-"      <span class=\"count\" id=\"leak-count\"></span>\n"
+"  <!-- INJECTABLE -->\n"
+"  <div>\n"
+"    <div class=\"sec-head\"><h2>可注入进程</h2><span class=\"cnt\" id=\"ic-cnt\"></span></div>\n"
+"    <div class=\"ctrls\"><input type=\"text\" id=\"proc-filter\" placeholder=\"搜索...\" oninput=\"loadProcs()\"></div>\n"
+"    <div class=\"panel\">\n"
+"      <table class=\"inj-table\">\n"
+"        <thead><tr><th style=\"width:48px\">PID</th><th style=\"width:90px\">进程</th><th style=\"width:150px\">命令行</th><th style=\"width:62px\">堆</th><th style=\"width:60px\">运行</th><th style=\"width:56px\">注入</th><th style=\"width:50px\">操作</th></tr></thead>\n"
+"        <tbody id=\"ptb\"><tr><td colspan=\"7\"><div class=\"empty\">加载中...</div></td></tr></tbody>\n"
+"      </table>\n"
 "    </div>\n"
-"    <div style=\"margin-bottom:8px;display:flex;gap:8px;align-items:center;\">\n"
-"      <input type=\"text\" id=\"leak-filter\" placeholder=\"按进程名或 PID 过滤泄漏...\" "
-"        oninput=\"renderLeaks()\" "
-"        style=\"width:260px;padding:5px 10px;border:1px solid var(--border);"
-"        border-radius:5px;font-size:12px;background:var(--bg);color:var(--text)\">\n"
-"      <span style=\"font-size:11px;color:var(--text-tertiary);margin-left:4px\">排序:</span>\n"
-"      <button class=\"btn sort-btn active\" id=\"sort-size\" onclick=\"setSort('size')\">大小</button>\n"
-"      <button class=\"btn sort-btn\" id=\"sort-time\" onclick=\"setSort('time')\">最近</button>\n"
-"      <button class=\"btn sort-btn\" id=\"sort-proc\" onclick=\"setSort('proc')\">进程</button>\n"
-"    </div>\n"
-"    <div id=\"tl\"><div class=\"empty\"><div class=\"empty-icon\">OK</div><p>暂无泄漏 - 一切正常</p></div></div>\n"
+"    <div class=\"pager\" id=\"pg\"></div>\n"
 "  </div>\n"
+"</div>\n"
+"</div><!-- /#panel-overview -->\n"
 "\n"
+"<div id=\"panel-ranking\" class=\"tab-panel\" style=\"display:none\">\n"
+"<div>\n"
+"  <div class=\"sec-head\"><h2>泄漏排行榜</h2><span class=\"cnt\" id=\"lk-cnt\"></span></div>\n"
+"  <div class=\"ctrls\">\n"
+"    <input type=\"text\" id=\"leak-filter\" placeholder=\"搜索泄漏...\" oninput=\"renderLeaks()\">\n"
+"    <span style=\"font-size:11px;color:var(--text3)\">排序:</span>\n"
+"    <button class=\"btn sort on\" id=\"sort-bytes\" onclick=\"setSort('bytes')\">字节</button>\n"
+"    <button class=\"btn sort\" id=\"sort-rate\" onclick=\"setSort('rate')\">速率</button>\n"
+"    <button class=\"btn sort\" id=\"sort-count\" onclick=\"setSort('count')\">次数</button>\n"
+"  </div>\n"
+"  <div id=\"leak-list\"><div class=\"empty\">暂无泄漏</div></div>\n"
+"</div>\n"
+"\n"
+"</div><!-- /#panel-ranking -->\n"
+"\n"
+"</div></div>\n"
+"\n"
+"<!-- DETAIL OVERLAY + PANEL -->\n"
+"<div class=\"overlay\" id=\"overlay\" onclick=\"closeDetail()\"></div>\n"
+"<div class=\"detail\" id=\"detail\">\n"
+"  <div class=\"detail-head\">\n"
+"    <h3 id=\"dtl-title\">进程详情</h3>\n"
+"    <button class=\"close\" onclick=\"closeDetail()\">&times;</button>\n"
+"  </div>\n"
+"  <div class=\"detail-body\" id=\"dtl-body\"></div>\n"
 "</div>\n"
 "\n"
 "<div class=\"toast\" id=\"toast\"></div>\n"
+"<!-- Cursor trail elements -->\n"
+"<div class=\"trail\" id=\"trail0\">王华是cos0</div>\n"
+"<div class=\"trail\" id=\"trail1\">王华是cos0</div>\n"
+"<div class=\"trail\" id=\"trail2\">王华是cos0</div>\n"
 "\n"
 "<script>\n"
-"var autoRefresh = true;\n"
-"var failCount = 0;\n"
-"var gAllLeaks = [];\n"
-"var gSortMode = 'size';\n"
+"var autoRefresh=true,failCount=0;\n"
+"var gAllLeaks=[],gSortMode='bytes';\n"
+"var gProcPage=1,gPageSize=15,gAllProcs=[];\n"
+"var gPrevLeaked={}; /* pid -> prev total_leaked */\n"
+"var gPrevTime=0;    /* timestamp of last snapshot */\n"
+"var gHistory={};    /* pid -> [{t,bytes},...] */\n"
+"var gDetailPid=0;\n"
 "\n"
-"setInterval(function() { if (autoRefresh) { refresh(); loadProcesses(); } }, 3000);\n"
+"/* ===== SIDEBAR ===== */\n"
+"function toggleSidebar(){document.getElementById('sidebar').classList.toggle('folded')}\n"
+"/* ===== TAB SWITCHING ===== */\n"
+"function switchPanel(name){\n"
+"  document.querySelectorAll('.sb-item').forEach(function(el){el.classList.toggle('on',el.getAttribute('data-panel')===name)});\n"
+"  document.querySelectorAll('.tab-panel').forEach(function(el){el.style.display='none'});\n"
+"  var panel=document.getElementById('panel-'+name);\n"
+"  if(panel)panel.style.display='';\n"
+"  if(name==='ranking')renderLeaks();\n"
+"}\n"
+"\n"
+"\n"
+"/* ===== RIPPLE ===== */\n"
+"document.addEventListener('click',function(e){\n"
+"  var el=e.target.closest('.btn,.btn-sm,.pg');\n"
+"  if(!el)return;\n"
+"  var r=document.createElement('span');r.className='ripple';\n"
+"  var rect=el.getBoundingClientRect(),s=Math.max(rect.width,rect.height);\n"
+"  r.style.width=r.style.height=s+'px';\n"
+"  r.style.left=e.clientX-rect.left-s/2+'px';\n"
+"  r.style.top=e.clientY-rect.top-s/2+'px';\n"
+"  el.appendChild(r);setTimeout(function(){r.remove()},450);\n"
+"});\n"
+"\n"
+"/* ===== CURSOR TRAIL: 3层lerp拖尾，20fps节流，移动渐显/静止渐消 ===== */\n"
+"var trailEls=[],trailPositions=[],targetX=0,targetY=0,trailAlpha=0,trailActive=false;\n"
+"var trailFadeTimer=null,trailFrameSkip=0,trailPaused=false;\n"
+"(function initTrail(){\n"
+"  for(var i=0;i<3;i++){\n"
+"    trailEls.push(document.getElementById('trail'+i));\n"
+"    trailPositions.push({x:0,y:0});\n"
+"  }\n"
+"  document.addEventListener('mousemove',function(e){\n"
+"    targetX=e.clientX;targetY=e.clientY;trailActive=true;\n"
+"    trailFadeTimer&&clearTimeout(trailFadeTimer);\n"
+"    trailFadeTimer=setTimeout(function(){trailActive=false},1200);\n"
+"  });\n"
+"  function tick(){\n"
+"    trailFrameSkip++;\n"
+"    if(trailFrameSkip%3!==0){requestAnimationFrame(tick);return} /* 20fps */\n"
+"    if(trailPaused){for(var i=0;i<3;i++)trailEls[i].style.opacity='0';requestAnimationFrame(tick);return}\n"
+"    if(trailActive){trailAlpha=Math.min(1,trailAlpha+0.06)}\n"
+"    else{trailAlpha=Math.max(0,trailAlpha-0.03)}\n"
+"    var lag=0.08;\n"
+"    for(var i=0;i<3;i++){\n"
+"      var tp=trailPositions[i];\n"
+"      var tx=(i===0)?targetX:trailPositions[i-1].x;\n"
+"      var ty=(i===0)?targetY:trailPositions[i-1].y;\n"
+"      tp.x+=(tx-tp.x)*lag;tp.y+=(ty-tp.y)*lag;\n"
+"      var el=trailEls[i];\n"
+"      el.style.left=tp.x+16+'px';el.style.top=tp.y+18+'px';\n"
+"      el.style.opacity=trailAlpha*(0.85-i*0.2);\n"
+"      el.style.transform='scale('+(1-i*0.05)+')';\n"
+"      lag=Math.max(0.03,lag-0.025);\n"
+"    }\n"
+"    requestAnimationFrame(tick);\n"
+"  }\n"
+"  tick();\n"
+"})();\n"
+"\n"
+"\n"
+"/* ===== RESET MODAL ===== */\n"
+"function openResetModal(){\n"
+"  document.getElementById('reset-modal-overlay').classList.add('show');\n"
+"  document.getElementById('reset-modal').classList.add('show');\n"
+"}\n"
+"function closeResetModal(){\n"
+"  document.getElementById('reset-modal-overlay').classList.remove('show');\n"
+"  document.getElementById('reset-modal').classList.remove('show');\n"
+"}\n"
+"function confirmReset(){\n"
+"  var btn=document.getElementById('btn-confirm-reset');\n"
+"  btn.disabled=true;btn.textContent='清除中...';\n"
+"  fetch('/api/reset').then(function(r){return r.json()}).then(function(d){\n"
+"    gAllLeaks=[];gHistory={};gPrevLeaked={};gPrevTime=0;gDetailPid=0;\n"
+"    toast('已清除所有泄漏历史数据');\n"
+"    closeResetModal();\n"
+"    btn.disabled=false;btn.textContent='确认重新监控';\n"
+"    refresh();loadProcs();\n"
+"    closeDetail();\n"
+"  }).catch(function(){\n"
+"    toast('请求失败，请重试');\n"
+"    btn.disabled=false;btn.textContent='确认重新监控';\n"
+"  });\n"
+"}\n"
+"\n"
+"/* ===== AUTO REFRESH ===== */\n"
+"setInterval(function(){if(autoRefresh){refresh();loadProcs()}},3000);\n"
 "refresh();\n"
 "\n"
-"function setSort(mode) {\n"
-"  gSortMode = mode;\n"
-"  document.getElementById('sort-size').classList.toggle('active', mode === 'size');\n"
-"  document.getElementById('sort-time').classList.toggle('active', mode === 'time');\n"
-"  document.getElementById('sort-proc').classList.toggle('active', mode === 'proc');\n"
+"function toggleAuto(){\n"
+"  autoRefresh=!autoRefresh;\n"
+"  var btn=document.getElementById('btn-pause'),dot=document.getElementById('status-dot');\n"
+"  if(autoRefresh){btn.textContent='暂停刷新';btn.classList.remove('warn');dot.classList.remove('off');refresh()}\n"
+"  else{btn.textContent='恢复刷新';btn.classList.add('warn');dot.classList.add('off');document.getElementById('conn-status').textContent='已暂停'}\n"
+"  toast(autoRefresh?'自动刷新已恢复':'自动刷新已暂停');\n"
+"}\n"
+"\n"
+"function refresh(){\n"
+"  fetch('/api/data').then(function(r){return r.json()}).then(function(d){\n"
+"    failCount=0;document.getElementById('status-dot').classList.remove('off');\n"
+"    document.getElementById('clock').textContent=new Date().toLocaleTimeString();\n"
+"    document.getElementById('conn-status').textContent='在线';\n"
+"    document.getElementById('kp-procs').textContent=d.nprocs;\n"
+"    document.getElementById('kp-leaks').textContent=d.total_leaks;\n"
+"    document.getElementById('kp-bytes').textContent=fmtBytes(d.total_bytes);\n"
+"    document.getElementById('kp-hist').textContent=d.nprocs;\n"
+"\n"
+"    var now=Date.now()/1000;\n"
+"    var prevTotal=0,curTotal=0;\n"
+"\n"
+"    /* accumulate history & compute rates */\n"
+"    for(var i=0;i<d.procs.length;i++){\n"
+"      var p=d.procs[i];\n"
+"      curTotal+=p.total_leaked;\n"
+"      if(!gHistory[p.pid])gHistory[p.pid]=[];\n"
+"      gHistory[p.pid].push({t:now,bytes:p.total_leaked});\n"
+"      if(gHistory[p.pid].length>600)gHistory[p.pid].shift();\n"
+"    }\n"
+"    /* store snapshot for rate calc */\n"
+"    gPrevLeaked={};gPrevTime=now;\n"
+"    for(var i=0;i<d.procs.length;i++){\n"
+"      var p=d.procs[i];\n"
+"      gPrevLeaked[p.pid]=p.total_leaked;\n"
+"    }\n"
+"\n"
+"    /* monitored table */\n"
+"    var rows='';\n"
+"    for(var i=0;i<d.procs.length;i++){\n"
+"      var p=d.procs[i];\n"
+"      var badge=p.active?'<span class=\"badge badge-live\">运行中</span>':'<span class=\"badge badge-gone\">已退出</span>';\n"
+"      var seen=p.last_seen?new Date(p.last_seen*1000).toLocaleTimeString():'--';\n"
+"      var hot=computeHotFunc(p.leaks);\n"
+"      rows+='<tr class=\"clickable\" onclick=\"openDetail('+p.pid+')\">'+\n"
+"        '<td>'+p.pid+'</td><td style=\"font-family:var(--font)\">'+esc(p.name)+'</td><td>'+badge+'</td>'+\n"
+"        '<td>'+p.leak_count+'</td><td>'+fmtBytes(p.total_leaked)+'</td>'+\n"
+"        '<td style=\"font-family:var(--font);font-size:12px;max-width:140px;overflow:hidden;text-overflow:ellipsis\">'+esc(hot)+'</td>'+\n"
+"        '<td style=\"font-size:11px;color:var(--text3)\">'+seen+'</td></tr>';\n"
+"    }\n"
+"    document.getElementById('mtb').innerHTML=rows||'<tr><td colspan=\"7\"><div class=\"empty\">等待进程接入...</div></td></tr>';\n"
+"    document.getElementById('mc-cnt').textContent=d.nprocs>0?'('+d.nprocs+')':'';\n"
+"\n"
+"    /* build leak list (dedup by file:line per pid) */\n"
+"    var leakMap={};\n"
+"    for(var i=0;i<d.procs.length;i++){\n"
+"      var pp=d.procs[i];\n"
+"      for(var j=0;j<pp.leaks.length;j++){\n"
+"        var l=pp.leaks[j];\n"
+"        var key=pp.pid+':'+l.file+':'+l.line;\n"
+"        if(!leakMap[key])leakMap[key]={pid:pp.pid,name:pp.name,file:l.file,line:l.line,total:0,count:0,frames:l.frames,nframes:l.nframes};\n"
+"        leakMap[key].total+=l.size;leakMap[key].count++;\n"
+"      }\n"
+"    }\n"
+"    gAllLeaks=Object.values(leakMap);\n"
+"    renderLeaks();\n"
+"    /* update detail panel if open */\n"
+"    if(gDetailPid>0 && document.getElementById('detail').classList.contains('show')) renderDetailBody(gDetailPid);\n"
+"  }).catch(function(){\n"
+"    failCount++;document.getElementById('status-dot').classList.add('off');\n"
+"    if(failCount<=1)document.getElementById('conn-status').textContent='重试中...';\n"
+"  });\n"
+"}\n"
+"\n"
+"/* ===== LEAK RANKING ===== */\n"
+"function setSort(m){\n"
+"  gSortMode=m;\n"
+"  document.getElementById('sort-bytes').classList.toggle('on',m==='bytes');\n"
+"  document.getElementById('sort-rate').classList.toggle('on',m==='rate');\n"
+"  document.getElementById('sort-count').classList.toggle('on',m==='count');\n"
 "  renderLeaks();\n"
 "}\n"
 "\n"
-"function renderLeaks() {\n"
-"  var filter = (document.getElementById('leak-filter').value || '').toLowerCase();\n"
-"  var filtered = gAllLeaks;\n"
-"  if (filter) {\n"
-"    filtered = gAllLeaks.filter(function(l) {\n"
-"      return (l.name && l.name.toLowerCase().indexOf(filter) >= 0) ||\n"
-"             (l.file && l.file.toLowerCase().indexOf(filter) >= 0) ||\n"
-"             String(l.pid).indexOf(filter) >= 0;\n"
-"    });\n"
+"function renderLeaks(){\n"
+"  var filter=(document.getElementById('leak-filter').value||'').toLowerCase();\n"
+"  var arr=gAllLeaks;\n"
+"  if(filter){\n"
+"    arr=arr.filter(function(l){return (l.name&&l.name.toLowerCase().indexOf(filter)>=0)||(l.file&&l.file.toLowerCase().indexOf(filter)>=0)||String(l.pid).indexOf(filter)>=0});\n"
 "  }\n"
+"  /* compute rate per leak site: use per-pid rate scaled by count ratio */\n"
+"  if(gSortMode==='rate'){arr.sort(function(a,b){return b.total-a.total})}\n"
+"  else if(gSortMode==='count'){arr.sort(function(a,b){return b.count-a.count})}\n"
+"  else{arr.sort(function(a,b){return b.total-a.total})} /* bytes */\n"
 "\n"
-"  if (gSortMode === 'size') {\n"
-"    filtered.sort(function(a, b) { return b.size - a.size; });\n"
-"  } else if (gSortMode === 'time') {\n"
-"    filtered.sort(function(a, b) { return b.seq - a.seq; });\n"
-"  } else if (gSortMode === 'proc') {\n"
-"    filtered.sort(function(a, b) {\n"
-"      var nc = (a.name||'').localeCompare(b.name||'');\n"
-"      if (nc !== 0) return nc;\n"
-"      return a.pid - b.pid;\n"
-"    });\n"
-"  }\n"
-"\n"
-"  // 保存当前打开卡片状态（key=pid:file:line:size:idx）\n"
-"  var openKeys = {};\n"
-"  var openCards = document.querySelectorAll('#tl .leak-card.open');\n"
-"  for (var k = 0; k < openCards.length; k++) {\n"
-"    var key = openCards[k].getAttribute('data-leak-key');\n"
-"    if (key) openKeys[key] = true;\n"
-"  }\n"
-"\n"
-"  var top = filtered.slice(0, 15);\n"
-"  var html = '';\n"
-"  for (var i = 0; i < top.length; i++) {\n"
-"    var l = top[i];\n"
-"    var leakKey = l.pid + ':' + l.file + ':' + l.line + ':' + l.size + ':' + i;\n"
-"\n"
-"    // 找到真正的泄漏帧: 从最内层(0)向外，跳过 libmemorytracetool.so 内部帧\n"
-"    var leakFrameIdx = 0;\n"
-"    if (l.nframes > 0) {\n"
-"      for (var j = 0; j < l.nframes; j++) {\n"
-"        var pf = parseFrame(l.frames[j] || '?');\n"
-"        var isInternal = (pf.bin && pf.bin.indexOf('libmemorytracetool') >= 0) ||\n"
-"                         (pf.lib && pf.lib.indexOf('libmemorytracetool') >= 0) ||\n"
-"                         (pf.fn && (pf.fn.indexOf('mtt_') === 0 ||\n"
-"                                    pf.fn === 'capture_stack' || pf.fn === 'backtrace'));\n"
-"        if (!isInternal) { leakFrameIdx = j; break; }\n"
+"  var top=arr.slice(0,15),html='';\n"
+"  for(var i=0;i<top.length;i++){\n"
+"    var l=top[i];\n"
+"    var leakIdx=0;\n"
+"    if(l.nframes>0){for(var j=0;j<l.nframes;j++){var pf=parseFrame(l.frames[j]||'?');var isInt=(pf.bin&&pf.bin.indexOf('libmemorytracetool')>=0)||(pf.fn&&(pf.fn.indexOf('mtt_')===0||pf.fn==='capture_stack'||pf.fn==='backtrace'));if(!isInt){leakIdx=j;break}}}\n"
+"    var maxF=Math.min(l.nframes,10);\n"
+"    html+='<div class=\"leak-card\">';\n"
+"    html+='<div class=\"leak-hdr\"><span class=\"sz\">'+fmtBytes(l.total)+'</span><span class=\"loc\">'+esc(l.file)+':'+l.line+'</span><span class=\"n\">x'+l.count+'</span><span class=\"info\">PID '+l.pid+' · '+esc(l.name)+'</span></div>';\n"
+"    html+='<div class=\"call-tree\">';\n"
+"    if(l.nframes>0){\n"
+"      for(var j=maxF-1;j>=0;j--){\n"
+"        var cls=j===leakIdx?'cn lk':(j===maxF-1?'cn top':'cn');\n"
+"        var parsed=parseFrame(l.frames[j]||'?');\n"
+"        html+='<div class=\"'+cls+'\"';\n"
+"        if(parsed.bin&&parsed.off)html+=' onclick=\"event.stopPropagation();resolveFrame(this,\\''+escAttr(parsed.bin)+'\\',\\''+escAttr(parsed.off)+'\\')\" style=\"cursor:pointer\" title=\"点击解析源码\"';\n"
+"        html+='><span class=\"fn\">'+esc(parsed.fn)+'</span>';\n"
+"        if(parsed.lib)html+='<span class=\"lib\">'+esc(parsed.lib)+'</span>';\n"
+"        if(j===leakIdx)html+='<span class=\"tag\">泄漏点</span>';\n"
+"        html+='</div>';\n"
 "      }\n"
+"    }else{html+='<div class=\"cn\"><span class=\"fn\" style=\"color:var(--text3)\">(无调用栈)</span></div>'}\n"
+"    html+='</div></div>';\n"
+"  }\n"
+"  var total=arr.length,shown=filter?Math.min(top.length,15):Math.min(total,15);\n"
+"  document.getElementById('leak-list').innerHTML=html||'<div class=\"empty\">'+(filter?'无匹配':'暂无泄漏')+'</div>';\n"
+"  document.getElementById('lk-cnt').textContent=total>0?(filter?'(匹配'+shown+'/'+total+')':'(Top '+shown+'/'+total+')'):'';\n"
+"}\n"
+"\n"
+"/* ===== PROCESS LIST ===== */\n"
+"function loadProcs(){\n"
+"  var filter=(document.getElementById('proc-filter').value||'').toLowerCase();\n"
+"  fetch('/api/processes').then(function(r){return r.json()}).then(function(d){\n"
+"    gAllProcs=d.processes;\n"
+"    if(filter)gAllProcs=gAllProcs.filter(function(p){return p.name.toLowerCase().indexOf(filter)>=0});\n"
+"    gProcPage=Math.min(gProcPage,Math.max(1,Math.ceil(gAllProcs.length/gPageSize)));\n"
+"    renderProcPage();renderPager();\n"
+"  }).catch(function(){document.getElementById('ptb').innerHTML='<tr><td colspan=\"7\"><div class=\"empty\">加载失败</div></td></tr>'});\n"
+"}\n"
+"\n"
+"function renderProcPage(){\n"
+"  var s=(gProcPage-1)*gPageSize,page=gAllProcs.slice(s,s+gPageSize),rows='';\n"
+"  for(var i=0;i<page.length;i++){\n"
+"    var p=page[i];\n"
+"    var inj=p.injected&&p.inj_status===1?'<span class=\"badge-ok\">已注入</span>':\n"
+"      (p.injected?'<span class=\"badge-fail\" title=\"'+escAttr(p.inj_err||'')+'\">失败</span>':'<span class=\"badge-pend\">未注入</span>');\n"
+"    var btn=p.injected&&p.inj_status===1?'<span class=\"badge-ok\">已注入</span>':\n"
+"      '<button class=\"btn-sm\" onclick=\"inject('+p.pid+',this)\">注入</button>';\n"
+"    var heap=p.heap_kb>=1024?(p.heap_kb/1024).toFixed(1)+'MB':p.heap_kb+'KB';\n"
+"    var uptime=fmtUptime(p.uptime_sec||0);\n"
+"    var cl=p.cmdline||p.name;\n"
+"    rows+='<tr>'+\n"
+"      '<td>'+p.pid+'</td><td style=\"font-family:var(--font)\">'+esc(p.name)+'</td>'+\n"
+"      '<td><span class=\"cmdline\" title=\"'+escAttr(cl)+'\">'+esc(cl)+'</span></td>'+\n"
+"      '<td style=\"color:var(--text2)\">'+heap+'</td><td style=\"font-size:10px;color:var(--text3)\">'+uptime+'</td>'+\n"
+"      '<td>'+inj+'</td><td>'+btn+'</td></tr>';\n"
+"  }\n"
+"  document.getElementById('ptb').innerHTML=rows||'<tr><td colspan=\"7\"><div class=\"empty\">'+(gAllProcs.length?'无匹配':'无可用进程')+'</div></td></tr>';\n"
+"  document.getElementById('ic-cnt').textContent=gAllProcs.length?'('+gAllProcs.length+')':'';\n"
+"}\n"
+"\n"
+"function renderPager(){\n"
+"  var t=Math.max(1,Math.ceil(gAllProcs.length/gPageSize)),h='';\n"
+"  h+='<button class=\"pg\" '+(gProcPage<=1?'disabled':'')+' onclick=\"goPage('+(gProcPage-1)+')\">&laquo;</button>';\n"
+"  for(var i=1;i<=t&&i<=8;i++)h+='<button class=\"pg'+(i===gProcPage?' on':'')+'\" onclick=\"goPage('+i+')\">'+i+'</button>';\n"
+"  if(t>8)h+='<span style=\"font-size:11px;color:var(--text3);margin:0 4px\">...'+t+'</span>';\n"
+"  h+='<button class=\"pg\" '+(gProcPage>=t?'disabled':'')+' onclick=\"goPage('+(gProcPage+1)+')\">&raquo;</button>';\n"
+"  document.getElementById('pg').innerHTML=h;\n"
+"}\n"
+"\n"
+"function goPage(n){gProcPage=n;renderProcPage();renderPager()}\n"
+"\n"
+"function inject(pid,btn){\n"
+"  btn.disabled=true;btn.textContent='...';toast('注入 PID '+pid+' ...');\n"
+"  fetch('/api/inject?pid='+pid).then(function(r){return r.json()}).then(function(d){\n"
+"    if(d.status==='ok'){toast('注入成功! '+d.patched+' GOT');loadProcs()}\n"
+"    else{toast('失败: '+d.error);btn.disabled=false;btn.textContent='重试'}\n"
+"  }).catch(function(){toast('请求失败');btn.disabled=false;btn.textContent='重试'});\n"
+"}\n"
+"\n"
+"loadProcs();\n"
+"\n"
+"/* ===== DETAIL PANEL ===== */\n"
+"function openDetail(pid){\n"
+"  gDetailPid=pid;\n"
+"  trailPaused=true;\n"
+"  document.getElementById('overlay').classList.add('show');\n"
+"  document.getElementById('detail').classList.add('show');\n"
+"  renderDetailBody(pid);\n"
+"}\n"
+"\n"
+"function closeDetail(){\n"
+"  document.getElementById('overlay').classList.remove('show');\n"
+"  document.getElementById('detail').classList.remove('show');\n"
+"  gDetailPid=0;\n"
+"  trailPaused=false;\n"
+"}\n"
+"\n"
+"document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeDetail();closeResetModal()}});\n"
+"\n"
+"function renderDetailBody(pid){\n"
+"  var hist=gHistory[pid]||[],body='';\n"
+"  /* find process name */\n"
+"  fetch('/api/data').then(function(r){return r.json()}).then(function(d){\n"
+"    var proc=null;\n"
+"    for(var i=0;i<d.procs.length;i++){if(d.procs[i].pid===pid){proc=d.procs[i];break}}\n"
+"    if(!proc){document.getElementById('dtl-title').textContent='PID '+pid+' (已退出)';return}\n"
+"\n"
+"    document.getElementById('dtl-title').textContent=proc.name+' (PID '+pid+')';\n"
+"    var rate=proc.total_leaked>0&&gPrevTime>0?'+'+fmtBytes(proc.total_leaked)+'/轮':'--';\n"
+"\n"
+"    body='<div class=\"detail-stats\">'+\n"
+"      '<div class=\"ds\"><div class=\"ds-val\">'+fmtBytes(proc.total_leaked)+'</div><div class=\"ds-label\">泄漏字节</div></div>'+\n"
+"      '<div class=\"ds\"><div class=\"ds-val\">'+proc.leak_count+'</div><div class=\"ds-label\">泄漏次数</div></div>'+\n"
+"      '<div class=\"ds\"><div class=\"ds-val\">'+rate+'</div><div class=\"ds-label\">增速/轮</div></div>'+\n"
+"      '<div class=\"ds\"><div class=\"ds-val\">'+(proc.active?'运行中':'已退出')+'</div><div class=\"ds-label\">状态</div></div>'+\n"
+"      '</div>';\n"
+"\n"
+"    /* chart */\n"
+"    body+='<div class=\"chart-wrap\"><canvas id=\"chart\" width=\"620\" height=\"240\"></canvas><div class=\"chart-tip\">滚轮缩放 · 拖拽平移 · 悬停查看数值</div></div>';\n"
+"\n"
+"    /* leak details for this process */\n"
+"    var leakMap={};\n"
+"    for(var j=0;j<proc.leaks.length;j++){\n"
+"      var l=proc.leaks[j],key=l.file+':'+l.line;\n"
+"      if(!leakMap[key])leakMap[key]={file:l.file,line:l.line,total:0,count:0,frames:l.frames,nframes:l.nframes};\n"
+"      leakMap[key].total+=l.size;leakMap[key].count++;\n"
 "    }\n"
-"\n"
-"    html += '<div class=\"leak-card\" data-leak-key=\"' + leakKey + '\" onclick=\"event.stopPropagation();this.classList.toggle(\\'open\\')\">';\n"
-"    html += '<div class=\"leak-header\">';\n"
-"    html += '<span class=\"arrow\">&#9654;</span>';\n"
-"    html += '<span class=\"sz\">' + fmtBytes(l.size) + '</span>';\n"
-"    html += '<span class=\"loc\">' + esc(l.file) + ':' + l.line + '</span>';\n"
-"    html += '<span class=\"proc-info\">PID ' + l.pid + ' &middot; ' + esc(l.name) + '</span>';\n"
-"    html += '</div>';\n"
-"    html += '<div class=\"leak-body\"><div class=\"leak-body-divider\"></div>';\n"
-"    html += '<div class=\"call-tree\">';\n"
-"\n"
-"    if (l.nframes > 0) {\n"
-"      for (var j = l.nframes - 1; j >= 0; j--) {\n"
-"        var cls = j === leakFrameIdx ? 'call-node leak-site' : (j === l.nframes - 1 ? 'call-node entry' : 'call-node');\n"
-"        var parsed = parseFrame(l.frames[j] || '?');\n"
-"        html += '<div class=\"' + cls + '\"';\n"
-"        if (parsed.bin && parsed.off) html += ' onclick=\"event.stopPropagation();resolveFrame(this,\\'' + escAttr(parsed.bin) + '\\',\\'' + escAttr(parsed.off) + '\\')\" style=\"cursor:pointer\" title=\"点击解析源码位置\"';\n"
-"        html += '>';\n"
-"        html += '<span class=\"fn\">' + esc(parsed.fn) + '</span>';\n"
-"        if (parsed.lib) html += '<span class=\"lib\">' + esc(parsed.lib) + '</span>';\n"
-"        if (j === leakFrameIdx) html += '<span class=\"tag\">泄漏点</span>';\n"
-"        html += '</div>';\n"
-"      }\n"
-"    } else {\n"
-"      html += '<div class=\"call-node\"><span class=\"fn\" style=\"color:var(--text-tertiary)\">(无调用栈)</span></div>';\n"
+"    var leaks=Object.values(leakMap);\n"
+"    leaks.sort(function(a,b){return b.total-a.total});\n"
+"    body+='<div class=\"leak-sec\"><h4>该进程泄漏明细 ('+leaks.length+' 个站点)</h4>';\n"
+"    for(var j=0;j<Math.min(leaks.length,10);j++){\n"
+"      var l=leaks[j],lkIdx=0;\n"
+"      if(l.nframes>0){for(var k=0;k<l.nframes;k++){var pf=parseFrame(l.frames[k]||'?');if(!pf.bin||pf.bin.indexOf('libmemorytracetool')<0){if(!pf.fn||(pf.fn.indexOf('mtt_')!==0&&pf.fn!=='capture_stack'&&pf.fn!=='backtrace')){lkIdx=k;break}}}}\n"
+"      var mf=Math.min(l.nframes,10);\n"
+"      body+='<div class=\"leak-card\" style=\"margin-top:4px\">';\n"
+"      body+='<div class=\"leak-hdr\"><span class=\"sz\">'+fmtBytes(l.total)+'</span><span class=\"loc\">'+esc(l.file)+':'+l.line+'</span><span class=\"n\">x'+l.count+'</span></div>';\n"
+"      body+='<div class=\"call-tree\">';\n"
+"      if(l.nframes>0){\n"
+"        for(var k=mf-1;k>=0;k--){\n"
+"          var cls=k===lkIdx?'cn lk':(k===mf-1?'cn top':'cn');\n"
+"          var p2=parseFrame(l.frames[k]||'?');\n"
+"          body+='<div class=\"'+cls+'\"><span class=\"fn\">'+esc(p2.fn)+'</span>';\n"
+"          if(p2.lib)body+='<span class=\"lib\">'+esc(p2.lib)+'</span>';\n"
+"          if(k===lkIdx)body+='<span class=\"tag\">泄漏点</span>';\n"
+"          body+='</div>';\n"
+"        }\n"
+"      }else{body+='<div class=\"cn\"><span class=\"fn\" style=\"color:var(--text3)\">(无调用栈)</span></div>'}\n"
+"      body+='</div></div>';\n"
 "    }\n"
+"    body+='</div>';\n"
+"    document.getElementById('dtl-body').innerHTML=body;\n"
 "\n"
-"    html += '</div></div></div>';\n"
+"    /* draw chart */\n"
+"    setTimeout(function(){drawChart(hist)},100);\n"
+"  });\n"
+"}\n"
+"\n"
+"/* ===== CANVAS CHART ===== */\n"
+"var chartZoom=1,chartPan=0,chartDragging=false,chartDragStart=0,chartPanStart=0;\n"
+"\n"
+"function drawChart(data){\n"
+"  var c=document.getElementById('chart');if(!c||data.length<2)return;\n"
+"  var dpr=window.devicePixelRatio||1;\n"
+"  var W=c.clientWidth,H=c.clientHeight;\n"
+"  c.width=W*dpr;c.height=H*dpr;\n"
+"  var ctx=c.getContext('2d');ctx.scale(dpr,dpr);\n"
+"\n"
+"  /* compute visible window */\n"
+"  var totalPts=data.length;\n"
+"  var winSize=Math.max(10,Math.floor(totalPts/chartZoom));\n"
+"  var endIdx=totalPts-1-chartPan;\n"
+"  var startIdx=Math.max(0,endIdx-winSize+1);\n"
+"  if(startIdx>=endIdx){startIdx=endIdx-1;if(startIdx<0)startIdx=0}\n"
+"  var vis=data.slice(startIdx,endIdx+1);\n"
+"  if(vis.length<2)return;\n"
+"\n"
+"  var minB=Infinity,maxB=-Infinity;\n"
+"  for(var i=0;i<vis.length;i++){minB=Math.min(minB,vis[i].bytes);maxB=Math.max(maxB,vis[i].bytes)}\n"
+"  if(maxB===minB)maxB=minB+1;\n"
+"\n"
+"  /* grid & axes */\n"
+"  var pad={l:48,r:16,t:24,b:28},pw=W-pad.l-pad.r,ph=H-pad.t-pad.b;\n"
+"  ctx.clearRect(0,0,W,H);\n"
+"\n"
+"  /* bg fill */\n"
+"  ctx.fillStyle='rgba(0,0,0,.15)';ctx.fillRect(pad.l,pad.t,pw,ph);\n"
+"\n"
+"  /* grid lines */\n"
+"  ctx.strokeStyle='rgba(0,212,255,.04)';ctx.lineWidth=.5;\n"
+"  var ySteps=5;\n"
+"  for(var i=0;i<=ySteps;i++){\n"
+"    var y=pad.t+(ph/ySteps)*i;\n"
+"    ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();\n"
+"    var val=minB+(maxB-minB)*(ySteps-i)/ySteps;\n"
+"    ctx.fillStyle='var(--text3)';ctx.font='9px var(--mono)';ctx.textAlign='right';\n"
+"    ctx.fillStyle='#8892a4';ctx.font='11px var(--mono)';ctx.fillText(fmtBytes(val),pad.l-6,y-2);\n"
+"  }\n"
+"  var timeSpan=(vis[vis.length-1].t-vis[0].t);\n"
+"  var xSteps=Math.min(7,Math.max(3,Math.floor(pw/80)));\n"
+"  var xFmt;\n"
+"  if(timeSpan<3600){xFmt=function(d){return d.toLocaleTimeString()}}\n"
+"  else if(timeSpan<86400){xFmt=function(d){var p=d.toLocaleTimeString().split(':');return p[0]+':'+p[1]}}\n"
+"  else{xFmt=function(d){return (d.getMonth()+1)+'-'+d.getDate()+' '+d.toLocaleTimeString().split(':').slice(0,2).join(':')}}\n"
+"  /* date range annotation */\n"
+"  var d0=new Date(vis[0].t*1000),d1=new Date(vis[vis.length-1].t*1000);\n"
+"  ctx.fillStyle='#8892a4';ctx.font='10px var(--mono)';ctx.textAlign='left';\n"
+"  ctx.fillText((d0.getMonth()+1)+'-'+d0.getDate()+' ~ '+(d1.getMonth()+1)+'-'+d1.getDate(),pad.l,pad.t-2);\n"
+"  for(var i=0;i<=xSteps;i++){\n"
+"    var xi=Math.floor(i*(vis.length-1)/Math.max(1,xSteps));\n"
+"    var x=pad.l+(pw/(Math.max(1,vis.length-1)))*xi;\n"
+"    ctx.strokeStyle='rgba(0,212,255,.04)';ctx.lineWidth=.5;\n"
+"    ctx.beginPath();ctx.moveTo(x,pad.t);ctx.lineTo(x,H-pad.b);ctx.stroke();\n"
+"    var d=new Date(vis[xi].t*1000);\n"
+"    ctx.fillStyle='#8892a4';ctx.font='11px var(--mono)';ctx.textAlign='center';\n"
+"    ctx.fillText(xFmt(d),x,H-pad.b+2);\n"
 "  }\n"
 "\n"
-"  var totalAll = gAllLeaks.length;\n"
-"  var shown = filter ? filtered.length : Math.min(totalAll, 15);\n"
-"  var label = '';\n"
-"  if (totalAll > 0) {\n"
-"    if (filter) {\n"
-"      label = '(匹配 ' + shown + ' / 共 ' + totalAll + ')';\n"
-"    } else {\n"
-"      label = '(Top ' + Math.min(totalAll, 15) + ' / 共 ' + totalAll + ')';\n"
+"  /* area fill */\n"
+"  ctx.beginPath();\n"
+"  for(var i=0;i<vis.length;i++){\n"
+"    var sx=pad.l+(pw/(vis.length-1))*i,sy=pad.t+ph-((vis[i].bytes-minB)/(maxB-minB))*ph;\n"
+"    if(i===0)ctx.moveTo(sx,sy);else ctx.lineTo(sx,sy);\n"
+"  }\n"
+"  ctx.lineTo(pad.l+(pw/(vis.length-1))*(vis.length-1),pad.t+ph);\n"
+"  ctx.lineTo(pad.l,pad.t+ph);ctx.closePath();\n"
+"  var grad=ctx.createLinearGradient(0,pad.t,0,pad.t+ph);\n"
+"  grad.addColorStop(0,'rgba(0,212,255,.15)');grad.addColorStop(1,'rgba(0,212,255,0)');\n"
+"  ctx.fillStyle=grad;ctx.fill();\n"
+"\n"
+"  /* line */\n"
+"  ctx.beginPath();ctx.strokeStyle='#00d4ff';ctx.lineWidth=1.5;ctx.lineJoin='round';\n"
+"  for(var i=0;i<vis.length;i++){\n"
+"    var sx=pad.l+(pw/(vis.length-1))*i,sy=pad.t+ph-((vis[i].bytes-minB)/(maxB-minB))*ph;\n"
+"    if(i===0)ctx.moveTo(sx,sy);else ctx.lineTo(sx,sy);\n"
+"  }\n"
+"  ctx.stroke();\n"
+"\n"
+"  /* last point dot */\n"
+"  var lx=pad.l+pw,ly=pad.t+ph-((vis[vis.length-1].bytes-minB)/(maxB-minB))*ph;\n"
+"  ctx.beginPath();ctx.arc(lx,ly,3.5,0,Math.PI*2);ctx.fillStyle='#00d4ff';ctx.fill();\n"
+"  ctx.beginPath();ctx.arc(lx,ly,7,0,Math.PI*2);ctx.fillStyle='rgba(0,212,255,.2)';ctx.fill();\n"
+"\n"
+"  /* zoom info */\n"
+"  ctx.fillStyle='#8892a4';ctx.font='11px var(--mono)';ctx.textAlign='right';\n"
+"  ctx.fillText(chartZoom+'x',W-pad.r-4,pad.t+10);\n"
+"\n"
+"  /* store chart state */\n"
+"  c._data=data;c._minB=minB;c._maxB=maxB;c._pad=pad;c._vis=vis;c._pw=pw;c._ph=ph;\n"
+"}\n"
+"\n"
+"/* chart interactions - dynamic canvas lookup fixes null-ref bug */\n"
+"(function(){\n"
+"  /* wheel zoom: only when mouse is on the chart canvas */\n"
+"  document.addEventListener('wheel',function(e){\n"
+"    if(!e.target.closest('#chart'))return;\n"
+"    var c=document.getElementById('chart');\n"
+"    if(!c||!c.closest('.detail.show'))return;\n"
+"    e.preventDefault();\n"
+"    var rect=c.getBoundingClientRect();\n"
+"    var oldZoom=chartZoom,oldPan=chartPan;\n"
+"    if(e.deltaY<0){chartZoom=Math.min(20,chartZoom*1.3)}else{chartZoom=Math.max(1,chartZoom/1.3)}\n"
+"    if(c._data){\n"
+"      var total=c._data.length,oldWin=Math.max(10,Math.floor(total/oldZoom));\n"
+"      chartPan=Math.max(0,Math.min(total-oldWin,chartPan));\n"
+"    }\n"
+"    drawChart(c._data||[]);\n"
+"  },{passive:false});\n"
+"\n"
+"  /* drag pan: mousedown on chart starts drag */\n"
+"  document.addEventListener('mousedown',function(e){\n"
+"    if(!e.target.closest('#chart'))return;\n"
+"    if(chartZoom<=1)return;\n"
+"    var c=document.getElementById('chart');\n"
+"    chartDragging=true;chartDragStart=e.clientX;chartPanStart=chartPan;\n"
+"    c.style.cursor='grabbing';\n"
+"  });\n"
+"  document.addEventListener('mousemove',function(e){\n"
+"    if(!chartDragging)return;\n"
+"    var c=document.getElementById('chart');\n"
+"    var dx=e.clientX-chartDragStart;\n"
+"    if(c&&c._data){\n"
+"      var total=c._data.length,win=Math.max(10,Math.floor(total/chartZoom));\n"
+"      var dp=Math.round(dx/c.clientWidth*win);\n"
+"      chartPan=Math.max(0,Math.min(total-win,chartPanStart+dp));\n"
+"    }\n"
+"    drawChart(c&&c._data||[]);\n"
+"  });\n"
+"  document.addEventListener('mouseup',function(){\n"
+"    chartDragging=false;\n"
+"    var c=document.getElementById('chart');\n"
+"    if(c)c.style.cursor='crosshair';\n"
+"  });\n"
+"\n"
+"  /* hover crosshair: only on chart canvas */\n"
+"  document.addEventListener('mousemove',function(e){\n"
+"    if(chartDragging)return;\n"
+"    if(!e.target.closest('#chart'))return;\n"
+"    var c=document.getElementById('chart');\n"
+"    if(!c||!c._vis)return;\n"
+"    var rect=c.getBoundingClientRect(),mx=e.clientX-rect.left;\n"
+"    var pad=c._pad;if(!pad||mx<pad.l||mx>pad.l+c._pw)return;\n"
+"    var vis=c._vis,idx=Math.round((mx-pad.l)/c._pw*(vis.length-1));\n"
+"    if(idx<0||idx>=vis.length)return;\n"
+"    drawChart(c._data);\n"
+"    var ctx=c.getContext('2d'),dpr=window.devicePixelRatio||1;\n"
+"    ctx.scale(dpr,dpr);\n"
+"    var cx=pad.l+(c._pw/(Math.max(1,vis.length-1)))*idx;\n"
+"    var cy=pad.t+c._ph-((vis[idx].bytes-c._minB)/(c._maxB-c._minB))*c._ph;\n"
+"    ctx.strokeStyle='rgba(0,212,255,.5)';ctx.lineWidth=1;\n"
+"    ctx.beginPath();ctx.moveTo(cx,pad.t);ctx.lineTo(cx,pad.t+c._ph);ctx.stroke();\n"
+"    ctx.beginPath();ctx.arc(cx,cy,4,0,Math.PI*2);ctx.fillStyle='#00d4ff';ctx.fill();\n"
+"\n"
+"    /* tooltip */\n"
+"    var d=new Date(vis[idx].t*1000);\n"
+"    var tw=ctx.measureText(d.toLocaleTimeString()+'  '+fmtBytes(vis[idx].bytes)).width;\n"
+"    ctx.fillStyle='rgba(17,22,34,.9)';ctx.fillRect(cx-tw/2-6,cy-16,tw+12,22);\n"
+"    ctx.fillStyle='var(--text)';ctx.font='11px var(--mono)';ctx.textAlign='center';\n"
+"    ctx.fillText(d.toLocaleTimeString()+'  '+fmtBytes(vis[idx].bytes),cx,cy-2);\n"
+"  });\n"
+"})();\n"
+"\n"
+"/* ===== HELPERS ===== */\n"
+"function computeHotFunc(leaks){\n"
+"  var map={};\n"
+"  for(var i=0;i<leaks.length;i++){\n"
+"    for(var j=0;j<leaks[i].nframes;j++){\n"
+"      var pf=parseFrame(leaks[i].frames[j]||'');\n"
+"      if(!pf.fn||pf.fn==='?'||pf.fn.indexOf('mtt_')===0||pf.fn==='capture_stack'||pf.fn==='backtrace')continue;\n"
+"      map[pf.fn]=(map[pf.fn]||0)+leaks[i].size;\n"
 "    }\n"
 "  }\n"
-"  document.getElementById('tl').innerHTML = html ||\n"
-"    '<div class=\"empty\"><div class=\"empty-icon\">OK</div><p>' + (filter ? '无匹配泄漏' : '暂无泄漏 - 一切正常') + '</p></div>';\n"
-"  document.getElementById('leak-count').textContent = label;\n"
-"\n"
-"  // 恢复之前打开的卡片\n"
-"  var allCards = document.querySelectorAll('#tl .leak-card');\n"
-"  for (var k = 0; k < allCards.length; k++) {\n"
-"    var key = allCards[k].getAttribute('data-leak-key');\n"
-"    if (key && openKeys[key]) allCards[k].classList.add('open');\n"
-"  }\n"
+"  var best='(none)',bestSz=0;\n"
+"  for(var k in map){if(map[k]>bestSz){bestSz=map[k];best=k}}\n"
+"  return best;\n"
 "}\n"
 "\n"
-"function toggleAuto() {\n"
-"  autoRefresh = !autoRefresh;\n"
-"  var btn = document.getElementById('btn-pause');\n"
-"  var dot = document.getElementById('status-dot');\n"
-"  if (autoRefresh) {\n"
-"    btn.textContent = '暂停刷新';\n"
-"    btn.classList.remove('paused');\n"
-"    dot.classList.remove('off');\n"
-"    refresh();\n"
-"  } else {\n"
-"    btn.textContent = '恢复刷新';\n"
-"    btn.classList.add('paused');\n"
-"    dot.classList.add('off');\n"
-"    document.getElementById('refresh-age').textContent = '已暂停';\n"
-"  }\n"
-"  toast(autoRefresh ? '自动刷新已恢复' : '自动刷新已暂停');\n"
+"function parseFrame(raw){\n"
+"  if(!raw)return{fn:'?',lib:'',bin:'',off:''};\n"
+"  var parts=raw.split('|'),display=parts[0]||raw;\n"
+"  var m=display.match(/^(.+?)\\s+\\((.+?)\\)\\s*$/);\n"
+"  if(m)return{fn:m[1],lib:m[2],bin:parts[1]||'',off:parts[2]||''};\n"
+"  m=display.match(/^(.+?)\\((.+?)\\)\\s*$/);\n"
+"  if(m)return{fn:m[1],lib:'',bin:parts[1]||'',off:parts[2]||''};\n"
+"  return{fn:display,lib:'',bin:parts[1]||'',off:parts[2]||''};\n"
 "}\n"
 "\n"
-"function refresh() {\n"
-"  fetch('/api/data')\n"
-"    .then(function(r) { return r.json(); })\n"
-"    .then(function(d) {\n"
-"      failCount = 0;\n"
-"      document.getElementById('status-dot').classList.remove('off');\n"
-"      document.getElementById('refresh-age').textContent = new Date().toLocaleTimeString();\n"
-"\n"
-"      document.getElementById('p').textContent = d.nprocs;\n"
-"      document.getElementById('l').textContent = d.total_leaks;\n"
-"      document.getElementById('b').textContent = fmtBytes(d.total_bytes);\n"
-"\n"
-"      var rows = '';\n"
-"      for (var i = 0; i < d.procs.length; i++) {\n"
-"        var p = d.procs[i];\n"
-"        var badge = p.active\n"
-"          ? '<span class=\"badge badge-live\">运行中</span>'\n"
-"          : '<span class=\"badge badge-done\">已退出</span>';\n"
-"        var seen = p.last_seen ? new Date(p.last_seen * 1000).toLocaleTimeString() : '--';\n"
-"        var topFn = parseTopFn(p.top_stack);\n"
-"        rows += '<tr>' +\n"
-"          '<td style=\"font-family:var(--mono);font-size:12px\">' + p.pid + '</td>' +\n"
-"          '<td>' + esc(p.name) + '</td>' +\n"
-"          '<td>' + badge + '</td>' +\n"
-"          '<td style=\"font-family:var(--mono);font-size:12px\">' + p.leak_count + '</td>' +\n"
-"          '<td style=\"font-family:var(--mono);font-size:12px\">' + fmtBytes(p.total_leaked) + '</td>' +\n"
-"          '<td style=\"font-size:12px;color:var(--text-secondary)\">' + seen + '</td>' +\n"
-"          '<td><span class=\"hot-fn\" title=\"' + escAttr(p.top_stack || '') + '\">' + esc(topFn) + '</span></td>' +\n"
-"          '</tr>';\n"
-"      }\n"
-"      document.getElementById('tb').innerHTML = rows ||\n"
-"        '<tr><td colspan=\"7\"><div class=\"empty\"><div class=\"empty-icon\">--</div><p>等待被监控进程接入...</p></div></td></tr>';\n"
-"      document.getElementById('proc-count').textContent = d.nprocs > 0 ? '(' + d.nprocs + ')' : '';\n"
-"\n"
-"      var seq = 0;\n"
-"      var all = [];\n"
-"      for (var i = 0; i < d.procs.length; i++) {\n"
-"        var p = d.procs[i];\n"
-"        for (var j = 0; j < p.leaks.length; j++) {\n"
-"          all.push({\n"
-"            size: p.leaks[j].size,\n"
-"            file: p.leaks[j].file,\n"
-"            line: p.leaks[j].line,\n"
-"            nframes: p.leaks[j].nframes,\n"
-"            frames: p.leaks[j].frames,\n"
-"            pid: p.pid,\n"
-"            name: p.name,\n"
-"            seq: seq++\n"
-"          });\n"
-"        }\n"
-"      }\n"
-"      gAllLeaks = all;\n"
-"      renderLeaks();\n"
-"    })\n"
-"    .catch(function() {\n"
-"      failCount++;\n"
-"      document.getElementById('status-dot').classList.add('off');\n"
-"      if (failCount <= 1) {\n"
-"        document.getElementById('refresh-age').textContent = '连接失败，重试中...';\n"
-"      }\n"
-"    });\n"
+"function resolveFrame(el,bin,off){\n"
+"  if(!bin||!off)return;\n"
+"  var fnEl=el.querySelector('.fn'),orig=fnEl.textContent;\n"
+"  fnEl.textContent=orig+' (解析中...)';\n"
+"  fetch('/api/addr2line?bin='+encodeURIComponent(bin)+'&off='+off).then(function(r){return r.json()}).then(function(d){\n"
+"    fnEl.textContent=orig;var tip=el.querySelector('.src-tip');\n"
+"    if(!tip){tip=document.createElement('span');tip.className='src-tip';el.appendChild(tip)}\n"
+"    tip.textContent=' @ '+d.result;tip.title=d.result;\n"
+"  }).catch(function(){fnEl.textContent=orig});\n"
 "}\n"
 "\n"
-"function loadProcesses() {\n"
-"  var filter = (document.getElementById('proc-filter').value || '').toLowerCase();\n"
-"  fetch('/api/processes')\n"
-"    .then(function(r) { return r.json(); })\n"
-"    .then(function(d) {\n"
-"      var rows = '';\n"
-"      var shown = 0;\n"
-"      for (var i = 0; i < d.processes.length; i++) {\n"
-"        var p = d.processes[i];\n"
-"        if (filter && p.name.toLowerCase().indexOf(filter) < 0) continue;\n"
-"        shown++;\n"
-"        var injHtml = '';\n"
-"        if (p.injected) {\n"
-"          if (p.inj_status === 1) {\n"
-"            injHtml = '<span class=\"badge-ok\">监控中</span>';\n"
-"          } else if (p.inj_status === 2) {\n"
-"            injHtml = '<span class=\"badge-fail\" title=\"' + escAttr(p.inj_err) + '\">失败</span>';\n"
-"          }\n"
-"        } else {\n"
-"          injHtml = '<span class=\"badge-pending\">未注入</span>';\n"
-"        }\n"
-"        var btnHtml = '';\n"
-"        if (p.injected && p.inj_status === 1) {\n"
-"          btnHtml = '<span class=\"badge-ok\">已注入</span>';\n"
-"        } else {\n"
-"          btnHtml = '<button class=\"btn-sm\" onclick=\"injectProcess(' + p.pid + ', this)\">注入</button>';\n"
-"        }\n"
-"        rows += '<tr>' +\n"
-"          '<td style=\"font-family:var(--mono);font-size:11px\">' + p.pid + '</td>' +\n"
-"          '<td>' + esc(p.name) + '</td>' +\n"
-"          '<td>' + injHtml + '</td>' +\n"
-"          '<td>' + btnHtml + '</td>' +\n"
-"          '</tr>';\n"
-"      }\n"
-"      document.getElementById('ptb').innerHTML = rows ||\n"
-"        '<tr><td colspan=\"4\"><div class=\"empty\"><p>' + (filter ? '无匹配进程' : '无可用进程') + '</p></div></td></tr>';\n"
-"      document.getElementById('proc-count-inject').textContent = shown > 0 ? '(' + shown + ')' : '';\n"
-"    })\n"
-"    .catch(function() {\n"
-"      document.getElementById('ptb').innerHTML = '<tr><td colspan=\"5\"><div class=\"empty\"><p>加载失败</p></div></td></tr>';\n"
-"    });\n"
+"function fmtBytes(b){\n"
+"  if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';\n"
+"  if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB';\n"
 "}\n"
 "\n"
-"function injectProcess(pid, btn) {\n"
-"  btn.disabled = true;\n"
-"  btn.textContent = '...';\n"
-"  toast('正在向 PID ' + pid + ' 注入...');\n"
-"  fetch('/api/inject?pid=' + pid)\n"
-"    .then(function(r) { return r.json(); })\n"
-"    .then(function(d) {\n"
-"      if (d.status === 'ok') {\n"
-"        toast('PID ' + pid + ' 注入成功！(' + d.patched + ' 个GOT表项已修补)');\n"
-"        loadProcesses();\n"
-"      } else {\n"
-"        toast('注入失败: ' + d.error);\n"
-"        btn.disabled = false;\n"
-"        btn.textContent = '重试';\n"
-"      }\n"
-"    })\n"
-"    .catch(function() {\n"
-"      toast('注入请求失败（网络错误）');\n"
-"      btn.disabled = false;\n"
-"      btn.textContent = '重试';\n"
-"    });\n"
+"function fmtUptime(s){\n"
+"  if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';\n"
+"  if(s<86400)return Math.floor(s/3600)+'h';return Math.floor(s/86400)+'d';\n"
 "}\n"
 "\n"
-"loadProcesses();\n"
+"function esc(s){if(!s)return'';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;')}\n"
+"function escAttr(s){if(!s)return'';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;')}\n"
 "\n"
-"function parseFrame(raw) {\n"
-"  if (!raw) return { fn: '?', lib: '', bin: '', off: '' };\n"
-"  var parts = raw.split('|');\n"
-"  var display = parts[0] || raw;\n"
-"  var m = display.match(/^(.+?)\\s+\\((.+?)\\)\\s*$/);\n"
-"  if (m) return { fn: m[1], lib: m[2], bin: parts[1] || '', off: parts[2] || '' };\n"
-"  m = display.match(/^(.+?)\\((.+?)\\)\\s*$/);\n"
-"  if (m) return { fn: m[1], lib: '', bin: parts[1] || '', off: parts[2] || '' };\n"
-"  return { fn: display, lib: '', bin: parts[1] || '', off: parts[2] || '' };\n"
-"}\n"
-"\n"
-"function parseTopFn(raw) {\n"
-"  if (!raw || raw === '(none)') return '(none)';\n"
-"  return parseFrame(raw).fn;\n"
-"}\n"
-"\n"
-"function resolveFrame(el, bin, off) {\n"
-"  if (!bin || !off) return;\n"
-"  var fnEl = el.querySelector('.fn');\n"
-"  var orig = fnEl.textContent;\n"
-"  fnEl.textContent = orig + ' (解析中...)';\n"
-"  fetch('/api/addr2line?bin=' + encodeURIComponent(bin) + '&off=' + off)\n"
-"    .then(function(r) { return r.json(); })\n"
-"    .then(function(d) {\n"
-"      fnEl.textContent = orig;\n"
-"      var tip = el.querySelector('.source-tip');\n"
-"      if (!tip) {\n"
-"        tip = document.createElement('span');\n"
-"        tip.className = 'source-tip';\n"
-"        el.appendChild(tip);\n"
-"      }\n"
-"      tip.textContent = ' @ ' + d.result;\n"
-"      tip.title = d.result;\n"
-"    })\n"
-"    .catch(function() {\n"
-"      fnEl.textContent = orig;\n"
-"    });\n"
-"}\n"
-"\n"
-"function fmtBytes(b) {\n"
-"  if (b < 1024) return b + ' B';\n"
-"  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';\n"
-"  if (b < 1073741824) return (b / 1048576).toFixed(1) + ' MB';\n"
-"  return (b / 1073741824).toFixed(1) + ' GB';\n"
-"}\n"
-"\n"
-"function esc(s) {\n"
-"  if (!s) return '';\n"
-"  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\n"
-"}\n"
-"\n"
-"function escAttr(s) {\n"
-"  if (!s) return '';\n"
-"  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#39;');\n"
-"}\n"
-"\n"
-"function toast(msg) {\n"
-"  var t = document.getElementById('toast');\n"
-"  t.textContent = msg;\n"
-"  t.classList.add('show');\n"
-"  setTimeout(function() { t.classList.remove('show'); }, 2000);\n"
+"function toast(msg){\n"
+"  var t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');\n"
+"  setTimeout(function(){t.classList.remove('show')},2000);\n"
 "}\n"
 "</script>\n"
+"\n"
+"<!-- RESET CONFIRMATION MODAL -->\n"
+"<div class=\"modal-overlay\" id=\"reset-modal-overlay\" onclick=\"closeResetModal()\"></div>\n"
+"<div class=\"modal-dialog\" id=\"reset-modal\">\n"
+"  <div class=\"modal-icon\">!</div>\n"
+"  <h3 class=\"modal-title\">确认重新监控</h3>\n"
+"  <p class=\"modal-body\">重新监控将<span class=\"modal-warn\">清除所有已记录的泄漏数据</span>，包括历史泄漏记录和调用栈信息。<br>已注入进程的注入状态会保留，下次内存分配时将自动重新报告。</p>\n"
+"  <div class=\"modal-actions\">\n"
+"    <button class=\"btn\" onclick=\"closeResetModal()\">取消</button>\n"
+"    <button class=\"btn warn\" id=\"btn-confirm-reset\" onclick=\"confirmReset()\">确认重新监控</button>\n"
+"  </div>\n"
+"</div>\n"
+"\n"
 "</body>\n"
-"</html>";
+"</html>\n"
+;
 
 /**
  * JSON 字符串转义。
@@ -1437,23 +1777,34 @@ static void send_addr2line(int fd, const char* bin, const char* offset)
 
 /* ---- 注入 API 端点 ---- */
 
-/** libmemorytracetool.so 的默认搜索路径（相对于 mttd 可执行文件） */
+/** libmemorytracetool.so 的备选搜索路径（绝对路径兜底） */
 static const char* default_lib_paths[] = {
-    "lib/libmemorytracetool.so",
-    "../lib/libmemorytracetool.so",
     "/usr/local/lib/libmemorytracetool.so",
     NULL
 };
 
-/** 解析出注入库的绝对路径 */
+/** 解析出注入库的绝对路径（基于 /proc/self/exe 定位项目树中的 .so） */
 static int resolve_lib_path(char* out, size_t out_sz)
 {
     (void)out_sz;
+    /* 通过 /proc/self/exe 获取 mttd 自身路径，推导 ../lib/libmemorytracetool.so */
+    char self_exe[512];
+    ssize_t n = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
+    if (n > 0) {
+        self_exe[n] = '\0';
+        char* slash = strrchr(self_exe, '/');
+        if (slash) {
+            *slash = '\0';                              /* self_exe 现在是 build/ 目录 */
+            char rel[640];
+            snprintf(rel, sizeof(rel), "%s/../lib/libmemorytracetool.so", self_exe);
+            if (realpath(rel, out)) return 0;
+        }
+    }
+
+    /* 兜底：绝对路径安装 */
     for (int i = 0; default_lib_paths[i]; i++) {
         if (realpath(default_lib_paths[i], out)) return 0;
     }
-    /* fallback: 假设在 build 目录下 ../lib/libmemorytracetool.so */
-    if (realpath("lib/libmemorytracetool.so", out)) return 0;
     return -1;
 }
 
@@ -1465,9 +1816,30 @@ static int resolve_lib_path(char* out, size_t out_sz)
  *
  * @param fd  HTTP 客户端 socket
  */
+/* 用于排序的临时进程信息 */
+typedef struct {
+    int pid;
+    char name[256];
+    char state;
+    int inj_status;
+    char inj_err[256];
+    unsigned long heap_kb;
+    char cmdline[256];       /* /proc/<pid>/cmdline，NULL字节替换为空格 */
+    unsigned long uptime_sec; /* 进程运行时长（秒） */
+} proc_info_t;
+
+static int proc_cmp_heapsz(const void* a, const void* b)
+{
+    const proc_info_t* pa = (const proc_info_t*)a;
+    const proc_info_t* pb = (const proc_info_t*)b;
+    if (pb->heap_kb > pa->heap_kb) return 1;
+    if (pb->heap_kb < pa->heap_kb) return -1;
+    return 0;
+}
+
 static void send_api_processes(int fd)
 {
-    char buf[65536];
+    char buf[131072];
     int pos = 0;
     int size = (int)sizeof(buf);
 
@@ -1479,14 +1851,23 @@ static void send_api_processes(int fd)
     int hdr_len = (int)strlen(hdr);
     if (pos + hdr_len < size) { memcpy(buf + pos, hdr, hdr_len); pos += hdr_len; }
 
-    safe_append(buf, &pos, size, "{\"processes\":[");
-    int first = 1;
+    /* 第一步：收集所有进程信息 */
+    enum { MAX_COLLECT = 4096 };
+    proc_info_t* procs = malloc(MAX_COLLECT * sizeof(proc_info_t));
+    int n = 0;
+    if (!procs) { send_all(fd, buf, pos); return; }
+
+    /* 读取系统运行时长（秒），用于计算进程运行时长 */
+    double sys_uptime = 0.0;
+    {
+        FILE* fu = fopen("/proc/uptime", "r");
+        if (fu) { fscanf(fu, "%lf", &sys_uptime); fclose(fu); }
+    }
 
     DIR* dir = opendir("/proc");
     if (dir) {
         struct dirent* de;
-        while ((de = readdir(dir))) {
-            /* 只处理数字目录（PID） */
+        while ((de = readdir(dir)) && n < MAX_COLLECT) {
             if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
             int pid = atoi(de->d_name);
             if (pid <= 1) continue;
@@ -1497,50 +1878,113 @@ static void send_api_processes(int fd)
             if (!fc) continue;
             if (!fgets(comm, sizeof(comm), fc)) { fclose(fc); continue; }
             fclose(fc);
-            /* 去掉尾部换行 */
             size_t cl = strlen(comm);
             while (cl > 0 && (comm[cl-1] == '\n' || comm[cl-1] == '\r'))
                 comm[--cl] = '\0';
 
-            /* 跳过内核线程: /proc/<pid>/exe 不可读 */
             char exe_path[64];
             snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", pid);
             if (access(exe_path, F_OK) != 0) continue;
 
-            /* 检查进程状态（跳过僵尸） */
             char stat_path[64];
             snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
             FILE* fs = fopen(stat_path, "r");
             if (!fs) continue;
             char state = '?';
-            /* stat 格式: pid (comm) state ... */
-            fscanf(fs, "%*d %*s %c", &state);
+            unsigned long starttime = 0;
+            char sline[1024];
+            if (fgets(sline, sizeof(sline), fs)) {
+                char* rp = strrchr(sline, ')');       /* 跳过进程名 "(name)" */
+                if (rp) {
+                    /* 字段: state(0) ppid(1) ... starttime(19)，用 %*s 跳过避免类型溢出 */
+                    sscanf(rp + 1, " %c %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %lu",
+                           &state, &starttime);
+                }
+            }
             fclose(fs);
-            if (state == 'Z' || state == 'X' || state == 'T' || state == 'D') continue; /* 跳过僵尸/已死/停止/不可中断进程 */
+            if (state == 'Z' || state == 'X' || state == 'T' || state == 'D') continue;
 
-            /* 检查注入状态 */
-            int inj_status = 0;  /* 0=未注入，1=成功，2=失败 */
-            const char* inj_err = "";
+            /* 计算运行时长 = 当前时间 - 启动时间（单位:秒） */
+            long ticks_per_sec = sysconf(_SC_CLK_TCK);
+            if (ticks_per_sec <= 0) ticks_per_sec = 100;
+            unsigned long uptime_sec = (starttime > 0 && sys_uptime > 0)
+                ? (unsigned long)(sys_uptime - (double)starttime / (double)ticks_per_sec) : 0;
+
+            /* 读取 cmdline（NULL 字节替换为空格）*/
+            char cmdline[256] = "";
+            char cl_path[64];
+            snprintf(cl_path, sizeof(cl_path), "/proc/%d/cmdline", pid);
+            FILE* fcl = fopen(cl_path, "r");
+            if (fcl) {
+                size_t nrd = fread(cmdline, 1, sizeof(cmdline) - 1, fcl);
+                fclose(fcl);
+                for (size_t ci = 0; ci < nrd; ci++)
+                    if (cmdline[ci] == '\0') cmdline[ci] = ' ';
+                cmdline[nrd] = '\0';
+                /* trim trailing spaces */
+                size_t clen = strlen(cmdline);
+                while (clen > 0 && cmdline[clen - 1] == ' ') cmdline[--clen] = '\0';
+            }
+
+            /* 读取堆内存使用量 (VmData from /proc/<pid>/status) */
+            unsigned long heap_kb = 0;
+            char status_path[64];
+            snprintf(status_path, sizeof(status_path), "/proc/%d/status", pid);
+            FILE* fst = fopen(status_path, "r");
+            if (fst) {
+                char sline[256];
+                while (fgets(sline, sizeof(sline), fst)) {
+                    if (strncmp(sline, "VmData:", 7) == 0) {
+                        /* VmData: <N> kB */
+                        char* vp = sline + 7;
+                        while (*vp == ' ' || *vp == '\t') vp++;
+                        heap_kb = strtoul(vp, NULL, 10);
+                        break;
+                    }
+                }
+                fclose(fst);
+            }
+
+            proc_info_t* pi = &procs[n++];
+            memset(pi, 0, sizeof(*pi));
+            pi->pid = pid;
+            pi->state = state;
+            pi->heap_kb = heap_kb;
+            pi->uptime_sec = uptime_sec;
+            snprintf(pi->name, sizeof(pi->name), "%s", comm);
+            snprintf(pi->cmdline, sizeof(pi->cmdline), "%s", cmdline);
             for (int i = 0; i < g_ninjected; i++) {
                 if (g_injected[i].pid == pid) {
-                    inj_status = g_injected[i].inject_status;
-                    inj_err = g_injected[i].inject_err;
+                    pi->inj_status = g_injected[i].inject_status;
+                    snprintf(pi->inj_err, sizeof(pi->inj_err), "%s", g_injected[i].inject_err);
                     break;
                 }
             }
-
-            if (!first) safe_append(buf, &pos, size, ",");
-            first = 0;
-            safe_append(buf, &pos, size,
-                "{\"pid\":%d,\"name\":\"%s\",\"state\":\"%c\","
-                "\"injected\":%s,\"inj_status\":%d,\"inj_err\":\"%s\"}",
-                pid, comm, state,
-                inj_status == 1 ? "true" : "false",
-                inj_status, inj_err);
         }
         closedir(dir);
     }
+
+    /* 第二步：按堆内存降序排序 */
+    qsort(procs, (size_t)n, sizeof(proc_info_t), proc_cmp_heapsz);
+
+    /* 第三步：序列化为 JSON */
+    safe_append(buf, &pos, size, "{\"processes\":[");
+    for (int i = 0; i < n; i++) {
+        proc_info_t* pi = &procs[i];
+        if (i > 0) safe_append(buf, &pos, size, ",");
+        char esc_cmdline[640];
+        json_escape(esc_cmdline, pi->cmdline, sizeof(esc_cmdline));
+        safe_append(buf, &pos, size,
+            "{\"pid\":%d,\"name\":\"%s\",\"state\":\"%c\","
+            "\"injected\":%s,\"inj_status\":%d,\"inj_err\":\"%s\","
+            "\"heap_kb\":%lu,\"cmdline\":\"%s\",\"uptime_sec\":%lu}",
+            pi->pid, pi->name, pi->state,
+            pi->inj_status == 1 ? "true" : "false",
+            pi->inj_status, pi->inj_err,
+            pi->heap_kb, esc_cmdline, pi->uptime_sec);
+    }
     safe_append(buf, &pos, size, "]}");
+    free(procs);
 
     send_all(fd, buf, pos);
 }
@@ -1756,6 +2200,32 @@ static void send_api_injected(int fd)
 }
 
 /**
+ * GET /api/reset — 清除所有泄漏历史数据。
+ *
+ * 释放所有被监控进程的泄漏记录数组，归零计数器，
+ * 但保留 PID/进程名/活跃状态，已注入进程下次分配内存时会通过 HELLO 重新初始化。
+ */
+static void handle_api_reset(int fd)
+{
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_nprocs; i++) {
+        free(g_procs[i].leaks);
+        g_procs[i].leaks = NULL;
+        g_procs[i].leak_count = 0;
+        g_procs[i].leak_cap = 0;
+        g_procs[i].total_leaked = 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    const char* resp =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+        "{\"status\":\"ok\",\"message\":\"all leak data cleared\"}";
+    send_all(fd, resp, strlen(resp));
+}
+
+/**
  * 处理 HTTP 请求并路由。
  *
  * 缺陷修复 #8: 添加请求方法验证和基本请求大小限制。
@@ -1766,6 +2236,7 @@ static void send_api_injected(int fd)
  *   GET /api/processes  → 进程列表（send_api_processes）
  *   GET /api/inject     → 运行时注入（handle_api_inject）
  *   GET /api/injected   → 注入记录（send_api_injected）
+ *   GET /api/reset      → 清除泄漏历史（handle_api_reset）
  *   其他                → 看板 HTML 页面（g_dashboard_html）
  */
 static void handle_http(int fd)
@@ -1841,6 +2312,8 @@ static void handle_http(int fd)
         }
     } else if (strncmp(buf, "GET /api/injected", 17) == 0) {
         send_api_injected(fd);
+    } else if (strncmp(buf, "GET /api/reset", 14) == 0) {
+        handle_api_reset(fd);
     } else if (strncmp(buf, "GET /api/data", 13) == 0) {
         send_api_data(fd);
     } else {
@@ -1929,9 +2402,15 @@ int main(int argc, char** argv)
         memset(&client_ctxs[i], 0, sizeof(client_ctxs[i]));
     }
 
+    /* 加载持久化历史记录 */
+    pthread_mutex_lock(&g_lock);
+    load_persisted();
+    pthread_mutex_unlock(&g_lock);
+
     printf("[mttd] Ready.\n");
 
     /* ---- 事件循环 ---- */
+    unsigned loop_ticks = 0;
     while (g_running) {
         fd_set rfds;
         FD_ZERO(&rfds);
@@ -1953,6 +2432,13 @@ int main(int argc, char** argv)
         if (ready < 0) {
             if (errno == EINTR) continue; /* 被信号中断，检查 g_running */
             break;
+        }
+
+        /* 每 5 次循环（约 5 秒）检查进程存活状态 */
+        if (++loop_ticks % 5 == 0) {
+            pthread_mutex_lock(&g_lock);
+            check_liveness();
+            pthread_mutex_unlock(&g_lock);
         }
 
         /* 缺陷修复 #8: 超时处理 — 清理空闲超时的客户端连接 */
