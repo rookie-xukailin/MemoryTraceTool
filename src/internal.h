@@ -74,7 +74,7 @@ typedef struct {
     _Atomic unsigned long sample_counter; /* 原子计数器，用于采样决策 */
     _Atomic unsigned sample_period;       /* >0 时每 N 次分配记录 1 次，0=全量 */
     _Atomic unsigned long entry_count;    /* 当前哈希表中条目数（原子操作） */
-    unsigned         max_entries;         /* 哈希表容量上限 */
+    _Atomic unsigned max_entries;         /* 哈希表容量上限 */
 
     /* 统计 */
     _Atomic size_t   skipped_sampled;     /* 因采样跳过的分配次数 */

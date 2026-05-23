@@ -178,6 +178,7 @@ static mttd_proc_t* find_or_create_proc(int pid, const char* name)
 }
 
 static void persist_proc(mttd_proc_t* p);
+static void json_escape(char* dst, const char* src, size_t n);
 
 /**
  * 向进程记录添加一条泄漏信息。
@@ -212,7 +213,8 @@ static int add_leak(mttd_proc_t* p, mttd_leak_t* leak)
     p->leaks[p->leak_count++] = *leak;
     p->total_leaked += leak->size;
     atomic_fetch_add(&g_total_leaks_global, 1);
-    persist_proc(p);
+    /* 标记需持久化，由调用者释放锁后写入磁盘，避免持锁 I/O */
+    p->dirty = 1;
     return 0;
 }
 
@@ -261,14 +263,17 @@ static void persist_proc(mttd_proc_t* p)
     FILE* f = fopen(path, "w");
     if (!f) return;
 
+    char escaped[512];
+    json_escape(escaped, p->name, sizeof(escaped));
     fprintf(f, "{\"pid\":%d,\"name\":\"%s\",\"active\":%d,\"total_leaked\":%zu,"
             "\"last_seen\":%ld,\"leaks\":[",
-            p->pid, p->name, p->active, p->total_leaked, (long)p->last_seen);
+            p->pid, escaped, p->active, p->total_leaked, (long)p->last_seen);
 
     for (int i = 0; i < p->leak_count; i++) {
         mttd_leak_t* l = &p->leaks[i];
+        json_escape(escaped, l->file, sizeof(escaped));
         fprintf(f, "%s{\"size\":%zu,\"file\":\"%s\",\"line\":%d,\"nframes\":%d,\"frames\":[",
-                i > 0 ? "," : "", l->size, l->file, l->line, l->nframes);
+                i > 0 ? "," : "", l->size, escaped, l->line, l->nframes);
         for (int j = 0; j < l->nframes; j++) {
             fprintf(f, "%s\"", j > 0 ? "," : "");
             /* 转义 JSON 特殊字符 */
@@ -435,7 +440,9 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
                 if (leak.nframes < 0) leak.nframes = 0;
                 pthread_mutex_lock(&ctx->proc->lock);
                 add_leak(ctx->proc, &leak);
+                int should_persist = (ctx->proc->leak_count % 5 == 0);
                 pthread_mutex_unlock(&ctx->proc->lock);
+                if (should_persist) persist_proc(ctx->proc);
             }
         }
         else if (strncmp(line, "FRAME ", 6) == 0 && ctx->proc) {
@@ -455,6 +462,7 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
                 pthread_mutex_lock(&ctx->proc->lock);
                 ctx->proc->active = 0; /* 标记进程已退出 */
                 pthread_mutex_unlock(&ctx->proc->lock);
+                persist_proc(ctx->proc); /* 退出时确保持久化 */
             }
             *out_proc = ctx->proc;
             shutdown(fd, SHUT_RDWR);
@@ -843,6 +851,7 @@ static const char* g_dashboard_html =
 "/* ===== RESPONSIVE ===== */\n"
 "\n"
 ".hamburger{display:none;position:fixed;top:10px;left:10px;z-index:150;background:var(--surface);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:var(--radius);cursor:pointer;font-size:18px}\n"
+"@media(max-width:1024px){.kpi-row{grid-template-columns:1fr 1fr}.detail{width:80vw}}\n"
 "@media(max-width:700px){.sidebar{display:none;position:fixed;z-index:200;top:0;left:0;height:100vh}.sidebar.open{display:flex}.hamburger{display:flex}.kpi-row{grid-template-columns:1fr}.detail{width:100vw}.panel{overflow-x:auto}}\n"
 "</style>\n"
 "</head>\n"
@@ -907,7 +916,7 @@ static const char* g_dashboard_html =
 "  <!-- INJECTABLE -->\n"
 "  <div>\n"
 "    <div class=\"sec-head\"><h2>可注入进程</h2><span class=\"cnt\" id=\"ic-cnt\"></span></div>\n"
-"    <div class=\"ctrls\"><input type=\"text\" id=\"proc-filter\" placeholder=\"搜索...\" oninput=\"loadProcs()\"></div>\n"
+"    <div class=\"ctrls\"><input type=\"text\" id=\"proc-filter\" placeholder=\"搜索...\" oninput=\"debounceLoadProcs()\"></div>\n"
 "    <div class=\"panel\">\n"
 "      <table class=\"inj-table\">\n"
 "        <thead><tr><th style=\"width:48px\">PID</th><th style=\"width:90px\">进程</th><th style=\"width:150px\">命令行</th><th style=\"width:62px\">堆</th><th style=\"width:60px\">运行</th><th style=\"width:56px\">注入</th><th style=\"width:50px\">操作</th></tr></thead>\n"
@@ -923,7 +932,7 @@ static const char* g_dashboard_html =
 "<div>\n"
 "  <div class=\"sec-head\"><h2>泄漏排行榜</h2><span class=\"cnt\" id=\"lk-cnt\"></span></div>\n"
 "  <div class=\"ctrls\">\n"
-"    <input type=\"text\" id=\"leak-filter\" placeholder=\"搜索泄漏...\" oninput=\"renderLeaks()\">\n"
+"    <input type=\"text\" id=\"leak-filter\" placeholder=\"搜索泄漏...\" oninput=\"debounceRenderLeaks()\">\n"
 "    <span style=\"font-size:11px;color:var(--text3)\">排序:</span>\n"
 "    <button class=\"btn sort on\" id=\"sort-bytes\" onclick=\"setSort('bytes')\">字节</button>\n"
 "    <button class=\"btn sort\" id=\"sort-rate\" onclick=\"setSort('rate')\">速率</button>\n"
@@ -961,7 +970,9 @@ static const char* g_dashboard_html =
 "var gPrevLeakMap={},gPrevLeakTime=0; /* 泄漏站点速率快照 */\n"
 "var gHistory={};    /* pid -> [{t,bytes},...] */\n"
 "var gDetailPid=0,gCachedProcs=null,gLastDetailSig='';\n"
-"var gLoadSeq=0,toastTimer=0;\n"
+"var gLoadSeq=0,toastTimer=0,gDebounceProc=0,gDebounceLeak=0,toastQueue=[],toastBusy=0;\n"
+"function debounceLoadProcs(){clearTimeout(gDebounceProc);gDebounceProc=setTimeout(loadProcs,280)}\n"
+"function debounceRenderLeaks(){clearTimeout(gDebounceLeak);gDebounceLeak=setTimeout(renderLeaks,280)}\n"
 "\n"
 "/* ===== SIDEBAR ===== */\n"
 "function toggleSidebar(){var sb=document.getElementById('sidebar'),tog=sb.querySelector('.sb-toggle');sb.classList.toggle('folded');tog.innerHTML=sb.classList.contains('folded')?'&raquo;':'&laquo;'}\n"
@@ -1170,8 +1181,9 @@ static const char* g_dashboard_html =
 "function toggleLeakCard(key){\n"
 "  if(gExpandedLeaks[key]){delete gExpandedLeaks[key]}\n"
 "  else{gExpandedLeaks[key]=true}\n"
+"  var expanded=!!gExpandedLeaks[key];\n"
 "  var card=document.querySelector('.leak-card[data-key=\"'+CSS.escape(key)+'\"]');\n"
-"  if(card)card.classList.toggle('expanded',!!gExpandedLeaks[key]);\n"
+"  if(card){card.classList.toggle('expanded',expanded);var hdr=card.querySelector('.leak-hdr');if(hdr)hdr.setAttribute('aria-expanded',expanded?'true':'false')}\n"
 "}\n"
 "function resolveAndPersist(el,bin,off){\n"
 "  var key=bin+':'+off;\n"
@@ -1211,7 +1223,7 @@ static const char* g_dashboard_html =
 "    if(l.nframes>0){for(var j=0;j<l.nframes;j++){var pf=parseFrame(l.frames[j]||'?');var isInt=(pf.bin&&pf.bin.indexOf('libmemorytracetool')>=0)||(pf.fn&&(pf.fn.indexOf('mtt_')===0||pf.fn==='capture_stack'||pf.fn==='backtrace'));if(!isInt){leakIdx=j;break}}}\n"
 "    var maxF=Math.min(l.nframes,10);\n"
 "    html+='<div class=\"leak-card'+(expanded?' expanded':'')+'\" data-key=\"'+escAttr(cardKey)+'\">';\n"
-"    html+='<div class=\"leak-hdr\" onclick=\"toggleLeakCard(\\''+escAttr(cardKey)+'\\')\"><span class=\"sz\">'+fmtBytes(l.total)+'</span><span class=\"loc\">'+(l.file==='?'&&l.line===0?'?:0 <span class=\"tag\" style=\"background:rgba(255,184,0,.1);color:var(--orange)\" title=\"LD_PRELOAD 模式无法获取源文件位置\">Preload</span>':esc(l.file)+':'+l.line)+'</span><span class=\"n\">x'+l.count+'</span><span class=\"info\">PID '+l.pid+' · '+esc(l.name)+'</span></div>';\n"
+"    html+='<div class=\"leak-hdr\" tabindex=\"0\" role=\"button\" aria-expanded=\"'+(expanded?'true':'false')+'\" onclick=\"toggleLeakCard(\\''+escAttr(cardKey)+'\\')\" onkeydown=\"if(event.key===\\'Enter\\'||event.key===\\' \\'){event.preventDefault();toggleLeakCard(\\''+escAttr(cardKey)+'\\')}\"><span class=\"sz\">'+fmtBytes(l.total)+'</span><span class=\"loc\">'+(l.file==='?'&&l.line===0?'?:0 <span class=\"tag\" style=\"background:rgba(255,184,0,.1);color:var(--orange)\" title=\"LD_PRELOAD 模式无法获取源文件位置\">Preload</span>':esc(l.file)+':'+l.line)+'</span><span class=\"n\">x'+l.count+'</span><span class=\"info\">PID '+l.pid+' · '+esc(l.name)+'</span></div>';\n"
 "    html+='<div class=\"call-tree\">';\n"
 "    if(l.nframes>0){\n"
 "      for(var j=maxF-1;j>=0;j--){\n"
@@ -1352,7 +1364,7 @@ static const char* g_dashboard_html =
 "      if(l.nframes>0){for(var k=0;k<l.nframes;k++){var pf=parseFrame(l.frames[k]||'?');if(!pf.bin||pf.bin.indexOf('libmemorytracetool')<0){if(!pf.fn||(pf.fn.indexOf('mtt_')!==0&&pf.fn!=='capture_stack'&&pf.fn!=='backtrace')){lkIdx=k;break}}}}\n"
 "      var mf=Math.min(l.nframes,10);\n"
 "      body+='<div class=\"leak-card'+(expanded?' expanded':'')+'\" data-key=\"'+escAttr(cardKey)+'\" style=\"margin-top:4px\">';\n"
-"      body+='<div class=\"leak-hdr\" onclick=\"toggleLeakCard(\\''+escAttr(cardKey)+'\\')\"><span class=\"sz\">'+fmtBytes(l.total)+'</span><span class=\"loc\">'+(l.file==='?'&&l.line===0?'?:0 <span class=\"tag\" style=\"background:rgba(255,184,0,.1);color:var(--orange)\" title=\"LD_PRELOAD 模式无法获取源文件位置\">Preload</span>':esc(l.file)+':'+l.line)+'</span><span class=\"n\">x'+l.count+'</span></div>';\n"
+"      body+='<div class=\"leak-hdr\" tabindex=\"0\" role=\"button\" aria-expanded=\"'+(expanded?'true':'false')+'\" onclick=\"toggleLeakCard(\\''+escAttr(cardKey)+'\\')\" onkeydown=\"if(event.key===\\'Enter\\'||event.key===\\' \\'){event.preventDefault();toggleLeakCard(\\''+escAttr(cardKey)+'\\')}\"><span class=\"sz\">'+fmtBytes(l.total)+'</span><span class=\"loc\">'+(l.file==='?'&&l.line===0?'?:0 <span class=\"tag\" style=\"background:rgba(255,184,0,.1);color:var(--orange)\" title=\"LD_PRELOAD 模式无法获取源文件位置\">Preload</span>':esc(l.file)+':'+l.line)+'</span><span class=\"n\">x'+l.count+'</span></div>';\n"
 "      body+='<div class=\"call-tree\">';\n"
 "      if(l.nframes>0){\n"
 "        for(var k=mf-1;k>=0;k--){\n"
@@ -1549,6 +1561,14 @@ static const char* g_dashboard_html =
 "  });\n"
 "})();\n"
 "\n"
+"/* canvas resize observer - redraw chart when container size changes */\n"
+"if(window.ResizeObserver){\n"
+"  new ResizeObserver(function(){\n"
+"    var c=document.getElementById('chart');\n"
+"    if(c&&c._data&&c.closest('.detail.show'))drawChart(c._data);\n"
+"  }).observe(document.querySelector('.chart-wrap')||document.body);\n"
+"}\n"
+"\n"
 "/* ===== HELPERS ===== */\n"
 "/* 为 LD_PRELOAD 模式 (?:0) 提取首个用户帧函数名作为去重键 */\n"
 "function getTopUserFn(l){\n"
@@ -1614,9 +1634,17 @@ static const char* g_dashboard_html =
 "function escAttr(s){if(!s)return'';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;')}\n"
 "\n"
 "function toast(msg){\n"
+"  toastQueue.push(msg);\n"
+"  if(toastBusy)return;\n"
+"  flushToast();\n"
+"}\n"
+"function flushToast(){\n"
+"  if(toastQueue.length===0){toastBusy=0;return}\n"
+"  toastBusy=1;\n"
+"  var msg=toastQueue.shift();\n"
 "  var t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');\n"
 "  clearTimeout(toastTimer);\n"
-"  toastTimer=setTimeout(function(){t.classList.remove('show')},2000);\n"
+"  toastTimer=setTimeout(function(){t.classList.remove('show');setTimeout(flushToast,150)},2000);\n"
 "}\n"
 "</script>\n"
 "\n"
@@ -2173,7 +2201,7 @@ static void handle_api_inject(int fd, int pid)
             "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
             "{\"pid\":%d,\"status\":\"fail\",\"error\":\"%s\"}", pid, err_msg);
-        send_all(fd, resp, n);
+        if (n > 0 && n < (int)sizeof(resp)) send_all(fd, resp, (size_t)n);
         return;
     }
     if (!valid) {
@@ -2184,8 +2212,8 @@ static void handle_api_inject(int fd, int pid)
             "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
             "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
             "Connection: close\r\n\r\n", n);
-        send_all(fd, hdr, hdrlen);
-        send_all(fd, resp, n);
+        if (hdrlen > 0 && hdrlen < (int)sizeof(hdr)) send_all(fd, hdr, (size_t)hdrlen);
+        if (n > 0) send_all(fd, resp, (size_t)n);
         return;
     }
 
@@ -2197,7 +2225,7 @@ static void handle_api_inject(int fd, int pid)
             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
             "{\"pid\":%d,\"status\":\"fail\",\"error\":\"Cannot find libmemorytracetool.so\"}",
             pid);
-        send_all(fd, resp, n);
+        if (n > 0 && n < (int)sizeof(resp)) send_all(fd, resp, (size_t)n);
         return;
     }
 
@@ -2208,7 +2236,7 @@ static void handle_api_inject(int fd, int pid)
             "HTTP/1.1 500 Internal Error\r\nContent-Type: application/json\r\n"
             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
             "{\"pid\":%d,\"status\":\"fail\",\"error\":\"pipe() failed\"}", pid);
-        send_all(fd, resp, n);
+        if (n > 0 && n < (int)sizeof(resp)) send_all(fd, resp, (size_t)n);
         return;
     }
 
@@ -2219,7 +2247,7 @@ static void handle_api_inject(int fd, int pid)
             "HTTP/1.1 500 Internal Error\r\nContent-Type: application/json\r\n"
             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
             "{\"pid\":%d,\"status\":\"fail\",\"error\":\"fork() failed\"}", pid);
-        send_all(fd, resp, n);
+        if (n > 0 && n < (int)sizeof(resp)) send_all(fd, resp, (size_t)n);
         return;
     }
 
@@ -2265,7 +2293,7 @@ static void handle_api_inject(int fd, int pid)
             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
             "{\"pid\":%d,\"status\":\"fail\",\"error\":\"Injector child failed\"}",
             pid);
-        send_all(fd, resp, n);
+        if (n > 0 && n < (int)sizeof(resp)) send_all(fd, resp, (size_t)n);
         return;
     }
 

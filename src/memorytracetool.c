@@ -156,7 +156,7 @@ static int should_track(mtt_state_t* s)
 static int is_over_capacity(mtt_state_t* s)
 {
     unsigned long n = atomic_load(&s->entry_count);
-    if (n >= s->max_entries) {
+    if (n >= atomic_load(&s->max_entries)) {
         atomic_fetch_add(&s->skipped_overcap, 1);
         return 1;
     }
@@ -481,7 +481,7 @@ void mtt_set_max_entries(unsigned limit)
 {
     mtt_ensure_init();
     if (limit >= 256)
-        g_state.max_entries = limit;
+        atomic_store(&g_state.max_entries, limit);
 }
 
 /** 获取跳过的采样统计 */
@@ -546,7 +546,12 @@ void mtt_install_signal_handler(void)
 
     g_signal_thread_stop = 0;
     pthread_t tid;
-    pthread_create(&tid, NULL, signal_thread_fn, NULL);
+    int rc = pthread_create(&tid, NULL, signal_thread_fn, NULL);
+    if (rc != 0) {
+        fprintf(stderr, "[MemoryTraceTool] WARN: pthread_create signal thread failed: %s\n", strerror(rc));
+        g_signal_installed = 0;
+        return;
+    }
     pthread_detach(tid);
 }
 
