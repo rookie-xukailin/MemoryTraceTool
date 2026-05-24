@@ -17,7 +17,7 @@
 #define MTT_MAX_PROCS        128               /* 守护进程最大监控进程数（高负载场景上调） */
 #define MTT_MAX_LEAKS        256               /* 每个进程最大泄漏记录数 */
 #define MTT_SYMBOL_MAX       256               /* 单帧符号字符串最大长度 */
-#define MTT_MAX_STACK        8                 /* 每个泄漏记录保留的栈帧数 */
+#define MTT_MAX_STACK        16                /* 每个泄漏记录保留的栈帧数 */
 
 /* 连接管理常量 */
 #define MTT_CLIENT_TIMEOUT_S 30                /* 客户端空闲超时（秒） */
