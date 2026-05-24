@@ -366,7 +366,7 @@ static void load_persisted(void)
             p->leak_count = leak_count;     /* 恢复历史泄漏记录条数 */
             p->last_seen = time(NULL);
             p->leak_cap = leak_count > 32 ? leak_count : 32;
-            p->leaks = malloc((size_t)p->leak_cap * sizeof(mttd_leak_t));
+            p->leaks = calloc((size_t)p->leak_cap, sizeof(mttd_leak_t));
             pthread_mutex_init(&p->lock, NULL);
             printf("[mttd] 已加载历史记录: PID %d (%s), 总计=%zu, 泄漏=%d 条\n",
                    pid, name, total_leaked, leak_count);
@@ -2715,7 +2715,9 @@ int main(int argc, char** argv)
             int cfd = accept(http_fd, NULL, NULL);
             if (cfd >= 0) {
                 /* 设置发送超时（5 秒），防止慢客户端阻塞事件循环 */
-                struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+                struct timeval tv;
+                tv.tv_sec = 5;
+                tv.tv_usec = 0;
                 setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
                 handle_http(cfd);
             }
