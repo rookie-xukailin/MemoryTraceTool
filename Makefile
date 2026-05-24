@@ -15,7 +15,7 @@ LIB_OBJS = $(BUILD_DIR)/memorytracetool.o $(BUILD_DIR)/hooks.o $(BUILD_DIR)/clie
 SHARED_LIB = $(LIB_DIR)/libmemorytracetool.so
 STATIC_LIB = $(LIB_DIR)/libmemorytracetool.a
 
-.PHONY: all clean daemon demo demo_preload test run_daemon_demo run_demo_long_running stop_daemon injector demo_stealth_leak run_demo_stealth_leak
+.PHONY: all clean daemon demo demo_preload test test_daemon run_daemon_demo run_demo_long_running stop_daemon injector demo_stealth_leak run_demo_stealth_leak
 
 all: $(SHARED_LIB) $(STATIC_LIB) daemon
 
@@ -141,10 +141,17 @@ run_demo_long_running: daemon demo_long_running
 stop_daemon:
 	@killall mttd 2>/dev/null && echo "Daemon stopped." || echo "No daemon running."
 
-# Build and run test
-test: $(STATIC_LIB) tests/test_basic.c
+# 核心追踪逻辑单元测试
+test_unit: $(STATIC_LIB) tests/test_basic.c
 	$(CC) $(CFLAGS) $(INC) -o $(BUILD_DIR)/test_basic tests/test_basic.c $(LIB_DIR)/libmemorytracetool.a $(LDFLAGS)
 	$(BUILD_DIR)/test_basic
+
+# 守护进程 / Web 看板 API 测试
+test_daemon: daemon
+	@bash tests/test_daemon.sh
+
+# 全部测试：追踪逻辑 + 面板API
+test: test_unit test_daemon
 
 clean:
 	rm -rf $(BUILD_DIR) $(LIB_DIR)
