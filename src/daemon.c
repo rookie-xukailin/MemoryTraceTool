@@ -509,7 +509,7 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
  * meta refresh 实现 3 秒自动刷新。
  * JS 通过 fetch /api/data 获取 JSON 数据并动态渲染 DOM。 */
 static const char* g_dashboard_html =
-"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n"
+"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store, max-age=0\r\nConnection: close\r\n\r\n"
 "<!DOCTYPE html>\n"
 "<html lang=\"zh-CN\">\n"
 "<head>\n"
