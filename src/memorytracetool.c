@@ -894,7 +894,9 @@ void mtt_report_to_fd(int fd)
                             free(syms);
                         }
                         if (!func_name[0]) {
-                            snprintf(func_name, sizeof(func_name), "??");
+                            size_t llen = strlen(lib_name);
+                            if (llen >= sizeof(func_name)) llen = sizeof(func_name) - 1;
+                            memcpy(func_name, lib_name, llen);
                         }
                         func_off = file_off;
                     }

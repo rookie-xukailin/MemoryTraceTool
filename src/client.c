@@ -107,9 +107,12 @@ static void resolve_frame_symbol(void* addr, char* out, size_t out_size)
                 }
                 free(syms);
             }
-            /* 仍无符号名则标记为 ?? ，避免库名重复显示 */
+            /* 仍无符号名则用库名作为函数名 */
             if (!func_name[0]) {
-                snprintf(func_name, sizeof(func_name), "??");
+                size_t llen = strlen(lib_name);
+                if (llen >= sizeof(func_name)) llen = sizeof(func_name) - 1;
+                memcpy(func_name, lib_name, llen);
+                func_name[llen] = '\0';
             }
             /* 无 dli_saddr 则用文件偏移近似函数偏移 */
             func_off = file_off;
