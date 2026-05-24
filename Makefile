@@ -1,6 +1,6 @@
 CC       = gcc
-CFLAGS   = -Wall -Wextra -g -fPIC
-CFLAGS_NOPIC = -Wall -Wextra -g
+CFLAGS   = -Wall -Wextra -g -O1 -fPIC
+CFLAGS_NOPIC = -Wall -Wextra -g -O1
 LDFLAGS  = -lpthread -ldl
 
 INC      = -Iinclude -Isrc
