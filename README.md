@@ -4,21 +4,24 @@
 
 ## 30 秒上手
 
+> 以下所有命令都在项目根目录 `MemoryTraceTool/` 下执行。
+
 ```bash
-# 1. 编译
+# 1. 编译（在 MemoryTraceTool/ 目录下）
 make
 
 # 2. 启动 Web 看板（守护进程）
 ./build/mttd 8080 &
 
-# 3. 浏览器打开 http://localhost:8080
+# 3. 浏览器打开
+# http://localhost:8080
 ```
 
 复制上面三行命令到终端，浏览器打开看板页面，完成。
 
 ## 监控你的程序
 
-用 `LD_PRELOAD` 启动你的程序（**不需要改一行代码**）：
+还是在 `MemoryTraceTool/` 目录下，用 `LD_PRELOAD` 启动你的程序（**不需要改一行代码**）：
 
 ```bash
 LD_PRELOAD=./lib/libmemorytracetool.so ./your_app
@@ -30,7 +33,7 @@ LD_PRELOAD=./lib/libmemorytracetool.so ./your_app
 - 调用树视图（带方向箭头，直观展示调用关系）
 - 泄漏趋势曲线图
 
-如果你的程序是常驻服务不会退出，发送信号触发报告：
+如果是常驻服务不会退出，发送信号触发报告：
 
 ```bash
 kill -USR1 <pid>
@@ -46,6 +49,7 @@ kill -USR1 <pid>
 ### LD_PRELOAD 模式（推荐，零侵入）
 
 ```bash
+# 在 MemoryTraceTool/ 目录下执行
 LD_PRELOAD=./lib/libmemorytracetool.so ./your_app
 ```
 
@@ -62,6 +66,7 @@ LD_PRELOAD=./lib/libmemorytracetool.so ./your_app
 ```
 
 ```bash
+# 在 MemoryTraceTool/ 目录下执行
 gcc -Iinclude -o myapp myapp.c lib/libmemorytracetool.a -lpthread -ldl
 ```
 
@@ -70,7 +75,7 @@ gcc -Iinclude -o myapp myapp.c lib/libmemorytracetool.a -lpthread -ldl
 对于已经在跑的进程，无需重启，直接注入动态库：
 
 ```bash
-# 给 mttd 授权 ptrace
+# 在 MemoryTraceTool/ 目录下执行
 sudo setcap cap_sys_ptrace+ep ./build/mttd
 
 # 在 Web 看板页面输入 PID，点击 Inject 即可
@@ -90,12 +95,14 @@ sudo setcap cap_sys_ptrace+ep ./build/mttd
 ## 测试
 
 ```bash
-make test          # 7 个单元测试
+# 在 MemoryTraceTool/ 目录下执行
+make test
 ```
 
 ## 清理
 
 ```bash
+# 在 MemoryTraceTool/ 目录下执行
 make clean         # 清理构建产物
 make stop_daemon   # 停止守护进程
 ```
