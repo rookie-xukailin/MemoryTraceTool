@@ -2423,7 +2423,11 @@ static void send_api_injected(int fd)
  */
 static void handle_api_reset(int fd)
 {
+    int removed = 0;
+
     pthread_mutex_lock(&g_lock);
+
+    /* 释放所有泄漏数据 */
     for (int i = 0; i < g_nprocs; i++) {
         free(g_procs[i].leaks);
         g_procs[i].leaks = NULL;
@@ -2431,15 +2435,47 @@ static void handle_api_reset(int fd)
         g_procs[i].leak_cap = 0;
         g_procs[i].total_leaked = 0;
     }
+
+    /* 移除已退出进程（active==0），仅保留仍在运行的 */
+    int kept = 0;
+    for (int i = 0; i < g_nprocs; i++) {
+        if (g_procs[i].active) {
+            if (kept != i) g_procs[kept] = g_procs[i];
+            kept++;
+        } else {
+            /* 销毁已退出进程的互斥锁 */
+            pthread_mutex_destroy(&g_procs[i].lock);
+            removed++;
+        }
+    }
+    g_nprocs = kept;
+
     atomic_store(&g_total_leaks_global, 0);
     pthread_mutex_unlock(&g_lock);
 
-    const char* resp =
+    /* 删除磁盘上所有持久化 JSON 文件 */
+    const char* logdir = get_log_dir();
+    DIR* d = opendir(logdir);
+    if (d) {
+        struct dirent* de;
+        while ((de = readdir(d))) {
+            if (de->d_name[0] == '.') continue;
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s", logdir, de->d_name);
+            unlink(path);
+        }
+        closedir(d);
+    }
+
+    char resp[256];
+    int n = snprintf(resp, sizeof(resp),
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: application/json; charset=utf-8\r\n"
         "Connection: close\r\n\r\n"
-        "{\"status\":\"ok\",\"message\":\"all leak data cleared\"}";
-    send_all(fd, resp, strlen(resp));
+        "{\"status\":\"ok\",\"message\":\"cleared, removed %d dead processes\"}",
+        removed);
+    if (n > 0 && n < (int)sizeof(resp))
+        send_all(fd, resp, (size_t)n);
 }
 
 /**
