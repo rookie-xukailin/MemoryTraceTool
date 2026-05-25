@@ -204,11 +204,55 @@ mtt_state_t* mtt_state_get(void) { return &g_state; }
 static __thread int g_in_capture = 0;
 
 /**
+ * ARM32 手动栈回溯：遍历帧指针链获取返回地址。
+ *
+ * AAPCS 约定下，fp 指向 {prev_fp, lr} 结构：
+ *   fp[0] = 上一帧的 fp（链表指针）
+ *   fp[1] = 当前函数的返回地址（保存的 lr）
+ *
+ * 相比 glibc backtrace() 在嵌入式 ARM 上更可靠，
+ * 不依赖 _Unwind_Backtrace 和 unwind table。
+ *
+ * @param buffer  输出缓冲区，存放返回地址
+ * @param max     缓冲区容量
+ * @return        实际捕获的帧数
+ */
+#if defined(__arm__)
+static int arm_frame_walk(void** buffer, int max)
+{
+    void** fp;
+    __asm__ volatile("mov %0, fp" : "=r"(fp));
+    if (!fp) return 0;
+
+    int count = 0;
+    /* 从 capture_stack 的调用者（mtt_entry_new）开始收集 */
+    while (fp && count < max) {
+        void* prev_fp = fp[0];
+        void* lr      = fp[1];
+
+        /* 安全检查：返回地址不能为空或内核空间 */
+        if (!lr || (unsigned long)lr < 0x1000UL) break;
+        /* 栈向下增长，上层帧地址必须大于当前帧 */
+        if (prev_fp && (unsigned long)prev_fp <= (unsigned long)fp) break;
+
+        /* 清除 Thumb 模式标志位（LSB），方便后续符号解析 */
+        buffer[count++] = (void*)((unsigned long)lr & ~1UL);
+
+        if (!prev_fp) break;
+        fp = (void**)prev_fp;
+    }
+    return count;
+}
+#endif
+
+/**
  * 捕获当前调用栈并存入 entry->stack。
  *
- * 使用 backtrace() 获取调用栈帧地址，通过 g_in_capture
- * (thread-local 变量) 防止 backtrace 内部再次触发 malloc
- * 导致无限递归。
+ * ARM32: 使用手动帧指针链遍历（arm_frame_walk），
+ *        不依赖 glibc backtrace() 和 unwind table。
+ * x86_64 / AArch64: 使用标准 backtrace()。
+ *
+ * 通过 g_in_capture (thread-local) 防止递归重入。
  */
 static void capture_stack(mtt_entry_t* entry)
 {
@@ -218,7 +262,11 @@ static void capture_stack(mtt_entry_t* entry)
     }
     int saved = g_in_capture;
     g_in_capture = 1;
+#if defined(__arm__)
+    entry->stack_frames = arm_frame_walk(entry->stack, MTT_STACK_DEPTH);
+#else
     entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
+#endif
     g_in_capture = saved; /* restore, not hard-reset to 0: 可能嵌套 */
 }
 
