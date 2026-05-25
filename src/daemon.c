@@ -454,6 +454,7 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
             char name[256] = {0};
             /* 缺陷修复 #2: 检查 sscanf 返回值 */
             if (sscanf(line, "HELLO %d %255[^\n]", &pid, name) >= 1) {
+                fprintf(stderr, "[mttd] HELLO pid=%d name=%s\n", pid, name);
                 pthread_mutex_lock(&g_lock);
                 ctx->proc = find_or_create_proc(pid, name);
                 if (ctx->proc) ctx->proc->active = 1;
