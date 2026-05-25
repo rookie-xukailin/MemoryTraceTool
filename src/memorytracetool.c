@@ -356,19 +356,20 @@ mtt_entry_t* mtt_entry_new(void* ptr, size_t size,
 
 /* 守护进程模式标记：是否在 mtt_report_to_daemon() 中被主动设置 */
 static int g_daemon_mode = 0;
-/* 守护进程可达性缓存：避免每次报告都尝试连接 */
-static int g_daemon_checked = 0;
+/* 守护进程可达性缓存：仅缓存成功，失败时允许重试（允许 daemon 后启动） */
 static int g_daemon_available = 0;
 
 /**
  * 检测守护进程是否可达（通过尝试连接到 Unix Socket）。
  *
- * 结果会被缓存到 g_daemon_available 中（一次性检测）。
+ * 成功结果会被缓存。失败不缓存，允许后续调用重试——daemon
+ * 可能在监控进程之后启动。
  */
 static int check_daemon(void)
 {
-    if (g_daemon_checked) return g_daemon_available;
-    g_daemon_checked = 1;
+    /* 仅缓存成功：一旦确认 daemon 可达就记住 */
+    if (g_daemon_available) return 1;
+
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return 0;
     struct sockaddr_un addr = {0};
