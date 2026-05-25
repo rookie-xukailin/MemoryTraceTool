@@ -83,6 +83,33 @@ sudo setcap cap_sys_ptrace+ep ./build/mttd
 
 > 注意：需要 `ptrace_scope=0` 或 root 权限。
 
+## 交叉编译
+
+支持交叉编译到 ARM 32/64 位等目标平台。设置 `CROSS_COMPILE` 环境变量后直接 `make`：
+
+```bash
+# ARM 32-bit（Cortex-A 系列）
+export CROSS_COMPILE=arm-linux-gnueabihf-
+make
+
+# ARM 64-bit（Cortex-A53/A72）
+export CROSS_COMPILE=aarch64-linux-gnu-
+make
+
+# 或直接在命令行指定
+make CROSS_COMPILE=arm-linux-gnueabihf-
+```
+
+设置 `CROSS_COMPILE` 后自动使用对应的交叉编译器，并跳过 ptrace 注入器（仅 x86_64 支持）。产物 `libmemorytracetool.so` 和 `mttd` 为对应架构的二进制。
+
+如需自定义编译选项（如 sysroot）：
+
+```bash
+make CROSS_COMPILE=arm-linux-gnueabihf- \
+     CFLAGS="-Wall -Wextra -g -O1 -fPIC --sysroot=/opt/sdk/sysroot" \
+     LDFLAGS="-lpthread -ldl --sysroot=/opt/sdk/sysroot"
+```
+
 ## API
 
 | 端点 | 说明 |

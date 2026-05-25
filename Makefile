@@ -1,5 +1,6 @@
-CC       ?= gcc
-WITHOUT_INJECTOR ?= 0
+CROSS_COMPILE ?=
+CC       ?= $(CROSS_COMPILE)gcc
+WITHOUT_INJECTOR ?= $(if $(CROSS_COMPILE),1,0)
 CFLAGS   = -Wall -Wextra -g -O1 -fPIC
 CFLAGS_NOPIC = -Wall -Wextra -g -O1
 LDFLAGS  = -lpthread -ldl
