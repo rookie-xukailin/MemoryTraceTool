@@ -39,7 +39,9 @@
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#ifndef WITHOUT_INJECTOR
 #include "injector.h"
+#endif
 #include "internal.h"
 
 /* ---- 全局状态 ---- */
@@ -50,8 +52,10 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER; /* 保护 g_procs / g
 static volatile sig_atomic_t g_running = 1;        /* 信号控制的主循环退出标志 */
 
 /* 运行时注入追踪 */
+#ifndef WITHOUT_INJECTOR
 static mttd_injected_t g_injected[MTT_MAX_INJECTED]; /* 注入记录数组 */
 static int             g_ninjected = 0;               /* 当前注入数 */
+#endif
 
 /* 长期监控安全: 全局泄漏记录计数器 */
 static _Atomic size_t g_total_leaks_global = 0;
@@ -2145,6 +2149,7 @@ static void send_api_processes(int fd)
             snprintf(pi->name, sizeof(pi->name), "%s", comm);
             snprintf(pi->cmdline, sizeof(pi->cmdline), "%s", cmdline);
             pthread_mutex_lock(&g_lock);
+#ifndef WITHOUT_INJECTOR
             for (int i = 0; i < g_ninjected; i++) {
                 if (g_injected[i].pid == pid) {
                     pi->inj_status = g_injected[i].inject_status;
@@ -2152,6 +2157,7 @@ static void send_api_processes(int fd)
                     break;
                 }
             }
+#endif
             pthread_mutex_unlock(&g_lock);
         }
         closedir(dir);
@@ -2182,6 +2188,7 @@ static void send_api_processes(int fd)
     send_all(fd, buf, pos);
 }
 
+#ifndef WITHOUT_INJECTOR
 /**
  * GET /api/inject?pid=N — 向目标进程注入 libmemorytracetool.so。
  *
@@ -2379,7 +2386,9 @@ static void handle_api_inject(int fd, int pid)
     send_all(fd, hdr, hdrlen);
     send_all(fd, resp, body_len);
 }
+#endif /* WITHOUT_INJECTOR */
 
+#ifndef WITHOUT_INJECTOR
 /**
  * GET /api/injected — 返回所有注入记录。
  */
@@ -2414,6 +2423,7 @@ static void send_api_injected(int fd)
 
     send_all(fd, buf, pos);
 }
+#endif /* WITHOUT_INJECTOR */
 
 /**
  * GET /api/reset — 清除所有泄漏历史数据。
@@ -2546,9 +2556,18 @@ static void handle_http(int fd)
     } else if (strncmp(buf, "GET /api/processes", 18) == 0) {
         send_api_processes(fd);
     } else if (strncmp(buf, "GET /api/injected", 17) == 0) {
+#ifndef WITHOUT_INJECTOR
         /* /api/injected 必须放在 /api/inject 之前，否则被短前缀截获 */
         send_api_injected(fd);
+#else
+        const char* noinj_resp =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+            "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+            "{\"injected\":[]}";
+        send_all(fd, noinj_resp, strlen(noinj_resp));
+#endif
     } else if (strncmp(buf, "GET /api/inject", 15) == 0) {
+#ifndef WITHOUT_INJECTOR
         /* 解析 ?pid=N */
         int pid = 0;
         char* params = strchr(buf, '?');
@@ -2566,6 +2585,13 @@ static void handle_http(int fd)
                 "{\"error\":\"missing pid parameter\"}";
             send_all(fd, err, strlen(err));
         }
+#else
+        const char* noinj_err =
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+            "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+            "{\"status\":\"fail\",\"error\":\"injector not compiled (non-x86_64 target)\"}";
+        send_all(fd, noinj_err, strlen(noinj_err));
+#endif
     } else if (strncmp(buf, "GET /api/reset", 14) == 0) {
         handle_api_reset(fd);
     } else if (strncmp(buf, "GET /api/data", 13) == 0) {

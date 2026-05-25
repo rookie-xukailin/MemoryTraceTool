@@ -1,4 +1,5 @@
-CC       = gcc
+CC       ?= gcc
+WITHOUT_INJECTOR ?= 0
 CFLAGS   = -Wall -Wextra -g -O1 -fPIC
 CFLAGS_NOPIC = -Wall -Wextra -g -O1
 LDFLAGS  = -lpthread -ldl
@@ -38,21 +39,29 @@ $(BUILD_DIR)/hooks.o: $(SRC_DIR)/hooks.c $(SRC_DIR)/internal.h | $(BUILD_DIR)
 $(BUILD_DIR)/client.o: $(SRC_DIR)/client.c $(SRC_DIR)/internal.h $(SRC_DIR)/daemon.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC) -c -o $@ $<
 
-# Injector object (linked into daemon and standalone binary)
+# Injector object (x86_64 only — skipped when WITHOUT_INJECTOR=1)
+ifeq ($(WITHOUT_INJECTOR),1)
+DAEMON_EXTRA_OBJ =
+DAEMON_EXTRA_DEF = -DWITHOUT_INJECTOR
+else
+DAEMON_EXTRA_OBJ = $(BUILD_DIR)/injector.o
+DAEMON_EXTRA_DEF =
+
 $(BUILD_DIR)/injector.o: $(SRC_DIR)/injector.c $(SRC_DIR)/injector.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS_NOPIC) $(INC) -c -o $@ $<
-
-# Daemon binary (now links injector.o)
-daemon: $(BUILD_DIR)/mttd
-
-$(BUILD_DIR)/mttd: $(SRC_DIR)/daemon.c $(SRC_DIR)/daemon.h $(BUILD_DIR)/injector.o | $(BUILD_DIR)
-	$(CC) $(CFLAGS_NOPIC) $(INC) -o $@ $< $(BUILD_DIR)/injector.o $(LDFLAGS)
 
 # Standalone injector binary for testing
 $(BUILD_DIR)/mtt-inject: $(SRC_DIR)/injector.c $(SRC_DIR)/injector.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS_NOPIC) $(INC) -DINJECTOR_STANDALONE -o $@ $< $(LDFLAGS)
 
 injector: $(BUILD_DIR)/mtt-inject
+endif
+
+# Daemon binary (conditionally links injector.o)
+daemon: $(BUILD_DIR)/mttd
+
+$(BUILD_DIR)/mttd: $(SRC_DIR)/daemon.c $(SRC_DIR)/daemon.h $(DAEMON_EXTRA_OBJ) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_NOPIC) $(INC) $(DAEMON_EXTRA_DEF) -o $@ $< $(DAEMON_EXTRA_OBJ) $(LDFLAGS)
 
 # Create directories
 $(BUILD_DIR):
