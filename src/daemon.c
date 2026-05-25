@@ -1012,7 +1012,7 @@ static const char* g_dashboard_html =
 "    <button class=\"btn\" id=\"btn-pause\" onclick=\"toggleAuto()\">暂停刷新</button>\n"
 "    <button class=\"btn\" onclick=\"refresh();loadProcs()\">立即刷新</button>\n"
 "    <button class=\"btn warn\" onclick=\"openResetModal()\">重新监控</button>\n"
-    <button class=\"btn warn\" onclick=\"openClearModal()\">清除所有历史数据</button>\n"
+"    <button class=\"btn warn\" onclick=\"openClearModal()\">清除所有历史数据</button>\n"
 "  </div>\n"
 "</div>\n"
 "\n"
