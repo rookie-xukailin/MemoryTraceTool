@@ -420,9 +420,8 @@ static int ptrace_remote_call(pid_t pid, unsigned long fn_addr,
     /* 预留 16KB 栈空间供 dlopen 等复杂函数使用 */
     unsigned long ret_slot = orig_sp - 16384;
 #if MTT_ARCH_ARM
-    /* ARM32 AAPCS: 栈需 8 字节对齐 */
+    /* ARM32 AAPCS: 栈需 8 字节对齐。ARM 用 LR 返回，无需预留返回地址槽。 */
     ret_slot &= ~0x07UL;
-    ret_slot -= 4;   /* 为返回地址预留（兼容可能压栈的函数） */
 #else
     /* x86_64 / AArch64: 栈需 16 字节对齐 */
     ret_slot &= ~0x0FUL;
@@ -824,18 +823,32 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
         return res;
     }
 
-    unsigned long libc_base = libc_region->start;
-
     /* trap_addr 放在 libc 可执行区域末尾 */
     unsigned long trap_addr = (libc_region->end - 16) & ~((unsigned long)15);
-    fprintf(stderr, "[DEBUG] libc r-xp: 0x%lx-0x%lx trap_addr=0x%lx\n",
-            libc_base, libc_region->end, trap_addr);
 
-    /* 通过自身 dlsym 计算目标进程中 dlopen 的地址 */
-    void* our_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
+    /* ELF 符号偏移是相对于 load bias（第一个映射起始地址），而非可执行区域起始地址。
+     * ARM32 上 libc 的第一个映射通常是 r--p，与 r-xp 地址不同；
+     * 用可执行区域起始地址计算 target_dlopen 会导致 SIGSEGV。 */
+    unsigned long libc_base = libc_region->start;
+    for (int i = 0; i < nregions; i++) {
+        if (strstr(regions[i].path, "libc") && regions[i].start < libc_base) {
+            libc_base = regions[i].start;
+        }
+    }
+    fprintf(stderr, "[DEBUG] libc load_bias=0x%lx r-xp=0x%lx-0x%lx trap_addr=0x%lx\n",
+            libc_base, libc_region->start, libc_region->end, trap_addr);
+
+    /* 通过自身 dlsym 计算目标进程中 __libc_dlopen_mode 的地址。
+     * __libc_dlopen_mode 是 glibc 内部函数，ptrace 远程注入的标准入口；
+     * 若不可用则回退到 dlopen（部分旧版或非 glibc 系统）。 */
+    void* our_dlopen = dlsym(RTLD_DEFAULT, "__libc_dlopen_mode");
+    if (!our_dlopen) {
+        our_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
+    }
     if (!our_dlopen) {
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
-        set_error(&res, INJECT_ERR_DLOPEN, "Cannot find dlopen in own process");
+        set_error(&res, INJECT_ERR_DLOPEN,
+                  "Cannot find __libc_dlopen_mode or dlopen in own process");
         return res;
     }
 
@@ -844,9 +857,11 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
         mem_region_t self_regions[MAX_REGIONS];
         int nself = read_maps(getpid(), self_regions, MAX_REGIONS);
         for (int i = 0; i < nself; i++) {
-            if (strstr(self_regions[i].path, "libc") && strchr(self_regions[i].perms, 'x')) {
-                our_libc_base = self_regions[i].start;
-                break;
+            /* 找最低地址的 libc 映射（load bias），ELF 符号偏移以此为基准 */
+            if (strstr(self_regions[i].path, "libc")) {
+                if (our_libc_base == 0 || self_regions[i].start < our_libc_base) {
+                    our_libc_base = self_regions[i].start;
+                }
             }
         }
     }
