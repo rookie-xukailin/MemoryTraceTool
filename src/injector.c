@@ -245,8 +245,9 @@ static int read_maps(pid_t pid, mem_region_t* regions, int max)
 }
 
 /**
- * 检查路径是否为 libc.so 或 libc-<version>.so。
- * 排除 libcap, libcrypt, libcrypto 等以 "libc" 开头的非 libc 库。
+ * 检查路径是否为 libc（排除 libcap, libcrypt, libcrypto 等以 libc 开头的库）。
+ * basename 以 "libc" 开头且下一个字符不是字母 (a-zA-Z)，即可匹配：
+ * libc.so.6, libc-2.31.so, libc6.so, libc.so, libc 等变体。
  */
 static int is_libc_path(const char* path)
 {
@@ -254,7 +255,9 @@ static int is_libc_path(const char* path)
     if (base) base++; else base = path;
     if (strncmp(base, "libc", 4) != 0) return 0;
     char next = base[4];
-    return (next == '.' || next == '-' || next == '\0');
+    if (next >= 'a' && next <= 'z') return 0;
+    if (next >= 'A' && next <= 'Z') return 0;
+    return 1;
 }
 
 /**
@@ -831,6 +834,7 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
                   "Cannot read /proc/%d/maps", pid);
         return res;
     }
+    fprintf(stderr, "[DEBUG] Target PID %d has %d memory regions\n", pid, nregions);
 
     /* 查找 libc 可执行区域：用 is_libc_path 精确匹配 libc.so/libc-，
      * 避免 strstr(...,"libc") 误匹配 libcap, libcrypt, libcrypto 等。 */
@@ -850,6 +854,12 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
         }
     }
     if (!libc_region) {
+        fprintf(stderr, "[DEBUG] Cannot find libc. Target PID %d maps:\n", pid);
+        for (int i = 0; i < nregions; i++) {
+            fprintf(stderr, "[DEBUG]   0x%lx-0x%lx %s %s\n",
+                    regions[i].start, regions[i].end,
+                    regions[i].perms, regions[i].path);
+        }
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         set_error(&res, INJECT_ERR_DLOPEN,
                   "Cannot find libc in /proc/%d/maps", pid);
