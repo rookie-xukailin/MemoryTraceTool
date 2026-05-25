@@ -364,7 +364,8 @@ static int elf_find_symbol(const char* elf_path, const char* sym_name,
 
         for (int i = 0; i < nsyms; i++) {
             const char* name = strtab_data + syms[i].st_name;
-            if (strcmp(name, sym_name) == 0 && syms[i].st_value != 0) {
+            if (strcmp(name, sym_name) == 0 && syms[i].st_value != 0
+                && syms[i].st_shndx != SHN_UNDEF) {
                 *out_offset = (unsigned long)syms[i].st_value;
                 found = 1;
                 break;

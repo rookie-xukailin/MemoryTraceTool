@@ -249,7 +249,9 @@ void free(void* ptr)
 {
     mtt_resolve_raw_allocators();
     if (!ptr) return;
-    if (g_in_resolver) { raw_free(ptr); return; }
+    /* 解析器窗口内不释放：bootstrap 内存不可 free，若 raw_* 已切换
+     * 为 real free 则会导致堆损坏。少量泄漏可接受（一次性）。 */
+    if (g_in_resolver) return;
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
 

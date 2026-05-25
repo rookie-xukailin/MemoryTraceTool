@@ -542,7 +542,7 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
         else if (strncmp(line, "STAT ", 5) == 0 && ctx->proc) {
             size_t cur_bytes = 0, allocs = 0, frees = 0, vm_rss = 0;
             if (sscanf(line, "STAT %zu %zu %zu %zu",
-                       &cur_bytes, &allocs, &frees, &vm_rss) >= 1) {
+                       &cur_bytes, &allocs, &frees, &vm_rss) >= 4) {
                 pthread_mutex_lock(&ctx->proc->lock);
                 ctx->proc->current_bytes = cur_bytes;
                 ctx->proc->alloc_count   = allocs;
