@@ -118,6 +118,7 @@ void mtt_resolve_raw_allocators(void)
     if (!atomic_compare_exchange_strong(&g_raw_resolved, &expected, 1))
         return;
 
+    fprintf(stderr, "[mtt-core] mtt_resolve_raw_allocators: resolving...\n");
     g_raw_resolving = 1;
 
     /* 先预设 bootstrap 分配器：dlsym 内部若触发 malloc，
@@ -156,6 +157,10 @@ void mtt_resolve_raw_allocators(void)
             "using bootstrap buffer (64KB, no-recycle).\n";
         write(STDERR_FILENO, warn_msg, sizeof(warn_msg) - 1);
     }
+
+    fprintf(stderr, "[mtt-core] mtt_resolve_raw_allocators: done "
+            "(raw_malloc=%p raw_free=%p raw_calloc=%p)\n",
+            (void*)raw_malloc, (void*)raw_free, (void*)raw_calloc);
 
     g_raw_resolving = 0;
 }
@@ -422,6 +427,8 @@ void mtt_ensure_init(void)
     if (atomic_load(&s->initialized))
         return;
 
+    fprintf(stderr, "[mtt-core] mtt_ensure_init: initializing...\n");
+
     /* ---- 阶段 1: 读取环境变量（无需持锁，getenv 只读 environ 不触发 malloc） ---- */
     int      want_disabled = 0;
     char     want_filter[256] = "";
@@ -510,6 +517,11 @@ void mtt_ensure_init(void)
 
     atomic_store(&s->initialized, 1);
     pthread_mutex_unlock(&init_lock);
+
+    fprintf(stderr, "[mtt-core] mtt_ensure_init: done "
+            "(disabled=%d sample=%u max_entries=%u filter='%s')\n",
+            s->disabled, s->sample_period, s->max_entries,
+            s->proc_filter[0] ? s->proc_filter : "(none)");
 
     /* ---- 阶段 3: 注册回调（不持锁，允许内部调用 malloc/fopen 等） ---- */
     atexit(mtt_atexit_report);

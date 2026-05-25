@@ -186,6 +186,7 @@ static int connect_daemon(void)
     strncpy(addr.sun_path, MTT_SOCK_PATH, sizeof(addr.sun_path) - 1);
 
     if (connect(g_sock_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "[mtt-client] connect_daemon FAILED: %s\n", strerror(errno));
         close(g_sock_fd);
         g_sock_fd = -1;
         return -1;
@@ -211,6 +212,9 @@ static int connect_daemon(void)
     if (n > 0 && n < (int)sizeof(msg))
         send_all(g_sock_fd, msg, (size_t)n);
 
+    fprintf(stderr, "[mtt-client] connect_daemon OK fd=%d pid=%d name=%s\n",
+            g_sock_fd, getpid(), exe_name);
+
     return g_sock_fd;
 }
 
@@ -233,6 +237,7 @@ typedef struct {
 
 static void do_client_report(int is_final)
 {
+    fprintf(stderr, "[mtt-client] do_client_report is_final=%d\n", is_final);
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
 
@@ -338,6 +343,7 @@ static void* reporter_thread_func(void* arg)
 /** 启动周期性报告线程（mtt_ensure_init 之后调用） */
 void mtt_start_periodic_report(void)
 {
+    fprintf(stderr, "[mtt-client] mtt_start_periodic_report: starting reporter thread\n");
     int rc = pthread_create(&g_reporter_thread, NULL, reporter_thread_func, NULL);
     if (rc != 0) {
         fprintf(stderr, "[MemoryTraceTool] WARN: pthread_create reporter failed: %s\n", strerror(rc));

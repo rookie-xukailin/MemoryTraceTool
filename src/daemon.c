@@ -437,7 +437,16 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
 
     ssize_t n = read(fd, ctx->buf + ctx->bufpos,
                      sizeof(ctx->buf) - ctx->bufpos - 1);
-    if (n <= 0) { *out_proc = ctx->proc; return (int)n; }
+    if (n <= 0) {
+        if (ctx->proc)
+            fprintf(stderr, "[mttd] client fd=%d disconnected (pid=%d name=%s n=%zd errno=%d)\n",
+                    fd, ctx->proc->pid, ctx->proc->name, n, errno);
+        else
+            fprintf(stderr, "[mttd] client fd=%d disconnected (no proc n=%zd errno=%d)\n",
+                    fd, n, errno);
+        *out_proc = ctx->proc;
+        return (int)n;
+    }
 
     ctx->bufpos += (int)n;
     ctx->buf[ctx->bufpos] = '\0';
@@ -468,6 +477,9 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
              * 缺陷修复 #3: %127s 防止缓冲区溢出 */
             if (sscanf(line, "LEAK %zu %127s %d %d",
                        &leak.size, leak.file, &leak.line, &leak.nframes) >= 4) {
+                fprintf(stderr, "[mttd] LEAK pid=%d name=%s size=%zu file=%s:%d frames=%d\n",
+                        ctx->proc->pid, ctx->proc->name,
+                        leak.size, leak.file, leak.line, leak.nframes);
                 if (leak.nframes > MTT_MAX_STACK) leak.nframes = MTT_MAX_STACK;
                 if (leak.nframes < 0) leak.nframes = 0;
                 pthread_mutex_lock(&ctx->proc->lock);
@@ -491,6 +503,8 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
         }
         else if (strncmp(line, "BYE", 3) == 0) {
             if (ctx->proc) {
+                fprintf(stderr, "[mttd] BYE pid=%d name=%s leak_count=%d\n",
+                        ctx->proc->pid, ctx->proc->name, ctx->proc->leak_count);
                 pthread_mutex_lock(&ctx->proc->lock);
                 ctx->proc->active = 0; /* 标记进程已退出 */
                 pthread_mutex_unlock(&ctx->proc->lock);
@@ -2777,6 +2791,7 @@ int main(int argc, char** argv)
         if (FD_ISSET(unix_fd, &rfds)) {
             int cfd = accept(unix_fd, NULL, NULL);
             if (cfd >= 0) {
+                fprintf(stderr, "[mttd] new unix client fd=%d\n", cfd);
                 set_nonblock(cfd);
                 set_recv_timeout(cfd, MTT_CLIENT_TIMEOUT_S);
                 if (nclients < MAX_CLIENTS) {
@@ -2786,6 +2801,7 @@ int main(int argc, char** argv)
                     client_conn_time[nclients] = time(NULL);
                     nclients++;
                 } else {
+                    fprintf(stderr, "[mttd] client slots full, rejecting fd=%d\n", cfd);
                     close(cfd); /* 客户端数已满 */
                 }
             }
@@ -2816,6 +2832,10 @@ int main(int argc, char** argv)
                 }
                 if (rc <= 0) {
                     /* 连接关闭或出错，从活跃列表中移除 */
+                    fprintf(stderr, "[mttd] closing client fd=%d rc=%d (pid=%d name=%s)\n",
+                            clients[i], rc,
+                            proc ? proc->pid : -1,
+                            proc ? proc->name : "?");
                     shutdown(clients[i], SHUT_RDWR);
                     close(clients[i]);
                     for (int j = i; j < nclients - 1; j++) {
