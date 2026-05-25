@@ -204,52 +204,12 @@ mtt_state_t* mtt_state_get(void) { return &g_state; }
 static __thread int g_in_capture = 0;
 
 /**
- * ARM32 手动栈回溯：遍历帧指针链获取返回地址。
- *
- * AAPCS 约定下，fp 指向 {prev_fp, lr} 结构：
- *   fp[0] = 上一帧的 fp（链表指针）
- *   fp[1] = 当前函数的返回地址（保存的 lr）
- *
- * 相比 glibc backtrace() 在嵌入式 ARM 上更可靠，
- * 不依赖 _Unwind_Backtrace 和 unwind table。
- *
- * @param buffer  输出缓冲区，存放返回地址
- * @param max     缓冲区容量
- * @return        实际捕获的帧数
- */
-#if defined(__arm__)
-static int arm_frame_walk(void** buffer, int max)
-{
-    void** fp;
-    __asm__ volatile("mov %0, fp" : "=r"(fp));
-    if (!fp) return 0;
-
-    int count = 0;
-    /* 从 capture_stack 的调用者（mtt_entry_new）开始收集 */
-    while (fp && count < max) {
-        void* prev_fp = fp[0];
-        void* lr      = fp[1];
-
-        /* 安全检查：返回地址不能为空或内核空间 */
-        if (!lr || (unsigned long)lr < 0x1000UL) break;
-        /* 栈向下增长，上层帧地址必须大于当前帧 */
-        if (prev_fp && (unsigned long)prev_fp <= (unsigned long)fp) break;
-
-        /* 清除 Thumb 模式标志位（LSB），方便后续符号解析 */
-        buffer[count++] = (void*)((unsigned long)lr & ~1UL);
-
-        if (!prev_fp) break;
-        fp = (void**)prev_fp;
-    }
-    return count;
-}
-#endif
-
-/**
  * 捕获当前调用栈并存入 entry->stack。
  *
- * ARM32: 使用手动帧指针链遍历（arm_frame_walk），
+ * ARM32: 使用帧指针链手动遍历（__builtin_frame_address + AAPCS 布局），
  *        不依赖 glibc backtrace() 和 unwind table。
+ *        capture_stack 自身非叶子函数（内部调用 raw_* 和 mtt_* 系列函数），
+ *        配合 Makefile 中 -fno-omit-frame-pointer 保证 fp 寄存器有效。
  * x86_64 / AArch64: 使用标准 backtrace()。
  *
  * 通过 g_in_capture (thread-local) 防止递归重入。
@@ -263,7 +223,27 @@ static void capture_stack(mtt_entry_t* entry)
     int saved = g_in_capture;
     g_in_capture = 1;
 #if defined(__arm__)
-    entry->stack_frames = arm_frame_walk(entry->stack, MTT_STACK_DEPTH);
+    {
+        /* 从 capture_stack 自身的帧指针出发，沿 AAPCS 链表向上遍历。
+         * 帧布局: fp[0] = 上一帧的 fp, fp[1] = 保存的 lr (返回地址)。
+         * 第一步取 fp[1] 即为 mtt_entry_new 中调用 capture_stack 的返回点。 */
+        void** fp = (void**)__builtin_frame_address(0);
+        int count = 0;
+        while (fp && count < MTT_STACK_DEPTH) {
+            void* prev_fp = fp[0];
+            void* lr      = fp[1];
+
+            if (!lr || (unsigned long)lr < 0x1000UL) break;
+            if (prev_fp && (unsigned long)prev_fp <= (unsigned long)fp) break;
+
+            /* 清除 Thumb 标志位（LSB），方便后续符号解析 */
+            entry->stack[count++] = (void*)((unsigned long)lr & ~1UL);
+
+            if (!prev_fp) break;
+            fp = (void**)prev_fp;
+        }
+        entry->stack_frames = count;
+    }
 #else
     entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
 #endif
