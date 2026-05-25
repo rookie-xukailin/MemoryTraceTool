@@ -35,6 +35,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <malloc.h>
 
 /* ======================================================================== *
@@ -54,20 +55,22 @@ static int g_raw_resolving = 0;
 
 /* Bootstrap 分配器：静态缓冲区，在 raw_* 解析完成前兜底。
  * dlsym 内部可能调用 malloc（尤其在 ARM 平台上），此时 raw_* 尚未就绪，
- * 用此静态缓冲区临时满足分配请求，避免空指针崩溃。 */
+ * 用此静态缓冲区临时满足分配请求，避免空指针崩溃。
+ *
+ * bootstrap_offset 使用原子操作：多线程并发进入 resolve 时，
+ * 各自对 bootstrap_malloc 的调用不会破坏彼此的数据。 */
 #define BOOTSTRAP_BUF_SIZE 65536
 static char bootstrap_buf[BOOTSTRAP_BUF_SIZE];
-static size_t bootstrap_offset = 0;
+static _Atomic size_t bootstrap_offset = 0;
 
 static void* bootstrap_malloc(size_t size)
 {
     /* 8 字节对齐 */
     size_t aligned = (size + 7) & ~((size_t)7);
-    if (bootstrap_offset + aligned > BOOTSTRAP_BUF_SIZE)
+    size_t old = atomic_fetch_add(&bootstrap_offset, aligned);
+    if (old + aligned > BOOTSTRAP_BUF_SIZE)
         return NULL;
-    void* p = bootstrap_buf + bootstrap_offset;
-    bootstrap_offset += aligned;
-    return p;
+    return bootstrap_buf + old;
 }
 
 static void bootstrap_free(void* ptr)
@@ -142,10 +145,17 @@ void mtt_resolve_raw_allocators(void)
         }
     }
 
-    /* 最终 fallback：直接引用 libc 符号（仅在非 LD_PRELOAD 模式有效） */
-    if (!raw_malloc) raw_malloc = (raw_malloc_fn)malloc;
-    if (!raw_free)   raw_free   = (raw_free_fn)free;
-    if (!raw_calloc) raw_calloc = (raw_calloc_fn)calloc;
+    /* 两种解析路径都失败时保留 bootstrap 分配器。
+     * 绝不 fallback 到 malloc/free/calloc 符号：在 LD_PRELOAD
+     * 模式下这些符号就是我们的钩子，赋值 raw_malloc = malloc 会导致
+     * 无限递归（钩子 → raw_malloc → 钩子 → …）。bootstrap 缓冲区
+     * 仅 64KB 且不回收，但至少不会让进程立即崩溃。 */
+    if (!raw_malloc || !raw_free || !raw_calloc) {
+        static const char warn_msg[] =
+            "[MemoryTraceTool] WARN: cannot resolve raw allocators; "
+            "using bootstrap buffer (64KB, no-recycle).\n";
+        write(STDERR_FILENO, warn_msg, sizeof(warn_msg) - 1);
+    }
 
     g_raw_resolving = 0;
 }
@@ -371,67 +381,38 @@ void mtt_report_to_daemon(void)
 
 /**
  * peek 进程名（从 /proc/self/comm 读取，用于 PROC_FILTER 匹配）。
+ * 使用 open/read/close 系统调用，避免 fopen 触发 malloc → 钩子递归。
  * 失败时返回空字符串。
  */
 static void get_proc_comm(char* buf, size_t size)
 {
     buf[0] = '\0';
-    FILE* fp = fopen("/proc/self/comm", "r");
-    if (fp) {
-        if (fgets(buf, (int)size, fp)) {
-            size_t len = strlen(buf);
-            if (len > 0 && buf[len - 1] == '\n')
-                buf[len - 1] = '\0';
+    int fd = open("/proc/self/comm", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, buf, size - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            if (buf[n - 1] == '\n')
+                buf[n - 1] = '\0';
         }
-        fclose(fp);
-    }
-}
-
-/**
- * 检查环境变量（MTT_DISABLE / MTT_PROC_FILTER），决定是否应追踪当前进程。
- * 只执行一次，结果缓存在 s->disabled 中。
- */
-static void check_env_switches(mtt_state_t* s)
-{
-    if (s->env_checked) return;
-    s->env_checked = 1;
-
-    /* MTT_DISABLE=1 完全禁用追踪 */
-    const char* env_disable = getenv("MTT_DISABLE");
-    if (env_disable && strcmp(env_disable, "1") == 0) {
-        s->disabled = 1;
-        return;
-    }
-
-    /* MTT_PROC_FILTER=name 仅追踪匹配名称的进程 */
-    const char* env_filter = getenv("MTT_PROC_FILTER");
-    if (env_filter && env_filter[0]) {
-        strncpy(s->proc_filter, env_filter, sizeof(s->proc_filter) - 1);
-        s->proc_filter[sizeof(s->proc_filter) - 1] = '\0';
-
-        char comm[256];
-        get_proc_comm(comm, sizeof(comm));
-        if (comm[0] && strcmp(comm, s->proc_filter) != 0) {
-            /* 进程名不匹配过滤器，禁用追踪 */
-            s->disabled = 1;
-        }
+        close(fd);
     }
 }
 
 /**
  * 确保全局状态已完成初始化（惰性初始化，多次调用安全）。
  *
- * 初始化包括：
- * - 分配 MTT_BUCKETS 个桶的哈希表（使用 raw_calloc 零初始化）
- * - 初始化 64 分段锁和随机种子
- * - 清零所有统计计数器
- * - 设置默认配置（采样周期 256、容量上限）
- * - 读取环境变量覆盖默认配置
- * - 注册 atexit 回调
+ * 初始化分三阶段：
+ *   1. 持锁前读取环境变量（不触发 malloc，安全）
+ *   2. 持锁初始化桶表、分段锁、计数器（仅纯内存操作 + raw_calloc）
+ *   3. 释放锁后注册 atexit 和启动周期报告线程（可能触发 malloc）
+ *
+ * 阶段分离避免了 init_lock 内调用 getenv/fopen/atexit/pthread_create
+ * 等可能内部触发 malloc → 钩子 → mtt_ensure_init 递归死锁的函数。
  *
  * 缺陷修复 #9: 生成随机哈希种子防止碰撞攻击。
- * 缺陷修复 #1: 读取环境变量 MTT_SAMPLE, MTT_DISABLE, MTT_MAX_ENTRIES, MTT_PROC_FILTER。
- * 缺陷修复 #23: 64 分段锁替代全局互斥锁，大幅降低高并发竞争。
+ * 缺陷修复 #23: 64 分段锁替代全局互斥锁。
+ * 缺陷修复 #28: 环境变量读取移到锁外，消除 init_lock 内递归死锁风险。
  */
 void mtt_ensure_init(void)
 {
@@ -441,33 +422,70 @@ void mtt_ensure_init(void)
     if (atomic_load(&s->initialized))
         return;
 
-    /* 缺陷修复 #25: 用静态锁保护初始化，防止多线程首次调用竞争。
-     * 不能用 CAS（会在线程 B 看到 initialized=1 时立即返回，
-     * 但此时桶表/互斥锁可能尚未初始化完成）。 */
+    /* ---- 阶段 1: 读取环境变量（无需持锁，getenv 只读 environ 不触发 malloc） ---- */
+    int      want_disabled = 0;
+    char     want_filter[256] = "";
+    unsigned want_sample  = MTT_SAMPLE_DEFAULT;
+    unsigned want_maxent  = MTT_MAX_ENTRIES;
+
+    {
+        const char* env_disable = getenv("MTT_DISABLE");
+        if (env_disable && strcmp(env_disable, "1") == 0)
+            want_disabled = 1;
+
+        const char* env_filter = getenv("MTT_PROC_FILTER");
+        if (env_filter && env_filter[0]) {
+            strncpy(want_filter, env_filter, sizeof(want_filter) - 1);
+            want_filter[sizeof(want_filter) - 1] = '\0';
+        }
+
+        const char* env_sample = getenv("MTT_SAMPLE");
+        if (env_sample) {
+            int sp = atoi(env_sample);
+            if (sp >= 0 && sp <= MTT_SAMPLE_MAX_PERIOD)
+                want_sample = (unsigned)sp;
+        }
+
+        const char* env_maxent = getenv("MTT_MAX_ENTRIES");
+        if (env_maxent) {
+            int me = atoi(env_maxent);
+            if (me >= 256 && me <= 1048576)
+                want_maxent = (unsigned)me;
+        }
+    }
+
+    /* PROC_FILTER 匹配：仅当 env 指定了过滤器且未 disable 时才读 /proc/self/comm */
+    if (!want_disabled && want_filter[0]) {
+        char comm[256];
+        get_proc_comm(comm, sizeof(comm));
+        if (comm[0] && strcmp(comm, want_filter) != 0)
+            want_disabled = 1; /* 进程名不匹配过滤器，禁用追踪 */
+    }
+
+    /* ---- 阶段 2: 持锁初始化数据结构（双重检查锁定模式） ---- */
     static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&init_lock);
 
     /* 双重检查：可能在等锁期间已被其他线程初始化 */
-    if (s->initialized) {
+    if (atomic_load(&s->initialized)) {
         pthread_mutex_unlock(&init_lock);
         return;
     }
 
     s->bucket_count = MTT_BUCKETS;
-    /* 使用 raw_calloc 避免分配操作被自身追踪记录 */
     s->buckets = raw_calloc(s->bucket_count, sizeof(mtt_entry_t*));
     if (!s->buckets) {
-        fprintf(stderr, "[MemoryTraceTool] FATAL: cannot allocate bucket table\n");
+        static const char fatal_msg[] =
+            "[MemoryTraceTool] FATAL: cannot allocate bucket table\n";
+        write(STDERR_FILENO, fatal_msg, sizeof(fatal_msg) - 1);
         pthread_mutex_unlock(&init_lock);
         return;
     }
 
-    /* 生成随机哈希种子：混入时间戳和进程 PID */
     s->hash_seed = ((unsigned long)time(NULL) ^
                     ((unsigned long)getpid() << 16) ^
                     0x9e3779b97f4a7c15UL);
 
-    /* 初始化 64 分段锁 */
     for (int i = 0; i < MTT_LOCK_STRIPES; i++)
         pthread_mutex_init(&s->bucket_locks[i], NULL);
 
@@ -480,42 +498,21 @@ void mtt_ensure_init(void)
     s->skipped_sampled = 0;
     s->skipped_overcap = 0;
 
-    /* 默认采样与容量配置 */
-    s->sample_period = MTT_SAMPLE_DEFAULT;
-    s->max_entries   = MTT_MAX_ENTRIES;
+    /* 应用阶段 1 读取的环境变量和进程名过滤结果 */
+    s->disabled       = want_disabled;
+    s->sample_period  = want_sample;
+    s->max_entries    = want_maxent;
     atomic_store(&s->sample_counter, 0);
     atomic_store(&s->entry_count, 0);
+    strncpy(s->proc_filter, want_filter, sizeof(s->proc_filter) - 1);
+    s->proc_filter[sizeof(s->proc_filter) - 1] = '\0';
+    s->env_checked = 1;
 
-    /* 进程级开关（首次调用 getenv，后续使用缓存） */
-    s->disabled    = 0;
-    s->proc_filter[0] = '\0';
-    s->env_checked = 0;
-    check_env_switches(s);
-
-    /* 环境变量覆盖采样和容量 */
-    {
-        const char* env_sample = getenv("MTT_SAMPLE");
-        if (env_sample) {
-            int sp = atoi(env_sample);
-            if (sp >= 0 && sp <= MTT_SAMPLE_MAX_PERIOD)
-                s->sample_period = (unsigned)sp;
-        }
-
-        const char* env_maxent = getenv("MTT_MAX_ENTRIES");
-        if (env_maxent) {
-            int me = atoi(env_maxent);
-            if (me >= 256 && me <= 1048576)
-                s->max_entries = (unsigned)me;
-        }
-    }
-
-    /* initialized 必须在所有字段就绪后才置 1 */
     atomic_store(&s->initialized, 1);
     pthread_mutex_unlock(&init_lock);
 
+    /* ---- 阶段 3: 注册回调（不持锁，允许内部调用 malloc/fopen 等） ---- */
     atexit(mtt_atexit_report);
-
-    /* 启动周期性报告线程：每 3 秒向守护进程推送泄漏数据，供实时看板 */
     mtt_start_periodic_report();
 }
 

@@ -1259,7 +1259,7 @@ static const char* g_dashboard_html =
 "        var parsed=parseFrame(l.frames[j]||'?');\n"
 "        var resolved=gResolvedFrames[parsed.bin+':'+parsed.off]||'';\n"
 "        html+='<div class=\"'+cls+'\"';\n"
-"        if(parsed.bin&&parsed.off)html+=' onclick=\"event.stopPropagation();resolveAndPersist(this,\\''+escAttr(parsed.bin)+'\\',\\''+escAttr(parsed.off)+'\\')\" style=\"cursor:pointer\" title=\"点击解析源码\"';\n"
+"        if(parsed.bin&&parsed.off)html+=' onclick=\"event.stopPropagation();resolveAndPersist(this,\\''+escJSStr(parsed.bin)+'\\',\\''+escJSStr(parsed.off)+'\\')\" style=\"cursor:pointer\" title=\"点击解析源码\"';\n"
 "        html+='><span class=\"fn\">'+esc(parsed.fn)+'</span>';\n"
 "        if(parsed.lib)html+='<span class=\"lib\">'+esc(parsed.lib)+'</span>';\n"
 "        if(resolved)html+='<span class=\"src-tip\"> @ '+esc(resolved)+'</span>';\n"
@@ -1405,7 +1405,7 @@ static const char* g_dashboard_html =
 "          var p2=parseFrame(l.frames[k]||'?');\n"
 "          var resolved=gResolvedFrames[p2.bin+':'+p2.off]||'';\n"
 "          body+='<div class=\"'+cls+'\"';\n"
-"          if(p2.bin&&p2.off)body+=' onclick=\"event.stopPropagation();resolveAndPersist(this,\\''+escAttr(p2.bin)+'\\',\\''+escAttr(p2.off)+'\\')\" style=\"cursor:pointer\" title=\"点击解析源码\"';\n"
+"          if(p2.bin&&p2.off)body+=' onclick=\"event.stopPropagation();resolveAndPersist(this,\\''+escJSStr(p2.bin)+'\\',\\''+escJSStr(p2.off)+'\\')\" style=\"cursor:pointer\" title=\"点击解析源码\"';\n"
 "          body+='><span class=\"fn\">'+esc(p2.fn)+'</span>';\n"
 "          if(p2.lib)body+='<span class=\"lib\">'+esc(p2.lib)+'</span>';\n"
 "          if(resolved)body+='<span class=\"src-tip\"> @ '+esc(resolved)+'</span>';\n"
@@ -1666,6 +1666,7 @@ static const char* g_dashboard_html =
 "\n"
 "function esc(s){if(!s)return'';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;')}\n"
 "function escAttr(s){if(!s)return'';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;').replace(/'/g,'&#39;')}\n"
+"function escJSStr(s){if(!s)return'';return s.replace(/\\\\/g,'\\\\\\\\').replace(/'/g,\"\\\\'\").replace(/&/g,'&amp;').replace(/\"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}\n"
 "\n"
 "function toast(msg){\n"
 "  toastQueue.push(msg);\n"
@@ -2091,8 +2092,10 @@ static void send_api_processes(int fd)
             if (fgets(sline, sizeof(sline), fs)) {
                 char* rp = strrchr(sline, ')');       /* 跳过进程名 "(name)" */
                 if (rp) {
-                    /* 字段: state(0) ppid(1) ... starttime(19)，用 %*s 跳过避免类型溢出 */
-                    sscanf(rp + 1, " %c %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %lu",
+                    /* 字段(紧随 ')' 之后): state(1) ppid(2) … starttime(20)，
+                     * 共 20 个字段，state 用 %c 读取，starttime 用 %lu，
+                     * 中间 18 个字段用 %*s 跳过避免类型溢出。 */
+                    sscanf(rp + 1, " %c %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %lu",
                            &state, &starttime);
                 }
             }
