@@ -67,6 +67,8 @@ static inline int hook_is_over_capacity(mtt_state_t* s)
  */
 void* malloc(size_t size)
 {
+    mtt_resolve_raw_allocators();
+
     /* 0 字节分配按标准放行 */
     if (size == 0) return raw_malloc(0);
 
@@ -117,6 +119,7 @@ void* malloc(size_t size)
  */
 void* calloc(size_t count, size_t size)
 {
+    mtt_resolve_raw_allocators();
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
 
@@ -153,6 +156,7 @@ void* calloc(size_t count, size_t size)
  */
 void* realloc(void* ptr, size_t size)
 {
+    mtt_resolve_raw_allocators();
     if (!ptr) return malloc(size);
     if (!size) { free(ptr); return NULL; }
 
@@ -221,6 +225,7 @@ void* realloc(void* ptr, size_t size)
  */
 void free(void* ptr)
 {
+    mtt_resolve_raw_allocators();
     if (!ptr) return;
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();

@@ -42,33 +42,94 @@
  *           以避免 LD_PRELOAD 模式下的无限递归                              *
  * ======================================================================== */
 
-/* 全局函数指针，由构造函数 resolve_raw_allocators 自动初始化 */
+/* 全局函数指针，由 resolve_raw_allocators 懒解析初始化 */
 raw_malloc_fn raw_malloc = NULL;
 raw_free_fn   raw_free   = NULL;
 raw_calloc_fn raw_calloc = NULL;
 
 /* 原子标志：防止构造函数被多次执行（多线程竞争） */
 static atomic_int g_raw_resolved = 0;
+/* 递归保护标志：dlsym 内部可能触发 malloc，防止 resolve 函数自身递归 */
+static int g_raw_resolving = 0;
+
+/* Bootstrap 分配器：静态缓冲区，在 raw_* 解析完成前兜底。
+ * dlsym 内部可能调用 malloc（尤其在 ARM 平台上），此时 raw_* 尚未就绪，
+ * 用此静态缓冲区临时满足分配请求，避免空指针崩溃。 */
+#define BOOTSTRAP_BUF_SIZE 65536
+static char bootstrap_buf[BOOTSTRAP_BUF_SIZE];
+static size_t bootstrap_offset = 0;
+
+static void* bootstrap_malloc(size_t size)
+{
+    /* 8 字节对齐 */
+    size_t aligned = (size + 7) & ~((size_t)7);
+    if (bootstrap_offset + aligned > BOOTSTRAP_BUF_SIZE)
+        return NULL;
+    void* p = bootstrap_buf + bootstrap_offset;
+    bootstrap_offset += aligned;
+    return p;
+}
+
+static void bootstrap_free(void* ptr)
+{
+    /* bootstrap 分配不回收，no-op */
+    (void)ptr;
+}
+
+static void* bootstrap_calloc(size_t count, size_t size)
+{
+    size_t total = count * size;
+    void* p = bootstrap_malloc(total);
+    if (p) {
+        /* 仅清零实际分配大小（对齐后大小可能大于请求） */
+        size_t actual = (total + 7) & ~((size_t)7);
+        if (actual > 0) memset(p, 0, actual);
+    }
+    return p;
+}
 
 /**
- * 共享库构造函数，在动态库加载时自动执行。
+ * 解析真正的 libc 分配函数指针（raw_malloc / raw_free / raw_calloc）。
  *
- * 查找真正的 libc 分配函数（raw_malloc / raw_free / raw_calloc）。
- * 优先使用 RTLD_NEXT（LD_PRELOAD 模式），失败时显式打开 libc
- * 查找（dlopen/ptrace 注入模式），最后 fallback 到直接调用。
+ * 从 __attribute__((constructor)) 改为首次调用时懒解析：
+ *   - ARM 平台上 dlsym() 内部可能触发 malloc，constructor 阶段
+ *     raw_malloc 尚未就绪会导致段错误
+ *   - 懒解析在第一次 malloc hook 被调用时执行，此时动态链接器
+ *     已完全就绪，dlsym 可安全调用
  *
- * 缺陷修复 #4: 使用 atomic_flag 确保只初始化一次，防止多线程竞争。
- * 缺陷修复 #26: dlopen 注入时 RTLD_NEXT 失败，显式打开 libc 查找符号。
+ * 线程安全：atomic CAS 确保只初始化一次。
+ * 重入保护：g_raw_resolving 标志防止 dlsym 内部 malloc 导致递归。
  */
-__attribute__((constructor)) static void resolve_raw_allocators(void)
+void mtt_resolve_raw_allocators(void)
 {
+    /* 已解析完成，直接返回 */
+    if (raw_malloc)
+        return;
+
+    /* 递归保护：dlsym 内部可能触发 malloc，此时跳过避免死循环 */
+    if (g_raw_resolving)
+        return;
+
+    /* CAS 确保多线程下只初始化一次 */
     int expected = 0;
     if (!atomic_compare_exchange_strong(&g_raw_resolved, &expected, 1))
         return;
 
-    raw_malloc = (raw_malloc_fn)dlsym(RTLD_NEXT, "malloc");
-    raw_free   = (raw_free_fn)dlsym(RTLD_NEXT, "free");
-    raw_calloc = (raw_calloc_fn)dlsym(RTLD_NEXT, "calloc");
+    g_raw_resolving = 1;
+
+    /* 先预设 bootstrap 分配器：dlsym 内部若触发 malloc，
+     * 重入我们的 hook 时 raw_* 至少不会为 NULL，避免空指针崩溃 */
+    raw_malloc = bootstrap_malloc;
+    raw_free   = bootstrap_free;
+    raw_calloc = bootstrap_calloc;
+
+    raw_malloc_fn  real_malloc  = (raw_malloc_fn)dlsym(RTLD_NEXT, "malloc");
+    raw_free_fn    real_free    = (raw_free_fn)dlsym(RTLD_NEXT, "free");
+    raw_calloc_fn  real_calloc  = (raw_calloc_fn)dlsym(RTLD_NEXT, "calloc");
+
+    if (real_malloc)  raw_malloc = real_malloc;
+    if (real_free)    raw_free   = real_free;
+    if (real_calloc)  raw_calloc = real_calloc;
 
     /* RTLD_NEXT 失败时显式打开 libc（dlopen/ptrace 注入路径） */
     if (!raw_malloc || !raw_free || !raw_calloc) {
@@ -81,10 +142,12 @@ __attribute__((constructor)) static void resolve_raw_allocators(void)
         }
     }
 
-    /* 最终 fallback */
+    /* 最终 fallback：直接引用 libc 符号（仅在非 LD_PRELOAD 模式有效） */
     if (!raw_malloc) raw_malloc = (raw_malloc_fn)malloc;
     if (!raw_free)   raw_free   = (raw_free_fn)free;
     if (!raw_calloc) raw_calloc = (raw_calloc_fn)calloc;
+
+    g_raw_resolving = 0;
 }
 
 /* ======================================================================== *
@@ -570,6 +633,8 @@ void mtt_install_signal_handler(void)
  */
 void* mtt_malloc(size_t size, const char* file, int line)
 {
+    mtt_resolve_raw_allocators();
+
     /* 0 字节分配按标准放行，不记录 */
     if (size == 0) return raw_malloc(0);
 
@@ -631,6 +696,7 @@ void* mtt_calloc(size_t count, size_t size, const char* file, int line)
  */
 void mtt_free(void* ptr)
 {
+    mtt_resolve_raw_allocators();
     if (!ptr) return;
 
     mtt_ensure_init();
@@ -662,6 +728,7 @@ void mtt_free(void* ptr)
  */
 void* mtt_realloc(void* ptr, size_t size, const char* file, int line)
 {
+    mtt_resolve_raw_allocators();
     if (!ptr)  return mtt_malloc(size, file, line);
     if (!size) { mtt_free(ptr); return NULL; }
 
