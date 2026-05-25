@@ -146,6 +146,9 @@ static mttd_proc_t* find_or_create_proc(int pid, const char* name)
     for (int i = 0; i < g_nprocs; i++) {
         if (g_procs[i].pid == pid) {
             mttd_proc_t* p = &g_procs[i];
+            /* 递减全局计数器：旧泄漏记录即将被释放，需减去计数防止溢出 */
+            atomic_fetch_sub(&g_total_leaks_global,
+                             (size_t)p->leak_count);
             free(p->leaks);
             p->leak_cap = 32;
             p->leaks = malloc(p->leak_cap * sizeof(mttd_leak_t));

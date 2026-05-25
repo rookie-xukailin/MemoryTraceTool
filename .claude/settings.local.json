@@ -2,37 +2,6 @@
   "env": {
     "CLAUDE_CODE_MAX_CONCURRENT_REQUESTS": "2"
   },
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sleep 0.3"
-          }
-        ]
-      },
-      {
-        "matcher": "Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sleep 0.1"
-          }
-        ]
-      },
-      {
-        "matcher": "Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "sleep 0.1"
-          }
-        ]
-      }
-    ]
-  },
   "permissions": {
     "allow": [
       "Bash(make: *)",
@@ -133,7 +102,39 @@
       "Bash(build/demo_macro_daemon *)",
       "Bash(build/test_basic: *)",
       "Bash(build/test_basic *)",
-      "Bash(*)"
+      "Bash(*)",
+      "PowerShell(Get-Command wsl -ErrorAction SilentlyContinue)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sleep 0.3"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sleep 0.1"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sleep 0.1"
+          }
+        ]
+      }
     ]
   }
 }
