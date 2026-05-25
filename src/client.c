@@ -354,11 +354,13 @@ void mtt_client_report_final(void)
 
 static pthread_t g_reporter_thread;
 static volatile int g_reporter_running = 1;
+static atomic_int g_reporter_started = 0;
 
 /** 后台报告线程：每 3 秒向守护进程推送当前泄漏数据 */
 static void* reporter_thread_func(void* arg)
 {
     (void)arg;
+    pthread_detach(pthread_self());
     while (g_reporter_running) {
         sleep(3);
         if (g_reporter_running)
@@ -370,10 +372,16 @@ static void* reporter_thread_func(void* arg)
 /** 启动周期性报告线程（mtt_ensure_init 之后调用） */
 void mtt_start_periodic_report(void)
 {
+    /* 防止多次调用创建重复线程 */
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_reporter_started, &expected, 1))
+        return;
+
     fprintf(stderr, "[mtt-client] mtt_start_periodic_report: starting reporter thread\n");
     int rc = pthread_create(&g_reporter_thread, NULL, reporter_thread_func, NULL);
     if (rc != 0) {
         fprintf(stderr, "[MemoryTraceTool] WARN: pthread_create reporter failed: %s\n", strerror(rc));
+        g_reporter_started = 0;
     }
 
     /* 立即发送 HELLO 注册进程，消除 3 秒延迟导致的"已退出"误显示。

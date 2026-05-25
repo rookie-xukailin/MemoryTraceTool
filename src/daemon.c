@@ -516,7 +516,7 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
                 pthread_mutex_unlock(&ctx->proc->lock);
             }
         }
-        else if (strncmp(line, "BYE", 3) == 0) {
+        else if (strcmp(line, "BYE") == 0) {
             if (ctx->proc) {
                 fprintf(stderr, "[mttd] BYE pid=%d name=%s leak_count=%d\n",
                         ctx->proc->pid, ctx->proc->name, ctx->proc->leak_count);

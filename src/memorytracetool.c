@@ -421,6 +421,10 @@ static void get_proc_comm(char* buf, size_t size)
  */
 void mtt_ensure_init(void)
 {
+    /* 确保 raw_* 函数指针已解析：注入路径（ptrace_remote_call）绕过了
+     * 钩子函数中的 mtt_resolve_raw_allocators() 调用，必须在此补调 */
+    mtt_resolve_raw_allocators();
+
     mtt_state_t* s = &g_state;
 
     /* 快速路径：初始化已完成 */
