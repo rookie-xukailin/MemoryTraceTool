@@ -2587,6 +2587,28 @@ static void handle_api_inject(int fd, int pid)
                  "%s", result.err_msg);
         g_ninjected++;
     }
+
+    /* 注入成功后立即创建被监控进程记录。
+     * 目标进程的首次 malloc 才会触发 mtt_ensure_init → HELLO，
+     * 在此之前 daemon 没有该进程的 proc 条目，不会出现在被监控列表。
+     * 此处提前创建条目，确保注入后进程即时可见。 */
+    if (result.status == INJECT_OK) {
+        char proc_name[256] = {0};
+        char comm_path[64];
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+        FILE* fc = fopen(comm_path, "r");
+        if (fc) {
+            if (fgets(proc_name, sizeof(proc_name), fc)) {
+                size_t cl = strlen(proc_name);
+                while (cl > 0 && (proc_name[cl-1] == '\n' || proc_name[cl-1] == '\r'))
+                    proc_name[--cl] = '\0';
+            }
+            fclose(fc);
+        }
+        if (!proc_name[0]) snprintf(proc_name, sizeof(proc_name), "pid_%d", pid);
+        mttd_proc_t* proc = find_or_create_proc(pid, proc_name);
+        if (proc) proc->active = 1;
+    }
     pthread_mutex_unlock(&g_lock);
 
     char hdr[256];
@@ -2640,6 +2662,162 @@ static void send_api_injected(int fd)
     send_all(fd, buf, pos);
 }
 #endif /* WITHOUT_INJECTOR */
+
+/* ======================================================================== *
+ *                    调试诊断 API（仅 GET，无副操作）                          *
+ * ======================================================================== */
+
+/**
+ * GET /api/debug/state — daemon 整体状态摘要。
+ * 返回进程数、注入数、黑名单数、全局计数器、daemon 自身 PID 等。
+ */
+static void handle_debug_state(int fd)
+{
+    char buf[4096];
+    int pos = 0;
+    int size = (int)sizeof(buf);
+
+    pthread_mutex_lock(&g_lock);
+    int n = snprintf(buf + pos, size - pos,
+        "{"
+        "\"daemon_pid\":%d,"
+        "\"nprocs\":%d,"
+        "\"ninjected\":%d,"
+        "\"nblocked\":%d,"
+        "\"total_leaks_global\":%zu,"
+        "\"blocked_pids\":[",
+        (int)getpid(), g_nprocs, g_ninjected, g_nblocked,
+        atomic_load(&g_total_leaks_global));
+    pos += n;
+
+    for (int i = 0; i < g_nblocked; i++) {
+        n = snprintf(buf + pos, size - pos, "%s%d", i > 0 ? "," : "", g_blocked_pids[i]);
+        pos += n;
+    }
+    n = snprintf(buf + pos, size - pos, "]}");
+    pos += n;
+    pthread_mutex_unlock(&g_lock);
+
+    char hdr[256];
+    int hdrlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+        "Connection: close\r\n\r\n", pos);
+    send_all(fd, hdr, hdrlen);
+    send_all(fd, buf, pos);
+}
+
+/**
+ * GET /api/debug/procs — 所有被监控进程的完整数据。
+ * 包含每个进程的锁状态、计数器和堆内存字段。
+ */
+static void handle_debug_procs(int fd)
+{
+    char buf[131072];
+    int pos = 0;
+    int size = (int)sizeof(buf);
+
+    pthread_mutex_lock(&g_lock);
+    pos += snprintf(buf + pos, size - pos,
+        "{\"nprocs\":%d,\"procs\":[", g_nprocs);
+    for (int i = 0; i < g_nprocs; i++) {
+        mttd_proc_t* p = &g_procs[i];
+        pthread_mutex_lock(&p->lock);
+        pos += snprintf(buf + pos, size - pos,
+            "%s{\"pid\":%d,\"name\":\"%s\",\"active\":%d,"
+            "\"leak_count\":%d,\"leak_cap\":%d,\"total_leaked\":%zu,"
+            "\"heap_rss_kb\":%zu,\"current_bytes\":%zu,"
+            "\"alloc_count\":%zu,\"free_count\":%zu,"
+            "\"last_seen\":%ld,\"dirty\":%d}",
+            i > 0 ? "," : "",
+            p->pid, p->name, p->active,
+            p->leak_count, p->leak_cap, p->total_leaked,
+            p->heap_rss_kb, p->current_bytes,
+            p->alloc_count, p->free_count,
+            (long)p->last_seen, p->dirty);
+        pthread_mutex_unlock(&p->lock);
+    }
+    pos += snprintf(buf + pos, size - pos, "]}");
+    pthread_mutex_unlock(&g_lock);
+
+    char hdr[256];
+    int hdrlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+        "Connection: close\r\n\r\n", pos);
+    send_all(fd, hdr, hdrlen);
+    send_all(fd, buf, pos);
+}
+
+/**
+ * GET /api/debug/injected — 所有注入记录的完整数据。
+ * 包含注入状态、基址、GOT 修补数、错误信息。
+ */
+static void handle_debug_injected(int fd)
+{
+#ifndef WITHOUT_INJECTOR
+    char buf[65536];
+    int pos = 0;
+    int size = (int)sizeof(buf);
+
+    pthread_mutex_lock(&g_lock);
+    pos += snprintf(buf + pos, size - pos,
+        "{\"ninjected\":%d,\"injected\":[", g_ninjected);
+    for (int i = 0; i < g_ninjected; i++) {
+        mttd_injected_t* inj = &g_injected[i];
+        pos += snprintf(buf + pos, size - pos,
+            "%s{\"pid\":%d,\"status\":%d,\"lib_base\":\"0x%lx\","
+            "\"patched\":%d,\"time\":%ld,\"error\":\"%s\"}",
+            i > 0 ? "," : "",
+            inj->pid, inj->inject_status, inj->lib_base,
+            inj->patched_count, (long)inj->inject_time, inj->inject_err);
+    }
+    pos += snprintf(buf + pos, size - pos, "]}");
+    pthread_mutex_unlock(&g_lock);
+
+    char hdr[256];
+    int hdrlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+        "Connection: close\r\n\r\n", pos);
+    send_all(fd, hdr, hdrlen);
+    send_all(fd, buf, pos);
+#else
+    const char* resp =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
+        "{\"ninjected\":0,\"injected\":[]}";
+    send_all(fd, resp, strlen(resp));
+#endif
+}
+
+/**
+ * GET /api/debug/blocked — 黑名单 PID 列表。
+ */
+static void handle_debug_blocked(int fd)
+{
+    char buf[4096];
+    int pos = 0;
+    int size = (int)sizeof(buf);
+
+    pthread_mutex_lock(&g_lock);
+    pos += snprintf(buf + pos, size - pos,
+        "{\"nblocked\":%d,\"blocked\":[", g_nblocked);
+    for (int i = 0; i < g_nblocked; i++) {
+        pos += snprintf(buf + pos, size - pos,
+            "%s%d", i > 0 ? "," : "", g_blocked_pids[i]);
+    }
+    pos += snprintf(buf + pos, size - pos, "]}");
+    pthread_mutex_unlock(&g_lock);
+
+    char hdr[256];
+    int hdrlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+        "Connection: close\r\n\r\n", pos);
+    send_all(fd, hdr, hdrlen);
+    send_all(fd, buf, pos);
+}
 
 /**
  * GET /api/reset — 清除所有泄漏历史数据。
@@ -2868,6 +3046,14 @@ static void handle_http(int fd)
             "{\"status\":\"fail\",\"error\":\"injector not compiled (WITHOUT_INJECTOR=1)\"}";
         send_all(fd, noinj_err, strlen(noinj_err));
 #endif
+    } else if (strncmp(buf, "GET /api/debug/state", 20) == 0) {
+        handle_debug_state(fd);
+    } else if (strncmp(buf, "GET /api/debug/procs", 20) == 0) {
+        handle_debug_procs(fd);
+    } else if (strncmp(buf, "GET /api/debug/injected", 23) == 0) {
+        handle_debug_injected(fd);
+    } else if (strncmp(buf, "GET /api/debug/blocked", 22) == 0) {
+        handle_debug_blocked(fd);
     } else if (strncmp(buf, "GET /api/reset", 14) == 0) {
         handle_api_reset(fd);
     } else if (strncmp(buf, "GET /api/clear", 14) == 0) {
