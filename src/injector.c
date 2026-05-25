@@ -245,6 +245,19 @@ static int read_maps(pid_t pid, mem_region_t* regions, int max)
 }
 
 /**
+ * 检查路径是否为 libc.so 或 libc-<version>.so。
+ * 排除 libcap, libcrypt, libcrypto 等以 "libc" 开头的非 libc 库。
+ */
+static int is_libc_path(const char* path)
+{
+    const char* base = strrchr(path, '/');
+    if (base) base++; else base = path;
+    if (strncmp(base, "libc", 4) != 0) return 0;
+    char next = base[4];
+    return (next == '.' || next == '-' || next == '\0');
+}
+
+/**
  * 在 maps 中查找包含指定路径的第一个可执行区域。
  * name_hint=NULL 表示主可执行文件。
  */
@@ -819,11 +832,18 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
         return res;
     }
 
-    const mem_region_t* libc_region = find_region(regions, nregions, "libc", 1);
-    if (!libc_region) libc_region = find_region(regions, nregions, "libc-", 1);
+    /* 查找 libc 可执行区域：用 is_libc_path 精确匹配 libc.so/libc-，
+     * 避免 strstr(...,"libc") 误匹配 libcap, libcrypt, libcrypto 等。 */
+    const mem_region_t* libc_region = NULL;
+    for (int i = 0; i < nregions; i++) {
+        if (is_libc_path(regions[i].path) && strchr(regions[i].perms, 'x')) {
+            libc_region = &regions[i];
+            break;
+        }
+    }
     if (!libc_region) {
         for (int i = 0; i < nregions; i++) {
-            if (strstr(regions[i].path, "libc") && strchr(regions[i].perms, 'x')) {
+            if (is_libc_path(regions[i].path) && strchr(regions[i].perms, 'x')) {
                 libc_region = &regions[i];
                 break;
             }
@@ -844,7 +864,7 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
      * 用可执行区域起始地址计算 target_dlopen 会导致 SIGSEGV。 */
     unsigned long libc_base = libc_region->start;
     for (int i = 0; i < nregions; i++) {
-        if (strstr(regions[i].path, "libc") && regions[i].start < libc_base) {
+        if (is_libc_path(regions[i].path) && regions[i].start < libc_base) {
             libc_base = regions[i].start;
         }
     }
@@ -872,7 +892,7 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
         int nself = read_maps(getpid(), self_regions, MAX_REGIONS);
         for (int i = 0; i < nself; i++) {
             /* 找最低地址的 libc 映射（load bias），ELF 符号偏移以此为基准 */
-            if (strstr(self_regions[i].path, "libc")) {
+            if (is_libc_path(self_regions[i].path)) {
                 if (our_libc_base == 0 || self_regions[i].start < our_libc_base) {
                     our_libc_base = self_regions[i].start;
                 }
