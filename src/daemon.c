@@ -1012,6 +1012,7 @@ static const char* g_dashboard_html =
 "    <button class=\"btn\" id=\"btn-pause\" onclick=\"toggleAuto()\">暂停刷新</button>\n"
 "    <button class=\"btn\" onclick=\"refresh();loadProcs()\">立即刷新</button>\n"
 "    <button class=\"btn warn\" onclick=\"openResetModal()\">重新监控</button>\n"
+    <button class=\"btn warn\" onclick=\"openClearModal()\">清除所有历史数据</button>\n"
 "  </div>\n"
 "</div>\n"
 "\n"
@@ -1194,6 +1195,34 @@ static const char* g_dashboard_html =
 "  }).catch(function(){\n"
 "    toast('请求失败，请重试');\n"
 "    btn.disabled=false;btn.textContent='确认重新监控';\n"
+"  });\n"
+"}\n"
+"\n"
+"/* ===== CLEAR MODAL ===== */\n"
+"function openClearModal(){\n"
+"  document.getElementById('clear-modal-overlay').classList.add('show');\n"
+"  document.getElementById('clear-modal').classList.add('show');\n"
+"}\n"
+"function closeClearModal(){\n"
+"  document.getElementById('clear-modal-overlay').classList.remove('show');\n"
+"  document.getElementById('clear-modal').classList.remove('show');\n"
+"}\n"
+"function confirmClear(){\n"
+"  var btn=document.getElementById('btn-confirm-clear');\n"
+"  btn.disabled=true;btn.textContent='清除中...';\n"
+"  fetch('/api/clear').then(function(r){return r.json()}).then(function(d){\n"
+"    if(d.status==='ok'){\n"
+"      gAllLeaks=[];gHistory={};gPrevLeaked={};gPrevTime=0;gDetailPid=0;gPrevLeakMap={};gPrevLeakTime=0;\n"
+"      gCachedProcs=[];\n"
+"      toast('已清除所有历史数据（含进程列表和持久化文件），刷新中...');\n"
+"      closeClearModal();\n"
+"      refresh();loadProcs();\n"
+"      closeDetail();\n"
+"    }else{toast('清除失败: '+(d.message||'未知错误'))}\n"
+"    btn.disabled=false;btn.textContent='确认清除所有';\n"
+"  }).catch(function(){\n"
+"    toast('请求失败，请重试');\n"
+"    btn.disabled=false;btn.textContent='确认清除所有';\n"
 "  });\n"
 "}\n"
 "\n"
@@ -1822,6 +1851,18 @@ static const char* g_dashboard_html =
 "  <div class=\"modal-actions\">\n"
 "    <button class=\"btn\" onclick=\"closeResetModal()\">取消</button>\n"
 "    <button class=\"btn warn\" id=\"btn-confirm-reset\" onclick=\"confirmReset()\">确认重新监控</button>\n"
+"  </div>\n"
+"</div>\n"
+"\n"
+"<!-- CLEAR ALL CONFIRMATION MODAL -->\n"
+"<div class=\"modal-overlay\" id=\"clear-modal-overlay\" onclick=\"closeClearModal()\"></div>\n"
+"<div class=\"modal-dialog\" id=\"clear-modal\">\n"
+"  <div class=\"modal-icon\">!!</div>\n"
+"  <h3 class=\"modal-title\">确认清除所有历史数据</h3>\n"
+"  <p class=\"modal-body\">此操作将<span class=\"modal-warn\">移除所有进程记录、泄漏数据、注入记录</span>，并<span class=\"modal-warn\">删除磁盘持久化文件</span>。<br>该操作不可撤销，已注入的进程不受影响，下次内存分配时将重新报告。</p>\n"
+"  <div class=\"modal-actions\">\n"
+"    <button class=\"btn\" onclick=\"closeClearModal()\">取消</button>\n"
+"    <button class=\"btn warn\" id=\"btn-confirm-clear\" onclick=\"confirmClear()\">确认清除所有</button>\n"
 "  </div>\n"
 "</div>\n"
 "\n"
@@ -2627,6 +2668,63 @@ static void handle_api_reset(int fd)
 }
 
 /**
+ * 清除所有历史数据（比 reset 更彻底）。
+ *
+ * 操作内容：
+ *   1. 释放所有进程的泄漏数据并销毁互斥锁（包括活跃进程）
+ *   2. 清空进程列表和注入记录
+ *   3. 删除磁盘上所有持久化 JSON 文件
+ *   4. 重置全局计数器
+ */
+static void handle_api_clear(int fd)
+{
+    int cleared_procs = 0;
+    int cleared_injected = 0;
+
+    pthread_mutex_lock(&g_lock);
+
+    /* 释放所有进程（包括活跃进程），销毁互斥锁 */
+    for (int i = 0; i < g_nprocs; i++) {
+        free(g_procs[i].leaks);
+        g_procs[i].leaks = NULL;
+        pthread_mutex_destroy(&g_procs[i].lock);
+        cleared_procs++;
+    }
+    g_nprocs = 0;
+
+    /* 清空注入记录 */
+    cleared_injected = g_ninjected;
+    g_ninjected = 0;
+
+    atomic_store(&g_total_leaks_global, 0);
+    pthread_mutex_unlock(&g_lock);
+
+    /* 删除磁盘上所有持久化 JSON 文件 */
+    const char* logdir = get_log_dir();
+    DIR* d = opendir(logdir);
+    if (d) {
+        struct dirent* de;
+        while ((de = readdir(d))) {
+            if (de->d_name[0] == '.') continue;
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s", logdir, de->d_name);
+            unlink(path);
+        }
+        closedir(d);
+    }
+
+    char resp[512];
+    int n = snprintf(resp, sizeof(resp),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
+        "Connection: close\r\n\r\n"
+        "{\"status\":\"ok\",\"message\":\"cleared %d processes and %d injection records\"}",
+        cleared_procs, cleared_injected);
+    if (n > 0 && n < (int)sizeof(resp))
+        send_all(fd, resp, (size_t)n);
+}
+
+/**
  * 处理 HTTP 请求并路由。
  *
  * 缺陷修复 #8: 添加请求方法验证和基本请求大小限制。
@@ -2638,6 +2736,7 @@ static void handle_api_reset(int fd)
  *   GET /api/inject     → 运行时注入（handle_api_inject）
  *   GET /api/injected   → 注入记录（send_api_injected）
  *   GET /api/reset      → 清除泄漏历史（handle_api_reset）
+ *   GET /api/clear      → 清除所有历史数据含进程列表（handle_api_clear）
  *   其他                → 看板 HTML 页面（g_dashboard_html）
  */
 static void handle_http(int fd)
@@ -2732,6 +2831,8 @@ static void handle_http(int fd)
 #endif
     } else if (strncmp(buf, "GET /api/reset", 14) == 0) {
         handle_api_reset(fd);
+    } else if (strncmp(buf, "GET /api/clear", 14) == 0) {
+        handle_api_clear(fd);
     } else if (strncmp(buf, "GET /api/data", 13) == 0) {
         send_api_data(fd);
     } else {
