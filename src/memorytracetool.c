@@ -50,8 +50,9 @@ raw_calloc_fn raw_calloc = NULL;
 
 /* 原子标志：防止构造函数被多次执行（多线程竞争） */
 static atomic_int g_raw_resolved = 0;
-/* 递归保护标志：dlsym 内部可能触发 malloc，防止 resolve 函数自身递归 */
-static int g_raw_resolving = 0;
+/* 递归保护标志：dlsym 内部可能触发 malloc，防止 resolve 函数自身递归。
+ * 使用 __thread 确保每个线程独立，避免多线程误判。 */
+static __thread int g_raw_resolving = 0;
 
 /* Bootstrap 分配器：静态缓冲区，在 raw_* 解析完成前兜底。
  * dlsym 内部可能调用 malloc（尤其在 ARM 平台上），此时 raw_* 尚未就绪，
@@ -113,19 +114,22 @@ void mtt_resolve_raw_allocators(void)
     if (g_raw_resolving)
         return;
 
+    /* 预先设置 bootstrap 分配器到全局指针：必须在 CAS 之前完成。
+     * 这样即使 CAS 失败的线程也能安全使用 bootstrap_*（非 NULL），
+     * 避免了 CAS 胜者尚未写 raw_* 时，败者线程调用 raw_malloc(NULL) 崩溃。
+     * dlsym 内部若触发 malloc，重入 hook 时 raw_* 至少不会为 NULL。 */
+    raw_malloc = bootstrap_malloc;
+    raw_free   = bootstrap_free;
+    raw_calloc = bootstrap_calloc;
+
     /* CAS 确保多线程下只初始化一次 */
     int expected = 0;
     if (!atomic_compare_exchange_strong(&g_raw_resolved, &expected, 1))
         return;
 
-    fprintf(stderr, "[mtt-core] mtt_resolve_raw_allocators: resolving...\n");
+    static const char resolve_msg[] = "[mtt-core] mtt_resolve_raw_allocators: resolving...\n";
+    write(STDERR_FILENO, resolve_msg, sizeof(resolve_msg) - 1);
     g_raw_resolving = 1;
-
-    /* 先预设 bootstrap 分配器：dlsym 内部若触发 malloc，
-     * 重入我们的 hook 时 raw_* 至少不会为 NULL，避免空指针崩溃 */
-    raw_malloc = bootstrap_malloc;
-    raw_free   = bootstrap_free;
-    raw_calloc = bootstrap_calloc;
 
     raw_malloc_fn  real_malloc  = (raw_malloc_fn)dlsym(RTLD_NEXT, "malloc");
     raw_free_fn    real_free    = (raw_free_fn)dlsym(RTLD_NEXT, "free");
@@ -135,14 +139,16 @@ void mtt_resolve_raw_allocators(void)
     if (real_free)    raw_free   = real_free;
     if (real_calloc)  raw_calloc = real_calloc;
 
-    /* RTLD_NEXT 失败时显式打开 libc（dlopen/ptrace 注入路径） */
+    /* RTLD_NEXT 失败时显式打开 libc（dlopen/ptrace 注入路径）。
+     * 注意：不调用 dlclose(libc_handle) —— 若引用计数为 1，libc.so 可能被卸载，
+     * 导致 raw_* 成为悬空指针。保持句柄打开对进程无害。 */
     if (!raw_malloc || !raw_free || !raw_calloc) {
         void* libc_handle = dlopen("libc.so.6", RTLD_LAZY);
         if (libc_handle) {
             if (!raw_malloc) raw_malloc = (raw_malloc_fn)dlsym(libc_handle, "malloc");
             if (!raw_free)   raw_free   = (raw_free_fn)dlsym(libc_handle, "free");
             if (!raw_calloc) raw_calloc = (raw_calloc_fn)dlsym(libc_handle, "calloc");
-            dlclose(libc_handle);
+            /* 不 dlclose(libc_handle)：避免 raw_* 悬空 */
         }
     }
 
@@ -158,9 +164,15 @@ void mtt_resolve_raw_allocators(void)
         write(STDERR_FILENO, warn_msg, sizeof(warn_msg) - 1);
     }
 
-    fprintf(stderr, "[mtt-core] mtt_resolve_raw_allocators: done "
-            "(raw_malloc=%p raw_free=%p raw_calloc=%p)\n",
-            (void*)raw_malloc, (void*)raw_free, (void*)raw_calloc);
+    {
+        char done_buf[256];
+        int dn = snprintf(done_buf, sizeof(done_buf),
+                "[mtt-core] mtt_resolve_raw_allocators: done "
+                "(raw_malloc=%p raw_free=%p raw_calloc=%p)\n",
+                (void*)raw_malloc, (void*)raw_free, (void*)raw_calloc);
+        if (dn > 0 && dn < (int)sizeof(done_buf))
+            write(STDERR_FILENO, done_buf, (size_t)dn);
+    }
 
     g_raw_resolving = 0;
 }
@@ -191,9 +203,10 @@ static void capture_stack(mtt_entry_t* entry)
         entry->stack_frames = 0;
         return;
     }
+    int saved = g_in_capture;
     g_in_capture = 1;
     entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
-    g_in_capture = 0;
+    g_in_capture = saved; /* restore, not hard-reset to 0: 可能嵌套 */
 }
 
 /* ---- 采样决策 ---- */
