@@ -29,7 +29,28 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
 #include <malloc.h>
+
+/* ---- hook 调用诊断计数器 ----
+ * 每 HOOK_LOG_INTERVAL 次分配输出一次诊断信息到 stderr，
+ * 用于确认 GOT 修补后钩子是否被调用、追踪是否生效。
+ * 使用 write() 而非 fprintf() 避免触发 malloc 递归。 */
+#define HOOK_LOG_INTERVAL 128
+static _Atomic unsigned long g_hook_malloc_calls = 0;
+static _Atomic unsigned long g_hook_free_calls   = 0;
+
+static void hook_diag_tick(void)
+{
+    unsigned long n = atomic_fetch_add(&g_hook_malloc_calls, 1);
+    if ((n % HOOK_LOG_INTERVAL) == (HOOK_LOG_INTERVAL - 1)) {
+        char buf[128];
+        int len = snprintf(buf, sizeof(buf),
+            "[mtt-hook] malloc called %lu times (pid=%d)\n", n + 1, (int)getpid());
+        if (len > 0 && len < (int)sizeof(buf))
+            write(STDERR_FILENO, buf, (size_t)len);
+    }
+}
 
 /**
  * 采样决策的简化版（内联到 hooks.c 中）。
@@ -67,6 +88,7 @@ static inline int hook_is_over_capacity(mtt_state_t* s)
  */
 void* malloc(size_t size)
 {
+    hook_diag_tick();
     mtt_resolve_raw_allocators();
 
     /* 0 字节分配按标准放行 */
