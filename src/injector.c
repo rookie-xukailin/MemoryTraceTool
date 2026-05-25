@@ -176,9 +176,18 @@
   #define BPKT_SIZE         4
   #define BPKT_WRITE(old)   ((unsigned long)BPKT_INSN)
   #define BPKT_ADJUST_PC(r) ((r).uregs[ARM_PC] -= BPKT_SIZE)
-  /* ARM32: 通过 LR (r14) 返回，把 trap_addr 写入 LR */
+  /* ARM32: 通过 LR (r14) 返回，把 trap_addr 写入 LR。
+   * 根据 fn bit[0] 设置 CPSR.T bit——bit[0]=1 为 Thumb，bit[0]=0 为 ARM。
+   * 忽略此位会导致 ARM 指令被当作 Thumb 解码，造成不可预测的 SIGSEGV。 */
   #define REMOTE_CALL_SETUP(rs, fn, a1, a2, rslot, trap) do { \
-      REG_SET_PC(rs, (fn));                                    \
+      unsigned long _fn = (fn);                                \
+      if (_fn & 1) {                                           \
+          REG_SET_PC(rs, _fn & ~1UL);                          \
+          (rs).uregs[ARM_CPSR] |= (1U << 5); /* T=1 Thumb */  \
+      } else {                                                 \
+          REG_SET_PC(rs, _fn);                                 \
+          (rs).uregs[ARM_CPSR] &= ~(1U << 5); /* T=0 ARM */   \
+      }                                                        \
       REG_SET_ARG1(rs, (a1));                                  \
       REG_SET_ARG2(rs, (a2));                                  \
       REG_SET_LR(rs, (trap));                                  \
@@ -188,6 +197,10 @@
 
 /* ptrace 读写单位：PEEKDATA/POKEDATA 的本机字长 */
 #define PTRACE_WORD_SIZE  sizeof(unsigned long)
+
+/* __RTLD_DLOPEN: glibc 内部标志，标识 dlopen 调用来自 libc 内部（而非用户代码）。
+ * 缺少此标志时 _dl_open 可能走错误代码路径，在 ARM32 上触发 SIGSEGV。 */
+#define __RTLD_DLOPEN  0x80000000UL
 
 /* ======================================================================== *
  *                           钩取符号列表                                    *
@@ -835,6 +848,7 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
             libc_base = regions[i].start;
         }
     }
+    fprintf(stderr, "[DEBUG] target libc path: %s\n", libc_region->path);
     fprintf(stderr, "[DEBUG] libc load_bias=0x%lx r-xp=0x%lx-0x%lx trap_addr=0x%lx\n",
             libc_base, libc_region->start, libc_region->end, trap_addr);
 
@@ -867,8 +881,8 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     }
     unsigned long dlopen_offset = (unsigned long)our_dlopen - our_libc_base;
     unsigned long target_dlopen = libc_base + dlopen_offset;
-    fprintf(stderr, "[DEBUG] our_libc=0x%lx dlopen_off=0x%lx target_dlopen=0x%lx\n",
-            our_libc_base, dlopen_offset, target_dlopen);
+    fprintf(stderr, "[DEBUG] our_dlopen=%p our_libc=0x%lx dlopen_off=0x%lx target_dlopen=0x%lx\n",
+            our_dlopen, our_libc_base, dlopen_offset, target_dlopen);
 
     /* ---- Step 4: 在目标栈上写库路径 ---- */
     unsigned long str_addr = REG_SP(saved_regs) - 32768;
@@ -878,6 +892,9 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     str_addr &= ~0x0FUL;
 #endif
 
+    fprintf(stderr, "[DEBUG] orig_sp=0x%lx str_addr=0x%lx abs_lib=%s\n",
+            (unsigned long)REG_SP(saved_regs), str_addr, abs_lib);
+
     size_t path_len = strlen(abs_lib) + 1;
     if (ptrace_write_mem(pid, str_addr, abs_lib, path_len) == -1) {
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
@@ -886,10 +903,10 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
         return res;
     }
 
-    /* ---- Step 5: 远程调用 dlopen ---- */
+    /* ---- Step 5: 远程调用 __libc_dlopen_mode ---- */
     native_regs_t call_regs = saved_regs;
     if (ptrace_remote_call(pid, target_dlopen, str_addr,
-                           (unsigned long)RTLD_LAZY,
+                           (unsigned long)(RTLD_LAZY | __RTLD_DLOPEN),
                            trap_addr, &call_regs) != 0) {
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         set_error(&res, INJECT_ERR_CRASH,
