@@ -342,4 +342,15 @@ void mtt_start_periodic_report(void)
     if (rc != 0) {
         fprintf(stderr, "[MemoryTraceTool] WARN: pthread_create reporter failed: %s\n", strerror(rc));
     }
+
+    /* 立即发送 HELLO 注册进程，消除 3 秒延迟导致的"已退出"误显示。
+     * 仅发送握手消息，不做数据采集，避免与后台报告线程竞争。 */
+    pthread_mutex_lock(&g_sock_lock);
+    int fd = connect_daemon();
+    if (fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+        g_sock_fd = -1;
+    }
+    pthread_mutex_unlock(&g_sock_lock);
 }

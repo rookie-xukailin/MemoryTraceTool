@@ -379,7 +379,16 @@ static void load_persisted(void)
     closedir(d);
 }
 
-/** 检查已监控进程是否仍然存活 */
+/**
+ * 检查已监控进程是否仍然存活。
+ *
+ * 仅在同时满足以下两个条件时才标记进程为"已退出"：
+ *   1. /proc/<pid> 目录不存在（内核确认进程已消失）
+ *   2. 最后一次通信距今超过宽限期（避免 /proc 暂时不可访问导致误判）
+ *
+ * 宽限期设为 10 秒，远大于 HELLO 的 3 秒报告间隔，
+ * 确保活跃进程不会因 /proc 访问问题被误标记为退出。
+ */
 static void check_liveness(void)
 {
     for (int i = 0; i < g_nprocs; i++) {
@@ -387,6 +396,9 @@ static void check_liveness(void)
         char proc_path[64];
         snprintf(proc_path, sizeof(proc_path), "/proc/%d", g_procs[i].pid);
         if (access(proc_path, F_OK) != 0) {
+            /* 宽限期：最后一次通信距今不足 10 秒则暂不标记退出 */
+            time_t now = time(NULL);
+            if (now - g_procs[i].last_seen < 10) continue;
             pthread_mutex_lock(&g_procs[i].lock);
             g_procs[i].active = 0;
             pthread_mutex_unlock(&g_procs[i].lock);
