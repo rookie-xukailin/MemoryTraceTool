@@ -1974,23 +1974,35 @@ static void send_addr2line(int fd, const char* bin, const char* offset)
 
 /* ---- 注入 API 端点 ---- */
 
-/** libmemorytracetool.so 的备选搜索路径（绝对路径兜底） */
+/** libmemorytracetool.so 的搜索路径（按优先级排列） */
 static const char* default_lib_paths[] = {
     "/usr/local/lib/libmemorytracetool.so",
+    "/usr/lib/libmemorytracetool.so",
     NULL
 };
 
-/** 解析出注入库的绝对路径（基于 /proc/self/exe 定位项目树中的 .so） */
+/** 解析出注入库的绝对路径。按优先级搜索：安装路径 → mttd 相对路径。 */
 static int resolve_lib_path(char* out, size_t out_sz)
 {
-    /* 通过 /proc/self/exe 获取 mttd 自身路径，推导 ../lib/libmemorytracetool.so */
+    /* 第一优先级：绝对安装路径 */
+    for (int i = 0; default_lib_paths[i]; i++) {
+        char* resolved = realpath(default_lib_paths[i], NULL);
+        if (resolved) {
+            strncpy(out, resolved, out_sz - 1);
+            out[out_sz - 1] = '\0';
+            free(resolved);
+            return 0;
+        }
+    }
+
+    /* 第二优先级：从 mttd 自身路径推导（开发场景：build/mttd → lib/libmemorytracetool.so） */
     char self_exe[512];
     ssize_t n = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
     if (n > 0) {
         self_exe[n] = '\0';
         char* slash = strrchr(self_exe, '/');
         if (slash) {
-            *slash = '\0';                              /* self_exe 现在是 build/ 目录 */
+            *slash = '\0';
             char rel[640];
             snprintf(rel, sizeof(rel), "%s/../lib/libmemorytracetool.so", self_exe);
             char* resolved = realpath(rel, NULL);
@@ -2000,17 +2012,6 @@ static int resolve_lib_path(char* out, size_t out_sz)
                 free(resolved);
                 return 0;
             }
-        }
-    }
-
-    /* 兜底：绝对路径安装 */
-    for (int i = 0; default_lib_paths[i]; i++) {
-        char* resolved = realpath(default_lib_paths[i], NULL);
-        if (resolved) {
-            strncpy(out, resolved, out_sz - 1);
-            out[out_sz - 1] = '\0';
-            free(resolved);
-            return 0;
         }
     }
     return -1;
