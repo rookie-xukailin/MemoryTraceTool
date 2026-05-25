@@ -81,6 +81,17 @@ static void block_pid(int pid)
     g_blocked_pids[g_nblocked++] = pid;
 }
 
+/** 从黑名单中移除 PID（重新注入时调用） */
+static void unblock_pid(int pid)
+{
+    for (int i = 0; i < g_nblocked; i++) {
+        if (g_blocked_pids[i] == pid) {
+            g_blocked_pids[i] = g_blocked_pids[--g_nblocked];
+            return;
+        }
+    }
+}
+
 /* ---- 辅助函数 ---- */
 
 /**
@@ -2593,6 +2604,8 @@ static void handle_api_inject(int fd, int pid)
      * 在此之前 daemon 没有该进程的 proc 条目，不会出现在被监控列表。
      * 此处提前创建条目，确保注入后进程即时可见。 */
     if (result.status == INJECT_OK) {
+        /* 重新注入时从黑名单移除，否则目标进程的 HELLO 会被拦截 */
+        unblock_pid(pid);
         char proc_name[256] = {0};
         char comm_path[64];
         snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
