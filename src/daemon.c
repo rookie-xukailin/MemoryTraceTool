@@ -470,6 +470,18 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
                 pthread_mutex_unlock(&g_lock);
             }
         }
+        else if (strncmp(line, "STAT ", 5) == 0 && ctx->proc) {
+            size_t cur_bytes = 0, allocs = 0, frees = 0, vm_rss = 0;
+            if (sscanf(line, "STAT %zu %zu %zu %zu",
+                       &cur_bytes, &allocs, &frees, &vm_rss) >= 1) {
+                pthread_mutex_lock(&ctx->proc->lock);
+                ctx->proc->current_bytes = cur_bytes;
+                ctx->proc->alloc_count   = allocs;
+                ctx->proc->free_count    = frees;
+                ctx->proc->heap_rss_kb   = vm_rss;
+                pthread_mutex_unlock(&ctx->proc->lock);
+            }
+        }
         else if (strncmp(line, "LEAK ", 5) == 0 && ctx->proc) {
             mttd_leak_t leak;
             memset(&leak, 0, sizeof(leak));
@@ -1162,14 +1174,15 @@ static const char* g_dashboard_html =
 "      var p=d.procs[i];\n"
 "      curTotal+=p.total_leaked;\n"
 "      if(!gHistory[p.pid])gHistory[p.pid]=[];\n"
-"      gHistory[p.pid].push({t:now,bytes:p.total_leaked});\n"
+"      /* chart 纵轴用 current_bytes（追踪未释放）和 heap_rss（进程堆RSS）双指标 */\n"
+"      gHistory[p.pid].push({t:now,bytes:p.current_bytes||0,heap:p.heap_rss_kb||0});\n"
 "      if(gHistory[p.pid].length>600)gHistory[p.pid].shift();\n"
 "    }\n"
 "    /* store snapshot for rate calc */\n"
 "    gPrevLeaked={};gPrevTime=now;\n"
 "    for(var i=0;i<d.procs.length;i++){\n"
 "      var p=d.procs[i];\n"
-"      gPrevLeaked[p.pid]=p.total_leaked;\n"
+"      gPrevLeaked[p.pid]=p.current_bytes||0;\n"
 "    }\n"
 "\n"
 "    /* monitored table */\n"
@@ -1179,9 +1192,17 @@ static const char* g_dashboard_html =
 "      var badge=p.active?'<span class=\"badge badge-live\">运行中</span>':'<span class=\"badge badge-gone\">已退出</span>';\n"
 "      var seen=p.last_seen?new Date(p.last_seen*1000).toLocaleTimeString():'--';\n"
 "      var hot=computeHotFunc(p.leaks);\n"
+"      var rateBytes='--';\n"
+"      if(gPrevLeaked&&gPrevLeaked[p.pid]!==undefined&&p.current_bytes!==undefined){\n"
+"        rateBytes=fmtBytes(Math.max(0,p.current_bytes-gPrevLeaked[p.pid]));\n"
+"        if(p.current_bytes>=gPrevLeaked[p.pid])rateBytes='+'+rateBytes;\n"
+"      }\n"
+"      var heapMB=(p.heap_rss_kb||0)>=1024?((p.heap_rss_kb||0)/1024).toFixed(1)+'MB':(p.heap_rss_kb||0)+'KB';\n"
+"      var curFmt=fmtBytes(p.current_bytes||0);\n"
 "      rows+='<tr class=\"clickable\" onclick=\"openDetail('+p.pid+')\">'+\n"
 "        '<td>'+p.pid+'</td><td style=\"font-family:var(--font)\">'+esc(p.name)+'</td><td>'+badge+'</td>'+\n"
 "        '<td>'+p.leak_count+'</td><td>'+fmtBytes(p.total_leaked)+'</td>'+\n"
+"        '<td><span title=\"当前堆RSS: '+heapMB+' | 追踪未释放: '+curFmt+'\">'+curFmt+'</span></td>'+\n"
 "        '<td style=\"font-family:var(--font);font-size:12px;max-width:140px;overflow:hidden;text-overflow:ellipsis\" title=\"'+escAttr(hot)+'\">'+esc(hot)+'</td>'+\n"
 "        '<td style=\"font-size:11px;color:var(--text3)\">'+seen+'</td></tr>';\n"
 "    }\n"
@@ -1394,17 +1415,20 @@ static const char* g_dashboard_html =
 "  gLastDetailSig=sig;\n"
 "\n"
 "  document.getElementById('dtl-title').textContent=proc.name+' (PID '+pid+')';\n"
-"  var rate=proc.total_leaked>0&&gPrevTime>0?'+'+fmtBytes(proc.total_leaked-(gPrevLeaked[proc.pid]||0))+'/轮':'--';\n"
+"  var rate=proc.current_bytes>0&&gPrevTime>0?'+'+fmtBytes(Math.max(0,proc.current_bytes-(gPrevLeaked[proc.pid]||0)))+'/轮':'--';\n"
+"  var heapMB=proc.heap_rss_kb>=1024?((proc.heap_rss_kb)/1024).toFixed(1)+'MB':(proc.heap_rss_kb||0)+'KB';\n"
 "\n"
 "  var body='<div class=\"detail-stats\">'+\n"
-"      '<div class=\"ds\"><div class=\"ds-val\">'+fmtBytes(proc.total_leaked)+'</div><div class=\"ds-label\">泄漏字节</div></div>'+\n"
+"      '<div class=\"ds\"><div class=\"ds-val\">'+heapMB+'</div><div class=\"ds-label\">进程堆RSS</div></div>'+\n"
+"      '<div class=\"ds\"><div class=\"ds-val\">'+fmtBytes(proc.current_bytes||0)+'</div><div class=\"ds-label\">追踪未释放</div></div>'+\n"
 "      '<div class=\"ds\"><div class=\"ds-val\">'+proc.leak_count+'</div><div class=\"ds-label\">泄漏次数</div></div>'+\n"
+"      '<div class=\"ds\"><div class=\"ds-val\">'+fmtBytes(proc.total_leaked)+'</div><div class=\"ds-label\">累计泄漏</div></div>'+\n"
 "      '<div class=\"ds\"><div class=\"ds-val\">'+rate+'</div><div class=\"ds-label\">增速/轮</div></div>'+\n"
 "      '<div class=\"ds\"><div class=\"ds-val\">'+(proc.active?'运行中':'已退出')+'</div><div class=\"ds-label\">状态</div></div>'+\n"
 "      '</div>';\n"
 "\n"
 "    /* chart */\n"
-"    body+='<div class=\"chart-wrap\"><canvas id=\"chart\" width=\"620\" height=\"240\"></canvas><div class=\"chart-tip\"><button class=\"chart-zoom-btn\" onclick=\"chartZoomIn()\">-</button><span>'+chartZoom+'x</span><button class=\"chart-zoom-btn\" onclick=\"chartZoomOut()\">+</button><button class=\"chart-zoom-btn\" onclick=\"chartZoomReset()\">&#8634;</button><span style=\"margin-left:8px\">滚轮缩放 · 拖拽平移 · 悬停查看数值</span></div></div>';\n"
+"    body+='<div class=\"chart-wrap\"><canvas id=\"chart\" width=\"620\" height=\"240\"></canvas><div class=\"chart-tip\"><button id=\"chart-metric\" class=\"chart-zoom-btn\" onclick=\"toggleChartMetric()\" title=\"切换图表指标\" style=\"font-size:10px;padding:2px 8px\">进程堆RSS</button><button class=\"chart-zoom-btn\" onclick=\"chartZoomIn()\">-</button><span>'+chartZoom+'x</span><button class=\"chart-zoom-btn\" onclick=\"chartZoomOut()\">+</button><button class=\"chart-zoom-btn\" onclick=\"chartZoomReset()\">&#8634;</button><span style=\"margin-left:8px\">滚轮缩放 · 拖拽平移 · 悬停查看数值</span></div></div>';\n"
 "\n"
 "    /* leak details for this process */\n"
 "    var leakMap={};\n"
@@ -1452,6 +1476,12 @@ static const char* g_dashboard_html =
 "\n"
 "/* ===== CANVAS CHART ===== */\n"
 "var chartZoom=1,chartPan=0,chartDragging=false,chartDragStart=0,chartPanStart=0;\n"
+"var gChartMetric='heap'; /* heap=进程RSS | tracked=追踪未释放 */\n"
+"function toggleChartMetric(){\n"
+"  gChartMetric=gChartMetric==='heap'?'tracked':'heap';\n"
+"  var el=document.getElementById('chart-metric');if(el)el.textContent=gChartMetric==='heap'?'进程堆RSS':'追踪未释放';\n"
+"  var c=document.getElementById('chart');if(c&&c._data)drawChart(c._data);\n"
+"}\n"
 "function chartZoomIn(){if(chartZoom<32){chartZoom=Math.min(32,chartZoom*2);chartPan=Math.max(0,chartPan-2)};var c=document.getElementById('chart');if(c&&c._data)drawChart(c._data)}\n"
 "function chartZoomOut(){if(chartZoom>1){chartZoom=Math.max(1,Math.floor(chartZoom/2));chartPan=0};var c=document.getElementById('chart');if(c&&c._data)drawChart(c._data)}\n"
 "function chartZoomReset(){chartZoom=1;chartPan=0;var c=document.getElementById('chart');if(c&&c._data)drawChart(c._data)}\n"
@@ -1472,8 +1502,11 @@ static const char* g_dashboard_html =
 "  var vis=data.slice(startIdx,endIdx+1);\n"
 "  if(vis.length<2)return;\n"
 "\n"
+"  /* 选择主指标: heap(进程RSS) vs bytes(追踪未释放) */\n"
+"  var metric=gChartMetric||'heap';\n"
+"  var vals=vis.map(function(v){return metric==='heap'?(v.heap||0)*1024:(v.bytes||0)});\n"
 "  var minB=Infinity,maxB=-Infinity;\n"
-"  for(var i=0;i<vis.length;i++){minB=Math.min(minB,vis[i].bytes);maxB=Math.max(maxB,vis[i].bytes)}\n"
+"  for(var i=0;i<vals.length;i++){minB=Math.min(minB,vals[i]);maxB=Math.max(maxB,vals[i])}\n"
 "  if(maxB===minB)maxB=minB+1;\n"
 "\n"
 "  /* grid & axes */\n"
@@ -1516,19 +1549,19 @@ static const char* g_dashboard_html =
 "  /* area fill */\n"
 "  ctx.beginPath();\n"
 "  for(var i=0;i<vis.length;i++){\n"
-"    var sx=pad.l+(pw/(vis.length-1))*i,sy=pad.t+ph-((vis[i].bytes-minB)/(maxB-minB))*ph;\n"
+"    var sx=pad.l+(pw/(vis.length-1))*i,sy=pad.t+ph-((vals[i]-minB)/(maxB-minB))*ph;\n"
 "    if(i===0)ctx.moveTo(sx,sy);else ctx.lineTo(sx,sy);\n"
 "  }\n"
 "  ctx.lineTo(pad.l+(pw/(vis.length-1))*(vis.length-1),pad.t+ph);\n"
 "  ctx.lineTo(pad.l,pad.t+ph);ctx.closePath();\n"
 "  var grad=ctx.createLinearGradient(0,pad.t,0,pad.t+ph);\n"
-"  grad.addColorStop(0,'rgba(0,212,255,.15)');grad.addColorStop(1,'rgba(0,212,255,0)');\n"
+"  grad.addColorStop(0,metric==='heap'?'rgba(0,212,255,.15)':'rgba(255,184,0,.15)');grad.addColorStop(1,'rgba(0,212,255,0)');\n"
 "  ctx.fillStyle=grad;ctx.fill();\n"
 "\n"
 "  /* line */\n"
-"  ctx.beginPath();ctx.strokeStyle='#00d4ff';ctx.lineWidth=1.5;ctx.lineJoin='round';\n"
+"  ctx.beginPath();ctx.strokeStyle=metric==='heap'?'#00d4ff':'#ffb800';ctx.lineWidth=1.5;ctx.lineJoin='round';\n"
 "  for(var i=0;i<vis.length;i++){\n"
-"    var sx=pad.l+(pw/(vis.length-1))*i,sy=pad.t+ph-((vis[i].bytes-minB)/(maxB-minB))*ph;\n"
+"    var sx=pad.l+(pw/(vis.length-1))*i,sy=pad.t+ph-((vals[i]-minB)/(maxB-minB))*ph;\n"
 "    if(i===0)ctx.moveTo(sx,sy);else ctx.lineTo(sx,sy);\n"
 "  }\n"
 "  ctx.stroke();\n"
@@ -1826,10 +1859,14 @@ static void send_api_data(int fd)
         truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE,
             "%s{\"pid\":%d,\"name\":\"%s\",\"active\":%s,"
             "\"leak_count\":%d,\"total_leaked\":%zu,"
+            "\"heap_rss_kb\":%zu,\"current_bytes\":%zu,"
+            "\"alloc_count\":%zu,\"free_count\":%zu,"
             "\"last_seen\":%ld,\"top_stack\":\"",
             i > 0 ? "," : "", p->pid, escaped,
             p->active ? "true" : "false",
             p->leak_count, p->total_leaked,
+            p->heap_rss_kb, p->current_bytes,
+            p->alloc_count, p->free_count,
             (long)p->last_seen) == 0);
         json_escape(escaped, top_stack, sizeof(escaped));
         truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE, "%s", escaped) == 0);

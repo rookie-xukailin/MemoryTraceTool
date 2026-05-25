@@ -47,6 +47,12 @@ typedef struct {
     int     leak_cap;                        /* leaks 数组容量 */
     time_t  last_seen;                       /* 最后一次收到报告的时间戳 */
 
+    /* 堆内存追踪（来自 STAT 消息，由客户端周期性上报） */
+    size_t  heap_rss_kb;                     /* 进程 RSS（/proc/pid/status VmRSS） */
+    size_t  current_bytes;                   /* 追踪器记录的当前未释放字节数 */
+    size_t  alloc_count;                     /* 累计分配次数 */
+    size_t  free_count;                      /* 累计释放次数 */
+
     mttd_leak_t* leaks;                      /* 动态分配的泄漏记录数组 */
     int     dirty;                           /* 有新泄漏未持久化到磁盘 */
 

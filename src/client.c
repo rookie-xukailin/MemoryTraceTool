@@ -247,6 +247,33 @@ static void do_client_report(int is_final)
     int fd = connect_daemon();
     if (fd < 0) { pthread_mutex_unlock(&g_sock_lock); return; }
 
+    /* 发送 STAT 消息：上报当前进程堆内存状态到 daemon，用于看板 chart 时序展示 */
+    {
+        size_t vm_rss = 0;
+        char stat_path[64];
+        snprintf(stat_path, sizeof(stat_path), "/proc/%d/status", getpid());
+        FILE* sf = fopen(stat_path, "r");
+        if (sf) {
+            char lbuf[256];
+            while (fgets(lbuf, sizeof(lbuf), sf)) {
+                if (strncmp(lbuf, "VmRSS:", 6) == 0) {
+                    vm_rss = strtoul(lbuf + 6, NULL, 10);
+                    break;
+                }
+            }
+            fclose(sf);
+        }
+        size_t cur_bytes = atomic_load(&s->current_bytes);
+        size_t allocs    = atomic_load(&s->alloc_count);
+        size_t frees     = atomic_load(&s->free_count);
+
+        char stat_line[256];
+        int sn = snprintf(stat_line, sizeof(stat_line),
+            "STAT %zu %zu %zu %zu\n", cur_bytes, allocs, frees, vm_rss);
+        if (sn > 0 && sn < (int)sizeof(stat_line))
+            send_all(fd, stat_line, (size_t)sn);
+    }
+
     /* 收集快照（逐锁遍历，持锁期间拷贝字段，避免 UAF） */
     int nleaks = 0;
     mtt_entry_snap_t* snaps = raw_malloc(MTT_MAX_LEAKS_PER_PROC * sizeof(mtt_entry_snap_t));
