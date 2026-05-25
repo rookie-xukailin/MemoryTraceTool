@@ -1591,7 +1591,7 @@ static const char* g_dashboard_html =
 "      ctx.fillStyle='rgba(17,22,34,.9)';ctx.fillRect(cx-tw/2-6,cy-16,tw+12,22);\n"
 "      ctx.fillStyle='#e4e7ec';ctx.font=\"11px 'Courier New','Liberation Mono','Consolas',monospace\";ctx.textAlign='center';\n"
 "      ctx.fillText(d.toLocaleTimeString()+'  '+fmtBytes(vis[idx].bytes),cx,cy-2);\n"
-"    })});\n"
+"    });\n"
 "  });\n"
 "})();\n"
 "\n"
