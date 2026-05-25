@@ -1,6 +1,6 @@
 CROSS_COMPILE ?=
 CC       = $(if $(CROSS_COMPILE),$(CROSS_COMPILE)gcc,gcc)
-WITHOUT_INJECTOR = $(if $(CROSS_COMPILE),1,0)
+WITHOUT_INJECTOR ?= 0
 CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables
 CFLAGS_NOPIC = -Wall -Wextra -g -O1 -funwind-tables
 LDFLAGS  = -lpthread -ldl

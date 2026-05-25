@@ -2592,7 +2592,7 @@ static void handle_http(int fd)
         const char* noinj_err =
             "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
             "Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
-            "{\"status\":\"fail\",\"error\":\"injector not compiled (non-x86_64 target)\"}";
+            "{\"status\":\"fail\",\"error\":\"injector not compiled (WITHOUT_INJECTOR=1)\"}";
         send_all(fd, noinj_err, strlen(noinj_err));
 #endif
     } else if (strncmp(buf, "GET /api/reset", 14) == 0) {

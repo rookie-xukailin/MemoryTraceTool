@@ -3,12 +3,13 @@
  *
  * 将 libmemorytracetool.so 注入到正在运行的进程中：
  *   1. ptrace ATTACH 暂停目标进程
- *   2. 在目标进程中远程调用 __libc_dlopen_mode 加载我们的 .so
- *   3. 解析目标 ELF64 的 .rela.plt 找到 malloc/free/calloc/realloc 的 GOT 表项
+ *   2. 在目标进程中远程调用 dlopen 加载我们的 .so
+ *   3. 解析目标 ELF 的 PLT 重定位表找到 malloc/free/calloc/realloc 的 GOT 表项
  *   4. 将 GOT 表项改写为我们的钩子函数地址
  *   5. 恢复寄存器并 DETACH
  *
- * 仅支持 x86_64 Linux，依赖 ELF64 格式和 ptrace 系统调用。
+ * 支持架构：x86_64 / ARM32 (EABI) / AArch64。
+ * 通过预处理器宏在编译时自适应选择 ELF 类型、寄存器布局和调用约定。
  */
 #define _GNU_SOURCE
 #include "injector.h"
@@ -28,7 +29,170 @@
 #include <sys/user.h>
 #include <sys/types.h>
 
-/* 钩取的符号名列表 */
+/* ======================================================================== *
+ *                    架构自适应抽象层                                        *
+ * ======================================================================== */
+
+/* ---- 架构检测 ---- */
+#if defined(__x86_64__)
+  #define MTT_ARCH_X86_64  1
+  #define MTT_ARCH_NAME    "x86_64"
+#elif defined(__aarch64__)
+  #define MTT_ARCH_AARCH64 1
+  #define MTT_ARCH_NAME    "aarch64"
+#elif defined(__arm__)
+  #define MTT_ARCH_ARM     1
+  #define MTT_ARCH_NAME    "arm"
+#else
+  #error "Unsupported architecture for runtime injection"
+#endif
+
+/* ---- ELF 原生类型（32 位 vs 64 位） ---- */
+#if MTT_ARCH_ARM
+  /* 32-bit ARM：使用 Elf32 类型，PLT 重定位用 Elf32_Rel（无 r_addend） */
+  typedef Elf32_Ehdr  Elf_Native_Ehdr;
+  typedef Elf32_Shdr  Elf_Native_Shdr;
+  typedef Elf32_Phdr  Elf_Native_Phdr;
+  typedef Elf32_Sym   Elf_Native_Sym;
+  typedef Elf32_Dyn   Elf_Native_Dyn;
+  typedef Elf32_Addr  Elf_Native_Addr;
+  typedef Elf32_Off   Elf_Native_Off;
+  typedef Elf32_Word  Elf_Native_Xword;
+  typedef Elf32_Rel   Elf_Native_Rela;   /* ARM JUMP_SLOT 用 Rel，非 Rela */
+  #define ELF_NATIVE_R_SYM      ELF32_R_SYM
+  #define ELF_NATIVE_R_TYPE     ELF32_R_TYPE
+  #define ELF_NATIVE_ST_TYPE    ELF32_ST_TYPE
+  #define ELF_NATIVE_JUMP_SLOT  R_ARM_JUMP_SLOT
+  #define ELF_NATIVE_CLASS      ELFCLASS32
+#else
+  /* 64-bit（x86_64 / AArch64）：使用 Elf64 类型 */
+  typedef Elf64_Ehdr  Elf_Native_Ehdr;
+  typedef Elf64_Shdr  Elf_Native_Shdr;
+  typedef Elf64_Phdr  Elf_Native_Phdr;
+  typedef Elf64_Sym   Elf_Native_Sym;
+  typedef Elf64_Dyn   Elf_Native_Dyn;
+  typedef Elf64_Addr  Elf_Native_Addr;
+  typedef Elf64_Off   Elf_Native_Off;
+  typedef Elf64_Xword Elf_Native_Xword;
+  typedef Elf64_Rela  Elf_Native_Rela;   /* x86_64/AArch64 JUMP_SLOT 用 Rela */
+  #define ELF_NATIVE_R_SYM      ELF64_R_SYM
+  #define ELF_NATIVE_R_TYPE     ELF64_R_TYPE
+  #define ELF_NATIVE_ST_TYPE    ELF64_ST_TYPE
+  #if MTT_ARCH_AARCH64
+    #define ELF_NATIVE_JUMP_SLOT  R_AARCH64_JUMP_SLOT
+  #else
+    #define ELF_NATIVE_JUMP_SLOT  R_X86_64_JUMP_SLOT
+  #endif
+  #define ELF_NATIVE_CLASS      ELFCLASS64
+#endif
+
+/* ---- ptrace 寄存器结构和寄存器访问 ---- */
+#if MTT_ARCH_X86_64
+  /* x86_64: struct user_regs_struct，通过 rip/rsp/rax/rdi/rsi 访问 */
+  typedef struct user_regs_struct native_regs_t;
+  #define REG_PC(r)        ((r).rip)
+  #define REG_SP(r)        ((r).rsp)
+  #define REG_RET(r)       ((r).rax)
+  #define REG_ARG1(r)      ((r).rdi)
+  #define REG_ARG2(r)      ((r).rsi)
+  #define REG_SET_PC(r,v)  ((r).rip = (v))
+  #define REG_SET_SP(r,v)  ((r).rsp = (v))
+  #define REG_SET_ARG1(r,v) ((r).rdi = (v))
+  #define REG_SET_ARG2(r,v) ((r).rsi = (v))
+  #define REG_SET_RET(r,v)  ((r).rax = (v))
+  #define REG_SYSCALL_NO(r)  ((r).orig_rax)
+  #define REGS_GET(pid, r)   ptrace(PTRACE_GETREGS, (pid), NULL, &(r))
+  #define REGS_SET(pid, r)   ptrace(PTRACE_SETREGS, (pid), NULL, &(r))
+  /* INT3 单字节，通过掩码嵌入 8 字节 PEEKDATA 的低 byte */
+  #define BPKT_INSN         0xCC
+  #define BPKT_SIZE         1
+  #define BPKT_WRITE(old)   (((unsigned long)(old) & ~0xFFUL) | BPKT_INSN)
+  #define BPKT_ADJUST_PC(r) ((r).rip -= BPKT_SIZE)
+  /* x86_64: 模拟 CALL 压栈 → 返回地址在栈顶 */
+  #define REMOTE_CALL_SETUP(rs, fn, a1, a2, rslot, trap) do { \
+      REG_SET_PC(rs, (fn));                                    \
+      REG_SET_ARG1(rs, (a1));                                  \
+      REG_SET_ARG2(rs, (a2));                                  \
+      REG_SET_SP(rs, (rslot));                                 \
+      REG_SYSCALL_NO(rs) = (unsigned long)-1;                  \
+  } while(0)
+
+#elif MTT_ARCH_AARCH64
+  /* AArch64: struct user_regs_struct，通过 regs[0..30]/sp/pc/pstate 访问 */
+  typedef struct user_regs_struct native_regs_t;
+  #define REG_PC(r)        ((r).pc)
+  #define REG_SP(r)        ((r).sp)
+  #define REG_RET(r)       ((r).regs[0])
+  #define REG_ARG1(r)      ((r).regs[0])
+  #define REG_ARG2(r)      ((r).regs[1])
+  #define REG_SET_PC(r,v)  ((r).pc = (v))
+  #define REG_SET_SP(r,v)  ((r).sp = (v))
+  #define REG_SET_ARG1(r,v) ((r).regs[0] = (v))
+  #define REG_SET_ARG2(r,v) ((r).regs[1] = (v))
+  #define REG_SET_RET(r,v)  ((r).regs[0] = (v))
+  #define REG_SYSCALL_NO(r) ((r).regs[8])  /* x8 = syscall 编号 */
+  #define REG_SET_LR(r,v)  ((r).regs[30] = (v))
+  #define REGS_GET(pid, r)  ptrace(PTRACE_GETREGS, (pid), NULL, &(r))
+  #define REGS_SET(pid, r)  ptrace(PTRACE_SETREGS, (pid), NULL, &(r))
+  /* BRK #0 = 0xd4200000，4 字节 */
+  #define BPKT_INSN         0xd4200000UL
+  #define BPKT_SIZE         4
+  #define BPKT_WRITE(old)   (((unsigned long)(old) & ~0xFFFFFFFFUL) | BPKT_INSN)
+  #define BPKT_ADJUST_PC(r) ((r).pc -= BPKT_SIZE)
+  /* AArch64: 通过 LR (x30) 返回，把 trap_addr 写入 LR */
+  #define REMOTE_CALL_SETUP(rs, fn, a1, a2, rslot, trap) do { \
+      REG_SET_PC(rs, (fn));                                    \
+      REG_SET_ARG1(rs, (a1));                                  \
+      REG_SET_ARG2(rs, (a2));                                  \
+      REG_SET_LR(rs, (trap));                                  \
+      REG_SET_SP(rs, (rslot));                                 \
+  } while(0)
+
+#elif MTT_ARCH_ARM
+  /* ARM32: struct user_regs，通过 uregs[0..17] 数组访问 */
+  typedef struct user_regs native_regs_t;
+  #define ARM_R0   0
+  #define ARM_R1   1
+  #define ARM_SP  13
+  #define ARM_LR  14
+  #define ARM_PC  15
+  #define ARM_CPSR 16
+  #define REG_PC(r)        ((r).uregs[ARM_PC])
+  #define REG_SP(r)        ((r).uregs[ARM_SP])
+  #define REG_RET(r)       ((r).uregs[ARM_R0])
+  #define REG_ARG1(r)      ((r).uregs[ARM_R0])
+  #define REG_ARG2(r)      ((r).uregs[ARM_R1])
+  #define REG_SET_PC(r,v)  ((r).uregs[ARM_PC] = (v))
+  #define REG_SET_SP(r,v)  ((r).uregs[ARM_SP] = (v))
+  #define REG_SET_ARG1(r,v) ((r).uregs[ARM_R0] = (v))
+  #define REG_SET_ARG2(r,v) ((r).uregs[ARM_R1] = (v))
+  #define REG_SET_RET(r,v)  ((r).uregs[ARM_R0] = (v))
+  #define REG_SET_LR(r,v)  ((r).uregs[ARM_LR] = (v))
+  #define REG_SYSCALL_NO(r) ((r).uregs[17])  /* ARM_ORIG_r0 */
+  #define REGS_GET(pid, r)  ptrace(PTRACE_GETREGS, (pid), NULL, &(r))
+  #define REGS_SET(pid, r)  ptrace(PTRACE_SETREGS, (pid), NULL, &(r))
+  /* BKPT #0 (ARM mode) = 0xe7f001f0，4 字节 */
+  #define BPKT_INSN         0xe7f001f0UL
+  #define BPKT_SIZE         4
+  #define BPKT_WRITE(old)   ((unsigned long)BPKT_INSN)
+  #define BPKT_ADJUST_PC(r) ((r).uregs[ARM_PC] -= BPKT_SIZE)
+  /* ARM32: 通过 LR (r14) 返回，把 trap_addr 写入 LR */
+  #define REMOTE_CALL_SETUP(rs, fn, a1, a2, rslot, trap) do { \
+      REG_SET_PC(rs, (fn));                                    \
+      REG_SET_ARG1(rs, (a1));                                  \
+      REG_SET_ARG2(rs, (a2));                                  \
+      REG_SET_LR(rs, (trap));                                  \
+      REG_SET_SP(rs, (rslot));                                 \
+  } while(0)
+#endif
+
+/* ptrace 读写单位：PEEKDATA/POKEDATA 的本机字长 */
+#define PTRACE_WORD_SIZE  sizeof(unsigned long)
+
+/* ======================================================================== *
+ *                           钩取符号列表                                    *
+ * ======================================================================== */
+
 const char* g_inject_hook_names[] = {"malloc", "free", "calloc", "realloc", NULL};
 
 /* ---- 辅助: /proc/pid/maps 解析 ---- */
@@ -87,10 +251,10 @@ static const mem_region_t* find_region(const mem_region_t* regions, int count,
     return NULL;
 }
 
-/* ---- 辅助: ELF64 符号解析 ---- */
+/* ---- 辅助: ELF 符号解析 ---- */
 
 /**
- * 从 ELF64 文件中查找指定符号的虚拟地址偏移。
+ * 从 ELF 文件中查找指定符号的虚拟地址偏移（相对于 ELF load base）。
  */
 static int elf_find_symbol(const char* elf_path, const char* sym_name,
                            unsigned long* out_offset)
@@ -98,32 +262,34 @@ static int elf_find_symbol(const char* elf_path, const char* sym_name,
     FILE* f = fopen(elf_path, "rb");
     if (!f) return -1;
 
-    Elf64_Ehdr ehdr;
+    Elf_Native_Ehdr ehdr;
     if (fread(&ehdr, 1, sizeof(ehdr), f) != sizeof(ehdr)) goto fail;
     if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) goto fail;
-    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) goto fail;
+    if (ehdr.e_ident[EI_CLASS] != ELF_NATIVE_CLASS) goto fail;
 
-    Elf64_Shdr shstr_shdr;
-    fseek(f, ehdr.e_shoff + (long)(ehdr.e_shstrndx * sizeof(Elf64_Shdr)), SEEK_SET);
+    /* 读取 section header string table */
+    Elf_Native_Shdr shstr_shdr;
+    fseek(f, (long)(ehdr.e_shoff + (unsigned long)(ehdr.e_shstrndx) * sizeof(Elf_Native_Shdr)), SEEK_SET);
     if (fread(&shstr_shdr, 1, sizeof(shstr_shdr), f) != sizeof(shstr_shdr)) goto fail;
 
     char* shstrtab = (char*)malloc(shstr_shdr.sh_size);
     if (!shstrtab) goto fail;
-    fseek(f, shstr_shdr.sh_offset, SEEK_SET);
+    fseek(f, (long)shstr_shdr.sh_offset, SEEK_SET);
     if (fread(shstrtab, 1, shstr_shdr.sh_size, f) != shstr_shdr.sh_size) {
         free(shstrtab);
         goto fail;
     }
 
-    Elf64_Shdr* shdrs = (Elf64_Shdr*)malloc(ehdr.e_shnum * sizeof(Elf64_Shdr));
+    Elf_Native_Shdr* shdrs = (Elf_Native_Shdr*)malloc(ehdr.e_shnum * sizeof(Elf_Native_Shdr));
     if (!shdrs) { free(shstrtab); goto fail; }
-    fseek(f, ehdr.e_shoff, SEEK_SET);
-    if (fread(shdrs, 1, ehdr.e_shnum * sizeof(Elf64_Shdr), f)
-        != ehdr.e_shnum * sizeof(Elf64_Shdr)) {
+    fseek(f, (long)ehdr.e_shoff, SEEK_SET);
+    if (fread(shdrs, 1, ehdr.e_shnum * sizeof(Elf_Native_Shdr), f)
+        != ehdr.e_shnum * sizeof(Elf_Native_Shdr)) {
         free(shdrs); free(shstrtab); goto fail;
     }
 
-    Elf64_Shdr *symtab_shdr = NULL, *strtab_shdr = NULL, *dynsym_shdr = NULL, *dynstr_shdr = NULL;
+    Elf_Native_Shdr *symtab_shdr = NULL, *strtab_shdr = NULL;
+    Elf_Native_Shdr *dynsym_shdr = NULL, *dynstr_shdr = NULL;
     for (int i = 0; i < ehdr.e_shnum; i++) {
         const char* sname = shstrtab + shdrs[i].sh_name;
         if (shdrs[i].sh_type == SHT_SYMTAB && strcmp(sname, ".symtab") == 0) {
@@ -140,23 +306,24 @@ static int elf_find_symbol(const char* elf_path, const char* sym_name,
     *out_offset = 0;
     int found = 0;
 
+    /* 先查 .dynsym，再查 .symtab */
     for (int table = 0; table < 2 && !found; table++) {
-        Elf64_Shdr* sym_hdr = (table == 0) ? dynsym_shdr : symtab_shdr;
-        Elf64_Shdr* str_hdr = (table == 0) ? dynstr_shdr : strtab_shdr;
+        Elf_Native_Shdr* sym_hdr = (table == 0) ? dynsym_shdr : symtab_shdr;
+        Elf_Native_Shdr* str_hdr = (table == 0) ? dynstr_shdr : strtab_shdr;
         if (!sym_hdr || !str_hdr) continue;
 
         char* strtab_data = (char*)malloc(str_hdr->sh_size);
         if (!strtab_data) continue;
-        fseek(f, str_hdr->sh_offset, SEEK_SET);
+        fseek(f, (long)str_hdr->sh_offset, SEEK_SET);
         if (fread(strtab_data, 1, str_hdr->sh_size, f) != str_hdr->sh_size) {
             free(strtab_data);
             continue;
         }
 
-        int nsyms = (int)(sym_hdr->sh_size / sizeof(Elf64_Sym));
-        Elf64_Sym* syms = (Elf64_Sym*)malloc(sym_hdr->sh_size);
+        int nsyms = (int)(sym_hdr->sh_size / sizeof(Elf_Native_Sym));
+        Elf_Native_Sym* syms = (Elf_Native_Sym*)malloc(sym_hdr->sh_size);
         if (!syms) { free(strtab_data); continue; }
-        fseek(f, sym_hdr->sh_offset, SEEK_SET);
+        fseek(f, (long)sym_hdr->sh_offset, SEEK_SET);
         if (fread(syms, 1, sym_hdr->sh_size, f) != sym_hdr->sh_size) {
             free(syms); free(strtab_data); continue;
         }
@@ -164,7 +331,7 @@ static int elf_find_symbol(const char* elf_path, const char* sym_name,
         for (int i = 0; i < nsyms; i++) {
             const char* name = strtab_data + syms[i].st_name;
             if (strcmp(name, sym_name) == 0 && syms[i].st_value != 0) {
-                *out_offset = syms[i].st_value;
+                *out_offset = (unsigned long)syms[i].st_value;
                 found = 1;
                 break;
             }
@@ -186,30 +353,36 @@ fail:
 /* ---- ptrace 辅助操作 ---- */
 
 /**
- * 安全写入目标进程内存（8 字节对齐，每次 8 字节）。
+ * 安全写入目标进程内存。
+ *
+ * 以 PTRACE_WORD_SIZE 为单位进行对齐写入，处理部分页写入
+ * 和非对齐末尾。跨架构适用 — PTRACE_POKEDATA 在 32 位系统上
+ * 写 4 字节，64 位系统上写 8 字节。
  */
 static int ptrace_write_mem(pid_t pid, unsigned long addr,
                             const void* data, size_t len)
 {
     const unsigned long* words = (const unsigned long*)data;
-    size_t nwords = (len + 7) / 8;
+    size_t nwords = (len + PTRACE_WORD_SIZE - 1) / PTRACE_WORD_SIZE;
 
     for (size_t i = 0; i < nwords; i++) {
         unsigned long word = 0;
-        size_t remain = len - i * 8;
-        if (remain >= 8) {
+        size_t remain = len - i * PTRACE_WORD_SIZE;
+        if (remain >= PTRACE_WORD_SIZE) {
             word = words[i];
         } else {
+            /* 部分字：先读出现有内容，再拼接 */
             long existing = ptrace(PTRACE_PEEKDATA, pid,
-                                   (void*)(addr + i * 8), NULL);
+                                   (void*)(addr + i * PTRACE_WORD_SIZE), NULL);
             if (existing == -1 && errno != 0) return -1;
             memcpy(&word, &words[i], remain);
-            size_t existing_off = remain;
-            memcpy((char*)&word + existing_off,
-                   (char*)&existing + existing_off, 8 - remain);
+            /* 保留原数据的高位部分 */
+            memcpy((char*)&word + remain,
+                   (char*)&existing + remain,
+                   PTRACE_WORD_SIZE - remain);
         }
         if (ptrace(PTRACE_POKEDATA, pid,
-                   (void*)(addr + i * 8), (void*)word) == -1)
+                   (void*)(addr + i * PTRACE_WORD_SIZE), (void*)word) == -1)
             return -1;
     }
     return 0;
@@ -220,100 +393,112 @@ static int ptrace_write_mem(pid_t pid, unsigned long addr,
 /**
  * 在目标进程中远程调用 fn(arg1, arg2)。
  *
- * 通过操纵目标进程的寄存器和栈实现远程函数调用。
- * fn 执行 ret 后跳转到 trap_addr（含 INT3 断点），触发 SIGTRAP 后
- * 由 ptrace 捕获，从而取回返回值 rax。
+ * 通过操纵目标进程的寄存器和执行流实现：
+ *   1. 在 libc 可执行区域末尾写入架构特定的断点指令（trap_addr）
+ *   2. 设置目标进程寄存器：PC=fn, ARG1/ARG2 传参，返回地址=trap_addr
+ *   3. PTRACE_CONT 执行直到 hit 断点（SIGTRAP）
+ *   4. 读取返回值，恢复 trap_addr 原始内容
  *
- * trap_addr 必须指向可执行内存（不可用栈，因为 NX 保护）。
+ * 不同架构的调用约定差异通过 REMOTE_CALL_SETUP 宏抽象：
+ *   - x86_64: 模拟 CALL 压栈（返回地址在栈上）
+ *   - ARM32/AArch64: 设置 LR 寄存器为 trap_addr
  *
  * @param pid       目标 PID
  * @param fn_addr   目标函数地址
- * @param arg1      第一个参数 (rdi)
- * @param arg2      第二个参数 (rsi)
- * @param trap_addr 存放 INT3 的可执行内存地址（调用前后恢复原值）
+ * @param arg1      第一个参数
+ * @param arg2      第二个参数
+ * @param trap_addr 存放断点指令的可执行内存地址
  * @param regs      输入: 原始寄存器 / 输出: 调用后寄存器状态
- * @return          0 成功（rax 中含返回值），-1 失败
+ * @return          0 成功（返回值在 RET 寄存器中），-1 失败
  */
 static int ptrace_remote_call(pid_t pid, unsigned long fn_addr,
                               unsigned long arg1, unsigned long arg2,
                               unsigned long trap_addr,
-                              struct user_regs_struct* regs)
+                              native_regs_t* regs)
 {
-    /* x86_64 ABI: 函数入口处 RSP 必须为 8 mod 16（模拟 call 压栈后的状态） */
-    unsigned long orig_rsp = regs->rsp;
-    /* 预留 16KB 栈空间供 dlopen 等复杂函数使用（256 字节不够） */
-    unsigned long ret_slot = (orig_rsp - 16384) & ~0x0FUL;
-    ret_slot -= 8;
+    unsigned long orig_sp = REG_SP(*regs);
+    /* 预留 16KB 栈空间供 dlopen 等复杂函数使用 */
+    unsigned long ret_slot = orig_sp - 16384;
+#if MTT_ARCH_ARM
+    /* ARM32 AAPCS: 栈需 8 字节对齐 */
+    ret_slot &= ~0x07UL;
+    ret_slot -= 4;   /* 为返回地址预留（兼容可能压栈的函数） */
+#else
+    /* x86_64 / AArch64: 栈需 16 字节对齐 */
+    ret_slot &= ~0x0FUL;
+    ret_slot -= PTRACE_WORD_SIZE; /* 预留返回地址槽 */
+#endif
 
-    /* 保存原始数据以便恢复 */
-    long old_ret = ptrace(PTRACE_PEEKDATA, pid, (void*)ret_slot, NULL);
-    if (old_ret == -1 && errno != 0) return -1;
+    /* 保存并写入断点指令 */
     long old_trap = ptrace(PTRACE_PEEKDATA, pid, (void*)trap_addr, NULL);
-    if (old_trap == -1 && errno != 0) old_trap = 0;
-
-    /* 在 trap_addr（可执行内存）写入 INT3 断点 */
-    unsigned long trap_word = (unsigned long)old_trap;
-    trap_word &= ~0xFFUL;
-    trap_word |= 0xCC;
-    if (ptrace(PTRACE_POKEDATA, pid, (void*)trap_addr, (void*)trap_word) == -1)
+    if (old_trap == -1 && errno != 0) return -1;
+    unsigned long trap_word = BPKT_WRITE(old_trap);
+    if (ptrace(PTRACE_POKEDATA, pid, (void*)trap_addr,
+               (void*)trap_word) == -1)
         return -1;
 
-    /* 在栈上写入返回地址 = trap_addr（位于可执行内存，非 NX 栈） */
+#if MTT_ARCH_X86_64
+    /* x86_64: 把返回地址压入 "栈"（模拟 CALL） */
+    long old_ret = ptrace(PTRACE_PEEKDATA, pid, (void*)ret_slot, NULL);
+    if (old_ret == -1 && errno != 0) {
+        ptrace(PTRACE_POKEDATA, pid, (void*)trap_addr, (void*)old_trap);
+        return -1;
+    }
     if (ptrace(PTRACE_POKEDATA, pid, (void*)ret_slot,
                (void*)trap_addr) == -1) {
         ptrace(PTRACE_POKEDATA, pid, (void*)trap_addr, (void*)old_trap);
         return -1;
     }
+#endif
 
-    /* 构造调用寄存器: x86_64 calling convention */
-    struct user_regs_struct call_regs = *regs;
-    call_regs.orig_rax = (unsigned long)-1; /* 告知内核: 无 syscall 需重启 */
-    call_regs.rip = fn_addr;
-    call_regs.rdi = arg1;
-    call_regs.rsi = arg2;
-    call_regs.rdx = 0;
-    call_regs.rcx = 0;
-    call_regs.r8  = 0;
-    call_regs.r9  = 0;
-    call_regs.rsp = ret_slot;
+    /* 构造调用寄存器状态 */
+    native_regs_t call_regs = *regs;
+    REMOTE_CALL_SETUP(call_regs, fn_addr, arg1, arg2, ret_slot, trap_addr);
 
-    if (ptrace(PTRACE_SETREGS, pid, NULL, &call_regs) == -1) {
+    if (REGS_SET(pid, call_regs) == -1) {
         ptrace(PTRACE_POKEDATA, pid, (void*)trap_addr, (void*)old_trap);
+#if MTT_ARCH_X86_64
         ptrace(PTRACE_POKEDATA, pid, (void*)ret_slot, (void*)old_ret);
+#endif
         return -1;
     }
 
     /* 执行目标进程直到遇到断点 */
     if (ptrace(PTRACE_CONT, pid, NULL, NULL) == -1) {
         ptrace(PTRACE_POKEDATA, pid, (void*)trap_addr, (void*)old_trap);
+#if MTT_ARCH_X86_64
         ptrace(PTRACE_POKEDATA, pid, (void*)ret_slot, (void*)old_ret);
-        ptrace(PTRACE_SETREGS, pid, NULL, regs);
+#endif
+        REGS_SET(pid, *regs); /* 尝试恢复原始寄存器 */
         return -1;
     }
 
     int status;
     if (waitpid(pid, &status, 0) == -1) {
         ptrace(PTRACE_POKEDATA, pid, (void*)trap_addr, (void*)old_trap);
+#if MTT_ARCH_X86_64
         ptrace(PTRACE_POKEDATA, pid, (void*)ret_slot, (void*)old_ret);
+#endif
         return -1;
     }
 
-    /* debug: print what happened */
     fprintf(stderr, "[DEBUG] remote_call wait: status=0x%x", status);
     if (WIFEXITED(status)) fprintf(stderr, " EXITED(%d)", WEXITSTATUS(status));
     if (WIFSIGNALED(status)) fprintf(stderr, " SIGNALED(%s)", strsignal(WTERMSIG(status)));
     if (WIFSTOPPED(status)) fprintf(stderr, " STOPPED(%s)", strsignal(WSTOPSIG(status)));
     fprintf(stderr, "\n");
 
-    /* 恢复栈和可执行内存上的原始数据 */
+    /* 恢复原始 trap 和栈数据 */
     ptrace(PTRACE_POKEDATA, pid, (void*)trap_addr, (void*)old_trap);
+#if MTT_ARCH_X86_64
     ptrace(PTRACE_POKEDATA, pid, (void*)ret_slot, (void*)old_ret);
+#endif
 
     /* 读取返回后的寄存器状态 */
-    if (ptrace(PTRACE_GETREGS, pid, NULL, regs) == -1) return -1;
+    if (REGS_GET(pid, *regs) == -1) return -1;
 
-    fprintf(stderr, "[DEBUG] remote_call result: RIP=0x%llx RAX=0x%llx\n",
-            (unsigned long long)regs->rip, (unsigned long long)regs->rax);
+    fprintf(stderr, "[DEBUG] remote_call result: PC=0x%lx RET=0x%lx\n",
+            (unsigned long)REG_PC(*regs), (unsigned long)REG_RET(*regs));
 
     /* 必须是 SIGTRAP 才算成功 */
     if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
@@ -322,8 +507,8 @@ static int ptrace_remote_call(pid_t pid, unsigned long fn_addr,
         return -1;
     }
 
-    /* INT3 断点后 RIP 指向 INT3 之后一条指令，回退到 INT3 处 */
-    regs->rip -= 1;
+    /* 断点后 PC 指向断点指令之后，回退到断点处 */
+    BPKT_ADJUST_PC(*regs);
 
     return 0;
 }
@@ -331,7 +516,7 @@ static int ptrace_remote_call(pid_t pid, unsigned long fn_addr,
 /* ---- GOT 修补 ---- */
 
 /** 将动态段的虚拟地址转换为文件偏移（遍历 PT_LOAD 程序头） */
-static long vaddr_to_file_off(const Elf64_Phdr* phdrs, int phnum,
+static long vaddr_to_file_off(const Elf_Native_Phdr* phdrs, int phnum,
                               unsigned long vaddr)
 {
     for (int i = 0; i < phnum; i++) {
@@ -345,8 +530,11 @@ static long vaddr_to_file_off(const Elf64_Phdr* phdrs, int phnum,
 }
 
 /**
- * 解析目标可执行文件 ELF64，找到 malloc/free/calloc/realloc 的
- * PLT 重定位表项，用钩子函数地址覆盖 GOT 槽位。
+ * 解析目标可执行文件 ELF PLT 重定位表，用钩子函数地址覆盖 GOT 槽位。
+ *
+ * 支持 x86_64、ARM32、AArch64 的 ELF 格式和 PLT 重定位类型。
+ * ARM32 上 JUMP_SLOT 使用 Elf32_Rel（无 r_addend 字段），
+ * 与其他架构使用的 Rela 不同，已通过 Elf_Native_Rela typedef 统一。
  */
 static int patch_got_entries(pid_t pid, const char* exe_path,
                              unsigned long exe_base,
@@ -355,20 +543,18 @@ static int patch_got_entries(pid_t pid, const char* exe_path,
     FILE* f = fopen(exe_path, "rb");
     if (!f) return -1;
 
-    Elf64_Ehdr ehdr;
+    Elf_Native_Ehdr ehdr;
     if (fread(&ehdr, 1, sizeof(ehdr), f) != sizeof(ehdr)) { fclose(f); return -1; }
     if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0) { fclose(f); return -1; }
-    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64) { fclose(f); return -1; }
+    if (ehdr.e_ident[EI_CLASS] != ELF_NATIVE_CLASS) { fclose(f); return -1; }
 
-    /* PIE (ET_DYN) 可执行文件: r_offset 是偏移量，需加基址。
-     * 非 PIE (ET_EXEC): r_offset 已是绝对地址。 */
     int is_pie = (ehdr.e_type == ET_DYN);
 
-    Elf64_Phdr* phdrs = (Elf64_Phdr*)malloc(ehdr.e_phnum * sizeof(Elf64_Phdr));
+    Elf_Native_Phdr* phdrs = (Elf_Native_Phdr*)malloc(ehdr.e_phnum * sizeof(Elf_Native_Phdr));
     if (!phdrs) { fclose(f); return -1; }
-    fseek(f, ehdr.e_phoff, SEEK_SET);
-    if (fread(phdrs, 1, ehdr.e_phnum * sizeof(Elf64_Phdr), f)
-        != ehdr.e_phnum * sizeof(Elf64_Phdr)) {
+    fseek(f, (long)ehdr.e_phoff, SEEK_SET);
+    if (fread(phdrs, 1, ehdr.e_phnum * sizeof(Elf_Native_Phdr), f)
+        != ehdr.e_phnum * sizeof(Elf_Native_Phdr)) {
         free(phdrs); fclose(f); return -1;
     }
 
@@ -377,15 +563,15 @@ static int patch_got_entries(pid_t pid, const char* exe_path,
 
     for (int i = 0; i < ehdr.e_phnum; i++) {
         if (phdrs[i].p_type == PT_DYNAMIC) {
-            dyn_filesz = phdrs[i].p_filesz;
-            dyn_file_off = phdrs[i].p_offset;
+            dyn_filesz = (unsigned long)phdrs[i].p_filesz;
+            dyn_file_off = (long)phdrs[i].p_offset;
             break;
         }
     }
     if (dyn_file_off < 0) { free(phdrs); fclose(f); return -1; }
 
-    int ndyns = (int)(dyn_filesz / sizeof(Elf64_Dyn));
-    Elf64_Dyn* dyns = (Elf64_Dyn*)malloc(dyn_filesz);
+    int ndyns = (int)(dyn_filesz / sizeof(Elf_Native_Dyn));
+    Elf_Native_Dyn* dyns = (Elf_Native_Dyn*)malloc(dyn_filesz);
     if (!dyns) { free(phdrs); fclose(f); return -1; }
     fseek(f, dyn_file_off, SEEK_SET);
     if (fread(dyns, 1, dyn_filesz, f) != dyn_filesz) {
@@ -399,10 +585,10 @@ static int patch_got_entries(pid_t pid, const char* exe_path,
 
     for (int i = 0; i < ndyns; i++) {
         switch (dyns[i].d_tag) {
-        case DT_JMPREL:   jmprel   = dyns[i].d_un.d_val; break;
-        case DT_PLTRELSZ: pltrelsz = dyns[i].d_un.d_val; break;
-        case DT_SYMTAB:   symtab   = dyns[i].d_un.d_val; break;
-        case DT_STRTAB:   strtab   = dyns[i].d_un.d_val; break;
+        case DT_JMPREL:   jmprel   = (unsigned long)dyns[i].d_un.d_val; break;
+        case DT_PLTRELSZ: pltrelsz = (unsigned long)dyns[i].d_un.d_val; break;
+        case DT_SYMTAB:   symtab   = (unsigned long)dyns[i].d_un.d_val; break;
+        case DT_STRTAB:   strtab   = (unsigned long)dyns[i].d_un.d_val; break;
         }
     }
 
@@ -410,25 +596,27 @@ static int patch_got_entries(pid_t pid, const char* exe_path,
         free(dyns); free(phdrs); fclose(f); return -1;
     }
 
+    /* 将动态段的虚拟地址转换为文件偏移 */
     long rela_off = vaddr_to_file_off(phdrs, ehdr.e_phnum, jmprel);
     if (rela_off < 0) { free(dyns); free(phdrs); fclose(f); return -1; }
-    int nrelocs = (int)(pltrelsz / sizeof(Elf64_Rela));
+    int nrelocs = (int)(pltrelsz / sizeof(Elf_Native_Rela));
 
     long sym_off = vaddr_to_file_off(phdrs, ehdr.e_phnum, symtab);
     if (sym_off < 0) { free(dyns); free(phdrs); fclose(f); return -1; }
     long str_off = vaddr_to_file_off(phdrs, ehdr.e_phnum, strtab);
     if (str_off < 0) { free(dyns); free(phdrs); fclose(f); return -1; }
+
+    /* 读取 .dynsym 真实大小 */
     size_t sym_size = 0;
-    /* 从 section header 读取 .dynsym 的真实大小，避免依赖 .dynstr 紧邻布局的假设 */
     {
-        Elf64_Shdr* shdrs = (Elf64_Shdr*)malloc(ehdr.e_shnum * sizeof(Elf64_Shdr));
+        Elf_Native_Shdr* shdrs = (Elf_Native_Shdr*)malloc(ehdr.e_shnum * sizeof(Elf_Native_Shdr));
         if (shdrs) {
-            fseek(f, ehdr.e_shoff, SEEK_SET);
-            if (fread(shdrs, 1, ehdr.e_shnum * sizeof(Elf64_Shdr), f)
-                == ehdr.e_shnum * sizeof(Elf64_Shdr)) {
+            fseek(f, (long)ehdr.e_shoff, SEEK_SET);
+            if (fread(shdrs, 1, ehdr.e_shnum * sizeof(Elf_Native_Shdr), f)
+                == ehdr.e_shnum * sizeof(Elf_Native_Shdr)) {
                 for (int i = 0; i < ehdr.e_shnum; i++) {
                     if (shdrs[i].sh_type == SHT_DYNSYM) {
-                        sym_size = shdrs[i].sh_size;
+                        sym_size = (size_t)shdrs[i].sh_size;
                         break;
                     }
                 }
@@ -436,12 +624,11 @@ static int patch_got_entries(pid_t pid, const char* exe_path,
             free(shdrs);
         }
     }
-    /* 回退: section header 不可用时用偏移差(带溢出保护) */
     if (sym_size == 0) {
         if (str_off > sym_off && (size_t)(str_off - sym_off) < 16 * 1024 * 1024)
             sym_size = (size_t)(str_off - sym_off);
         else
-            sym_size = 65536 * sizeof(Elf64_Sym);
+            sym_size = 65536 * sizeof(Elf_Native_Sym);
     }
 
     fseek(f, 0, SEEK_END);
@@ -451,34 +638,36 @@ static int patch_got_entries(pid_t pid, const char* exe_path,
 
     char* strtab_data = (char*)malloc(str_size);
     if (!strtab_data) { free(dyns); free(phdrs); fclose(f); return -1; }
-    fseek(f, str_off, SEEK_SET);
+    fseek(f, (long)str_off, SEEK_SET);
     if (fread(strtab_data, 1, str_size, f) != str_size) {
         free(strtab_data); free(dyns); free(phdrs); fclose(f); return -1;
     }
 
-    Elf64_Sym* syms = (Elf64_Sym*)malloc(sym_size);
+    Elf_Native_Sym* syms = (Elf_Native_Sym*)malloc(sym_size);
     if (!syms) { free(strtab_data); free(dyns); free(phdrs); fclose(f); return -1; }
-    fseek(f, sym_off, SEEK_SET);
+    fseek(f, (long)sym_off, SEEK_SET);
     if (fread(syms, 1, sym_size, f) != sym_size) {
         free(syms); free(strtab_data); free(dyns); free(phdrs); fclose(f); return -1;
     }
 
     int patched = 0;
-    fseek(f, rela_off, SEEK_SET);
+    fseek(f, (long)rela_off, SEEK_SET);
     fprintf(stderr, "[DEBUG] patch_got: PIE=%d exe_base=0x%lx nrelocs=%d jmprel=0x%lx\n",
             is_pie, exe_base, nrelocs, jmprel);
 
     for (int i = 0; i < nrelocs; i++) {
-        Elf64_Rela rela;
+        Elf_Native_Rela rela;
         if (fread(&rela, 1, sizeof(rela), f) != sizeof(rela)) break;
 
-        if (ELF64_R_TYPE(rela.r_info) != R_X86_64_JUMP_SLOT) continue;
+        if (ELF_NATIVE_R_TYPE(rela.r_info) != ELF_NATIVE_JUMP_SLOT)
+            continue;
 
-        unsigned long sym_idx = ELF64_R_SYM(rela.r_info);
-        if (sym_idx >= sym_size / sizeof(Elf64_Sym)) continue;
+        unsigned long sym_idx = (unsigned long)ELF_NATIVE_R_SYM(rela.r_info);
+        if (sym_idx >= sym_size / sizeof(Elf_Native_Sym)) continue;
 
         const char* name = strtab_data + syms[sym_idx].st_name;
-        if (i < 5) fprintf(stderr, "[DEBUG] PLT[%d]: sym_idx=%lu name=%s r_offset=0x%lx\n", i, sym_idx, name, rela.r_offset);
+        if (i < 5) fprintf(stderr, "[DEBUG] PLT[%d]: sym_idx=%lu name=%s r_offset=0x%lx\n",
+                           i, sym_idx, name, (unsigned long)rela.r_offset);
 
         int hook_idx = -1;
         for (int j = 0; j < 4; j++) {
@@ -487,11 +676,11 @@ static int patch_got_entries(pid_t pid, const char* exe_path,
                 break;
             }
         }
-        fprintf(stderr, "[DEBUG] hook_idx=%d for %s\n", hook_idx, name);
         if (hook_idx < 0) continue;
 
-        /* PIE 可执行文件: r_offset 是链接时偏移，需加基址 */
-        unsigned long got_addr = is_pie ? (exe_base + rela.r_offset) : rela.r_offset;
+        unsigned long got_addr = is_pie
+            ? (exe_base + (unsigned long)rela.r_offset)
+            : (unsigned long)rela.r_offset;
         unsigned long hook_addr = hook_addrs[hook_idx];
 
         errno = 0;
@@ -534,10 +723,11 @@ static void set_error(inject_result_t* res, inject_status_t st,
 }
 
 /**
- * 将 libmemorytracetool.so 注入到目标进程。
+ * 将 libmemorytracetool.so 注入到目标进程并修补其 GOT。
  *
- * 完整流程：验证 PID → ATTACH → 查 libc → 远程 dlopen →
- * 查钩子符号 → GOT 修补 → DETACH
+ * @param pid       目标进程 PID
+ * @param lib_path  要注入的 .so 文件路径
+ * @return          注入结果
  */
 inject_result_t inject_library(pid_t pid, const char* lib_path)
 {
@@ -571,7 +761,7 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
         if (errno == EPERM) {
             set_error(&res, INJECT_ERR_PERM,
-                      "Permission denied. Run daemon as root or: "
+                      "Permission denied. Run as root or: "
                       "echo 0 | sudo tee /proc/sys/kernel/yama/ptrace_scope");
         } else if (errno == ESRCH) {
             set_error(&res, INJECT_ERR_NOTFOUND,
@@ -599,15 +789,15 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     }
 
     /* ---- Step 2: 保存原始寄存器 ---- */
-    struct user_regs_struct saved_regs;
-    if (ptrace(PTRACE_GETREGS, pid, NULL, &saved_regs) == -1) {
+    native_regs_t saved_regs;
+    if (REGS_GET(pid, saved_regs) == -1) {
         set_error(&res, INJECT_ERR_ATTACH,
                   "PTRACE_GETREGS failed: %s", strerror(errno));
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         return res;
     }
 
-    /* ---- Step 3: 查找目标 libc 基址和可执行区域 ---- */
+    /* ---- Step 3: 查找目标 libc 基址 ---- */
     mem_region_t regions[MAX_REGIONS];
     int nregions = read_maps(pid, regions, MAX_REGIONS);
     if (nregions <= 0) {
@@ -618,9 +808,7 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     }
 
     const mem_region_t* libc_region = find_region(regions, nregions, "libc", 1);
-    if (!libc_region) {
-        libc_region = find_region(regions, nregions, "libc-", 1);
-    }
+    if (!libc_region) libc_region = find_region(regions, nregions, "libc-", 1);
     if (!libc_region) {
         for (int i = 0; i < nregions; i++) {
             if (strstr(regions[i].path, "libc") && strchr(regions[i].perms, 'x')) {
@@ -638,13 +826,12 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
 
     unsigned long libc_base = libc_region->start;
 
-    /* 在 libc 可执行区域末尾预留 16 字节作为 INT3 陷阱地址。
-     * 必须使用可执行内存（非栈），因为 NX 栈保护禁止在栈上执行代码。 */
-    unsigned long trap_addr = (libc_region->end - 16) & ~0x0FUL;
+    /* trap_addr 放在 libc 可执行区域末尾 */
+    unsigned long trap_addr = (libc_region->end - 16) & ~((unsigned long)15);
     fprintf(stderr, "[DEBUG] libc r-xp: 0x%lx-0x%lx trap_addr=0x%lx\n",
             libc_base, libc_region->end, trap_addr);
 
-    /* 通过自身进程的 dlsym 计算 dlopen 偏移（比解析目标 libc ELF 更可靠） */
+    /* 通过自身 dlsym 计算目标进程中 dlopen 的地址 */
     void* our_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
     if (!our_dlopen) {
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
@@ -652,7 +839,6 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
         return res;
     }
 
-    /* 找到自身 libc 基址以计算偏移 */
     unsigned long our_libc_base = 0;
     {
         mem_region_t self_regions[MAX_REGIONS];
@@ -669,10 +855,13 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     fprintf(stderr, "[DEBUG] our_libc=0x%lx dlopen_off=0x%lx target_dlopen=0x%lx\n",
             our_libc_base, dlopen_offset, target_dlopen);
 
-    /* ---- Step 4: 在目标栈上分配空间写入库路径 ---- */
-    /* 放在 ret_slot 下方 32KB 处，避免与远程调用的栈帧冲突 */
-    unsigned long str_addr = saved_regs.rsp - 32768;
+    /* ---- Step 4: 在目标栈上写库路径 ---- */
+    unsigned long str_addr = REG_SP(saved_regs) - 32768;
+#if MTT_ARCH_ARM
+    str_addr &= ~0x07UL;
+#else
     str_addr &= ~0x0FUL;
+#endif
 
     size_t path_len = strlen(abs_lib) + 1;
     if (ptrace_write_mem(pid, str_addr, abs_lib, path_len) == -1) {
@@ -683,8 +872,9 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     }
 
     /* ---- Step 5: 远程调用 dlopen ---- */
-    struct user_regs_struct call_regs = saved_regs;
-    if (ptrace_remote_call(pid, target_dlopen, str_addr, RTLD_LAZY,
+    native_regs_t call_regs = saved_regs;
+    if (ptrace_remote_call(pid, target_dlopen, str_addr,
+                           (unsigned long)RTLD_LAZY,
                            trap_addr, &call_regs) != 0) {
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         set_error(&res, INJECT_ERR_CRASH,
@@ -692,9 +882,9 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
         return res;
     }
 
-    unsigned long lib_handle = call_regs.rax;
+    unsigned long lib_handle = (unsigned long)REG_RET(call_regs);
     if (lib_handle == 0) {
-        ptrace(PTRACE_SETREGS, pid, NULL, &saved_regs);
+        REGS_SET(pid, saved_regs);
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         set_error(&res, INJECT_ERR_DLOPEN,
                   "dlopen(%s) returned NULL in target. Check library deps.",
@@ -703,15 +893,12 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     }
 
     /* ---- Step 6: 找到注入库中钩子函数地址 ---- */
-    /* 查找 .so 的 ELF load bias（最低地址映射，即第一个 PT_LOAD 所在页）。
-     * 符号虚拟地址以 p_vaddr=0 为基准，不可用 r-xp 段起始地址，
-     * 否则 hook_addr 超出可执行映射范围导致 SIGSEGV 指令预取异常。 */
     nregions = read_maps(pid, regions, MAX_REGIONS);
-    const mem_region_t* our_lib = NULL;
-    const mem_region_t* our_lib_load = NULL;  /* 最低地址映射 = load bias */
+    const mem_region_t* our_lib_load = NULL;  /* 最低地址映射 = ELF load bias */
+    const mem_region_t* our_lib = NULL;       /* 可执行映射 */
     for (int i = 0; i < nregions; i++) {
         if (strstr(regions[i].path, "libmemorytracetool")) {
-            if (!our_lib_load) our_lib_load = &regions[i];  /* 第一个映射 */
+            if (!our_lib_load) our_lib_load = &regions[i];
             if (!our_lib || !strchr(our_lib->perms, 'x'))
                 our_lib = &regions[i];
             if (strchr(regions[i].perms, 'x')) {
@@ -721,54 +908,56 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
         }
     }
     if (!our_lib || !our_lib_load) {
-        ptrace(PTRACE_SETREGS, pid, NULL, &saved_regs);
+        REGS_SET(pid, saved_regs);
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         set_error(&res, INJECT_ERR_DLOPEN,
                   "Library loaded but not found in /proc/%d/maps", pid);
         return res;
     }
-    /* 使用 ELF load bias（最低地址映射），非 r-xp 段地址 */
     unsigned long so_base = our_lib_load->start;
     fprintf(stderr, "[DEBUG] .so load_bias=0x%lx r-xp_start=0x%lx\n",
             so_base, our_lib->start);
     res.lib_base = so_base;
 
-    /* ---- Step 6.5: 修复 raw_* 函数指针（缺陷修复 #26）----
-     * .so 的构造函数通过 dlsym(RTLD_NEXT) 解析 raw_malloc/free/calloc，
-     * 但通过 dlopen 注入时 RTLD_NEXT 在 link map 末尾搜不到 libc，
-     * 内部的 dlopen("libc.so.6") fallback 也不可靠（可能导致 SIGSEGV）。
-     * 这里直接用已知的 libc 基址和 dlsym 偏移写入正确的函数地址。 */
+    /* ---- Step 6.5: 修复 raw_* 函数指针 ----
+     * 动态查找 raw_malloc/raw_free/raw_calloc 在 .so 中的偏移，
+     * 然后用已知的 libc 基址差值写入目标进程的正确 libc 函数地址。 */
     {
-        /* raw_* 符号在 .so 中的偏移（readelf 确认） */
-        #define RAW_MALLOC_OFF  0xa240
-        #define RAW_FREE_OFF    0xa248
-        #define RAW_CALLOC_OFF  0xa250
-
-        /* 通过自身 dlsym 计算 libc 中 malloc/free/calloc 的偏移 */
-        unsigned long real_malloc = 0, real_free = 0, real_calloc = 0;
-        void* sym_malloc = dlsym(RTLD_DEFAULT, "malloc");
-        void* sym_free   = dlsym(RTLD_DEFAULT, "free");
-        void* sym_calloc = dlsym(RTLD_DEFAULT, "calloc");
-
-        if (our_libc_base && sym_malloc)
-            real_malloc = libc_base + ((unsigned long)sym_malloc - our_libc_base);
-        if (our_libc_base && sym_free)
-            real_free   = libc_base + ((unsigned long)sym_free - our_libc_base);
-        if (our_libc_base && sym_calloc)
-            real_calloc = libc_base + ((unsigned long)sym_calloc - our_libc_base);
-
-        if (real_malloc && real_free && real_calloc) {
-            ptrace(PTRACE_POKEDATA, pid, (void*)(so_base + RAW_MALLOC_OFF), (void*)real_malloc);
-            ptrace(PTRACE_POKEDATA, pid, (void*)(so_base + RAW_FREE_OFF),   (void*)real_free);
-            ptrace(PTRACE_POKEDATA, pid, (void*)(so_base + RAW_CALLOC_OFF), (void*)real_calloc);
-            fprintf(stderr, "[DEBUG] Fixed raw_*: malloc=0x%lx free=0x%lx calloc=0x%lx\n",
-                    real_malloc, real_free, real_calloc);
-        } else {
-            fprintf(stderr, "[DEBUG] WARNING: cannot resolve raw_* fallback, "
+        unsigned long raw_malloc_off = 0, raw_free_off = 0, raw_calloc_off = 0;
+        if (elf_find_symbol(abs_lib, "raw_malloc", &raw_malloc_off) != 0 ||
+            elf_find_symbol(abs_lib, "raw_free",   &raw_free_off)   != 0 ||
+            elf_find_symbol(abs_lib, "raw_calloc", &raw_calloc_off) != 0) {
+            fprintf(stderr, "[DEBUG] WARNING: cannot find raw_* symbols in .so, "
                     "injected process may crash\n");
+        } else {
+            unsigned long real_malloc = 0, real_free = 0, real_calloc = 0;
+            void* sym_malloc = dlsym(RTLD_DEFAULT, "malloc");
+            void* sym_free   = dlsym(RTLD_DEFAULT, "free");
+            void* sym_calloc = dlsym(RTLD_DEFAULT, "calloc");
+
+            if (our_libc_base && sym_malloc)
+                real_malloc = libc_base + ((unsigned long)sym_malloc - our_libc_base);
+            if (our_libc_base && sym_free)
+                real_free   = libc_base + ((unsigned long)sym_free - our_libc_base);
+            if (our_libc_base && sym_calloc)
+                real_calloc = libc_base + ((unsigned long)sym_calloc - our_libc_base);
+
+            if (real_malloc && real_free && real_calloc) {
+                ptrace(PTRACE_POKEDATA, pid,
+                       (void*)(so_base + raw_malloc_off), (void*)real_malloc);
+                ptrace(PTRACE_POKEDATA, pid,
+                       (void*)(so_base + raw_free_off),   (void*)real_free);
+                ptrace(PTRACE_POKEDATA, pid,
+                       (void*)(so_base + raw_calloc_off), (void*)real_calloc);
+                fprintf(stderr, "[DEBUG] Fixed raw_*: malloc=0x%lx free=0x%lx calloc=0x%lx\n",
+                        real_malloc, real_free, real_calloc);
+            } else {
+                fprintf(stderr, "[DEBUG] WARNING: cannot resolve raw_* in libc\n");
+            }
         }
     }
 
+    /* ---- Step 7: 查找钩子符号在 .so 中的偏移 ---- */
     unsigned long hook_addrs[4] = {0};
     const char* hook_names[4] = {"malloc", "free", "calloc", "realloc"};
     int hooks_found = 0;
@@ -780,20 +969,20 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
         }
     }
     if (hooks_found < 2) {
-        ptrace(PTRACE_SETREGS, pid, NULL, &saved_regs);
+        REGS_SET(pid, saved_regs);
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         set_error(&res, INJECT_ERR_GOT,
                   "Found only %d/4 hook symbols in injected library", hooks_found);
         return res;
     }
 
-    /* ---- Step 7: GOT 修补 ---- */
+    /* ---- Step 8: GOT 修补 ---- */
     char exe_link[64];
     snprintf(exe_link, sizeof(exe_link), "/proc/%d/exe", pid);
     char exe_path[512];
     ssize_t exe_len = readlink(exe_link, exe_path, sizeof(exe_path) - 1);
     if (exe_len <= 0) {
-        ptrace(PTRACE_SETREGS, pid, NULL, &saved_regs);
+        REGS_SET(pid, saved_regs);
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         set_error(&res, INJECT_ERR_GOT,
                   "Cannot readlink /proc/%d/exe", pid);
@@ -801,24 +990,22 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     }
     exe_path[exe_len] = '\0';
 
-    /* 查找主可执行文件基址（最低地址映射，即 ELF load base）。
-     * 不筛选 'x' 权限 — PIE 可执行文件的 .rela.plt r_offset 是相对于
-     * 第一个 PT_LOAD 段（r--p）的偏移，而非 r-xp 段。 */
     const mem_region_t* exe_region = find_region(regions, nregions, NULL, 0);
     if (!exe_region) {
-        ptrace(PTRACE_SETREGS, pid, NULL, &saved_regs);
+        REGS_SET(pid, saved_regs);
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         set_error(&res, INJECT_ERR_GOT, "Cannot find main executable mapping");
         return res;
     }
     unsigned long exe_base = exe_region->start;
-    fprintf(stderr, "[DEBUG] exe_region: start=0x%lx end=0x%lx path=%s\n", exe_region->start, exe_region->end, exe_region->path);
+    fprintf(stderr, "[DEBUG] exe_region: start=0x%lx end=0x%lx path=%s\n",
+            exe_region->start, exe_region->end, exe_region->path);
 
     int patched = patch_got_entries(pid, exe_path, exe_base, hook_addrs);
     res.patched_count = patched;
 
-    /* ---- Step 8: 恢复并分离 ---- */
-    ptrace(PTRACE_SETREGS, pid, NULL, &saved_regs);
+    /* ---- Step 9: 恢复并分离 ---- */
+    REGS_SET(pid, saved_regs);
 
     if (ptrace(PTRACE_DETACH, pid, NULL, NULL) == -1) {
         set_error(&res, INJECT_ERR_ATTACH,

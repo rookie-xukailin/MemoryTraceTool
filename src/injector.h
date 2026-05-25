@@ -5,7 +5,8 @@
  * 正在运行的目标进程中，并修补其 GOT 表项使 malloc/free/calloc/realloc
  * 重定向到我们的钩子函数。
  *
- * 仅支持 x86_64 Linux + ELF64 格式。
+ * 支持架构：x86_64 / ARM32 (EABI) / AArch64。
+ * 编译时通过预处理器宏自动适配 ELF 类型、寄存器布局和调用约定。
  */
 #ifndef MTT_INJECTOR_H
 #define MTT_INJECTOR_H
