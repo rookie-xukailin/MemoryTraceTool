@@ -206,13 +206,12 @@ static __thread int g_in_capture = 0;
 /**
  * 捕获当前调用栈并存入 entry->stack。
  *
- * ARM32: 使用帧指针链手动遍历（__builtin_frame_address + AAPCS 布局），
- *        不依赖 glibc backtrace() 和 unwind table。
- *        capture_stack 自身非叶子函数（内部调用 raw_* 和 mtt_* 系列函数），
- *        配合 Makefile 中 -fno-omit-frame-pointer 保证 fp 寄存器有效。
- * x86_64 / AArch64: 使用标准 backtrace()。
+ * 使用 backtrace() 获取调用栈帧地址，通过 g_in_capture
+ * (thread-local 变量) 防止 backtrace 内部再次触发 malloc
+ * 导致无限递归。
  *
- * 通过 g_in_capture (thread-local) 防止递归重入。
+ * ARM32: Makefile 中 -fno-omit-frame-pointer 确保帧指针可用，
+ *        backtrace() 依赖帧指针链遍历，不需要 unwind table。
  */
 static void capture_stack(mtt_entry_t* entry)
 {
@@ -222,31 +221,7 @@ static void capture_stack(mtt_entry_t* entry)
     }
     int saved = g_in_capture;
     g_in_capture = 1;
-#if defined(__arm__)
-    {
-        /* 从 capture_stack 自身的帧指针出发，沿 AAPCS 链表向上遍历。
-         * 帧布局: fp[0] = 上一帧的 fp, fp[1] = 保存的 lr (返回地址)。
-         * 第一步取 fp[1] 即为 mtt_entry_new 中调用 capture_stack 的返回点。 */
-        void** fp = (void**)__builtin_frame_address(0);
-        int count = 0;
-        while (fp && count < MTT_STACK_DEPTH) {
-            void* prev_fp = fp[0];
-            void* lr      = fp[1];
-
-            if (!lr || (unsigned long)lr < 0x1000UL) break;
-            if (prev_fp && (unsigned long)prev_fp <= (unsigned long)fp) break;
-
-            /* 清除 Thumb 标志位（LSB），方便后续符号解析 */
-            entry->stack[count++] = (void*)((unsigned long)lr & ~1UL);
-
-            if (!prev_fp) break;
-            fp = (void**)prev_fp;
-        }
-        entry->stack_frames = count;
-    }
-#else
     entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
-#endif
     g_in_capture = saved; /* restore, not hard-reset to 0: 可能嵌套 */
 }
 
