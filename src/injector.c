@@ -938,10 +938,12 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
         return res;
     }
 
-    /* ---- Step 5: 远程调用 __libc_dlopen_mode ---- */
+    /* ---- Step 5: 远程调用 __libc_dlopen_mode ----
+     * RTLD_NOW 强制立即符号解析，确保加载失败时错误信息可追溯。 */
     native_regs_t call_regs = saved_regs;
+    unsigned long dl_mode = (unsigned long)RTLD_NOW;
     if (ptrace_remote_call(pid, target_dlopen, str_addr,
-                           (unsigned long)(RTLD_LAZY | __RTLD_DLOPEN),
+                           dl_mode,
                            trap_addr, &call_regs) != 0) {
         ptrace(PTRACE_DETACH, pid, NULL, NULL);
         set_error(&res, INJECT_ERR_CRASH,
