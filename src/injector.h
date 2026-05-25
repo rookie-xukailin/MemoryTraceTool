@@ -33,6 +33,7 @@ typedef struct {
     pid_t           pid;
     unsigned long   lib_base;      /* 注入后 .so 在目标进程中的基地址，0=未知 */
     int             patched_count; /* 成功修补的 GOT 表项数 */
+    char            patched_names[128]; /* 逗号分隔的已修补符号名，如 "malloc,free,calloc" */
 } inject_result_t;
 
 /* 要钩取的符号名列表（以 NULL 结尾） */

@@ -574,7 +574,8 @@ static long vaddr_to_file_off(const Elf_Native_Phdr* phdrs, int phnum,
  */
 static int patch_got_entries(pid_t pid, const char* exe_path,
                              unsigned long exe_base,
-                             const unsigned long hook_addrs[4])
+                             const unsigned long hook_addrs[4],
+                             char* names_out, size_t names_size)
 {
     FILE* f = fopen(exe_path, "rb");
     if (!f) return -1;
@@ -724,6 +725,16 @@ static int patch_got_entries(pid_t pid, const char* exe_path,
                    (void*)hook_addr) != -1) {
             fprintf(stderr, "[DEBUG] POKEDATA %s: got=0x%lx hook=0x%lx OK\n",
                     name, got_addr, hook_addr);
+            if (names_out && names_size > 0) {
+                size_t cur = strlen(names_out);
+                size_t nlen = strlen(name);
+                size_t need = cur + (cur > 0 ? 1 : 0) + nlen;
+                if (need < names_size) {
+                    if (cur > 0) names_out[cur++] = ',';
+                    memcpy(names_out + cur, name, nlen);
+                    names_out[cur + nlen] = '\0';
+                }
+            }
             patched++;
         } else {
             fprintf(stderr, "[DEBUG] POKEDATA %s: got=0x%lx hook=0x%lx FAIL errno=%d(%s)\n",
@@ -1078,7 +1089,8 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     fprintf(stderr, "[DEBUG] exe_region: start=0x%lx end=0x%lx path=%s\n",
             exe_region->start, exe_region->end, exe_region->path);
 
-    int patched = patch_got_entries(pid, exe_path, exe_base, hook_addrs);
+    int patched = patch_got_entries(pid, exe_path, exe_base, hook_addrs,
+                                     res.patched_names, sizeof(res.patched_names));
     res.patched_count = patched;
 
     /* 注意：不在此处远程调用 mtt_ensure_init()。

@@ -2584,6 +2584,9 @@ static void handle_api_inject(int fd, int pid)
         g_injected[existing].inject_status = (result.status == INJECT_OK) ? 1 : 2;
         g_injected[existing].lib_base = result.lib_base;
         g_injected[existing].patched_count = result.patched_count;
+        snprintf(g_injected[existing].patched_names,
+                 sizeof(g_injected[existing].patched_names),
+                 "%s", result.patched_names);
         snprintf(g_injected[existing].inject_err,
                  sizeof(g_injected[existing].inject_err),
                  "%s", result.err_msg);
@@ -2593,6 +2596,9 @@ static void handle_api_inject(int fd, int pid)
         g_injected[g_ninjected].inject_status = (result.status == INJECT_OK) ? 1 : 2;
         g_injected[g_ninjected].lib_base = result.lib_base;
         g_injected[g_ninjected].patched_count = result.patched_count;
+        snprintf(g_injected[g_ninjected].patched_names,
+                 sizeof(g_injected[g_ninjected].patched_names),
+                 "%s", result.patched_names);
         snprintf(g_injected[g_ninjected].inject_err,
                  sizeof(g_injected[g_ninjected].inject_err),
                  "%s", result.err_msg);
@@ -2626,10 +2632,11 @@ static void handle_api_inject(int fd, int pid)
 
     char hdr[256];
     int body_len = snprintf(resp, sizeof(resp),
-        "{\"pid\":%d,\"status\":\"%s\",\"error\":\"%s\",\"patched\":%d}",
+        "{\"pid\":%d,\"status\":\"%s\",\"error\":\"%s\",\"patched\":%d,\"patched_names\":\"%s\"}",
         pid,
         result.status == INJECT_OK ? "ok" : "fail",
-        result.err_msg, result.patched_count);
+        result.err_msg, result.patched_count,
+        result.patched_names[0] ? result.patched_names : "none");
     int hdrlen = snprintf(hdr, sizeof(hdr),
         "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
         "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
@@ -2662,11 +2669,12 @@ static void send_api_injected(int fd)
         if (i > 0) safe_append(buf, &pos, size, ",");
         safe_append(buf, &pos, size,
             "{\"pid\":%d,\"inject_status\":%d,\"lib_base\":\"0x%lx\","
-            "\"patched\":%d,\"time\":%ld,\"error\":\"%s\"}",
+            "\"patched\":%d,\"patched_names\":\"%s\",\"time\":%ld,\"error\":\"%s\"}",
             g_injected[i].pid,
             g_injected[i].inject_status,
             g_injected[i].lib_base,
             g_injected[i].patched_count,
+            g_injected[i].patched_names[0] ? g_injected[i].patched_names : "none",
             (long)g_injected[i].inject_time,
             g_injected[i].inject_err);
     }
@@ -2780,10 +2788,12 @@ static void handle_debug_injected(int fd)
         mttd_injected_t* inj = &g_injected[i];
         pos += snprintf(buf + pos, size - pos,
             "%s{\"pid\":%d,\"status\":%d,\"lib_base\":\"0x%lx\","
-            "\"patched\":%d,\"time\":%ld,\"error\":\"%s\"}",
+            "\"patched\":%d,\"patched_names\":\"%s\",\"time\":%ld,\"error\":\"%s\"}",
             i > 0 ? "," : "",
             inj->pid, inj->inject_status, inj->lib_base,
-            inj->patched_count, (long)inj->inject_time, inj->inject_err);
+            inj->patched_count,
+            inj->patched_names[0] ? inj->patched_names : "none",
+            (long)inj->inject_time, inj->inject_err);
     }
     pos += snprintf(buf + pos, size - pos, "]}");
     pthread_mutex_unlock(&g_lock);

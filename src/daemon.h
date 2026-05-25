@@ -73,6 +73,7 @@ typedef struct {
     time_t  inject_time;                   /* 注入时间戳 */
     unsigned long lib_base;                /* 注入库在目标中的基地址 */
     int     patched_count;                 /* 成功修补的 GOT 表项数 */
+    char    patched_names[128];            /* 逗号分隔的已修补符号名，如 "malloc,free" */
 } mttd_injected_t;
 
 #endif /* WITHOUT_INJECTOR */
