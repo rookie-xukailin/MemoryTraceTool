@@ -219,7 +219,7 @@ typedef struct {
     char          path[512];
 } mem_region_t;
 
-#define MAX_REGIONS 256
+#define MAX_REGIONS 2048
 
 /**
  * 读取 /proc/<pid>/maps，解析所有内存映射区域。
@@ -241,6 +241,11 @@ static int read_maps(pid_t pid, mem_region_t* regions, int max)
         if (n >= 4) count++;
     }
     fclose(f);
+
+    if (count >= max) {
+        fprintf(stderr, "[DEBUG] WARNING: read_maps hit limit %d, "
+                "high-address regions (libc, ld-linux) may be truncated\n", max);
+    }
     return count;
 }
 
