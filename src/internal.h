@@ -144,6 +144,9 @@ static inline void mtt_stripe_unlock(mtt_state_t* s, const void* ptr)
 
 /** 解析 libc 原始分配器函数指针（raw_malloc/raw_free/raw_calloc），懒加载+递归保护 */
 void        mtt_resolve_raw_allocators(void);
+/** 解析器活跃标志：置位期间 hooks.c 跳过追踪直接透传 raw_*，
+ *  防止 bootstrap 分配器分配的内存后续被 real free 释放导致堆损坏 */
+extern __thread int g_in_resolver;
 /** 惰性初始化全局状态（线程安全，多次调用安全） */
 void        mtt_ensure_init(void);
 /** 创建新的分配追踪记录，填入文件、行号、时间戳和调用栈 */

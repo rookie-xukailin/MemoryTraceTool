@@ -54,6 +54,12 @@ static atomic_int g_raw_resolved = 0;
  * 使用 __thread 确保每个线程独立，避免多线程误判。 */
 static __thread int g_raw_resolving = 0;
 
+/* Bootstrap 窗口标志：置位期间 hooks.c 跳过所有追踪，直接透传 raw_*。
+ * 原因：dlsym 内部 malloc 触发 hook 时 raw_* 指向 bootstrap 分配器，
+ * bootstrap 分配的 entry/数据后续被 real free 释放会导致堆损坏。
+ * 跳过追踪后，dlsym 内部分配不会有追踪记录，避免了 cross-allocator 问题。 */
+__thread int g_in_resolver = 0;
+
 /* Bootstrap 分配器：静态缓冲区，在 raw_* 解析完成前兜底。
  * dlsym 内部可能调用 malloc（尤其在 ARM 平台上），此时 raw_* 尚未就绪，
  * 用此静态缓冲区临时满足分配请求，避免空指针崩溃。
@@ -130,6 +136,10 @@ void mtt_resolve_raw_allocators(void)
     static const char resolve_msg[] = "[mtt-core] mtt_resolve_raw_allocators: resolving...\n";
     write(STDERR_FILENO, resolve_msg, sizeof(resolve_msg) - 1);
     g_raw_resolving = 1;
+    /* 设置 bootstrap 窗口标志：dlsym 内部 malloc 将通过 hooks.c 进入，
+     * 此时 raw_* 仍是 bootstrap 分配器。跳过追踪可防止 bootstrap
+     * 分配的 entry/数据后续被 real free 释放时堆损坏。 */
+    g_in_resolver = 1;
 
     raw_malloc_fn  real_malloc  = (raw_malloc_fn)dlsym(RTLD_NEXT, "malloc");
     raw_free_fn    real_free    = (raw_free_fn)dlsym(RTLD_NEXT, "free");
@@ -151,6 +161,9 @@ void mtt_resolve_raw_allocators(void)
             /* 不 dlclose(libc_handle)：避免 raw_* 悬空 */
         }
     }
+
+    /* 解析完成，退出 bootstrap 窗口 */
+    g_in_resolver = 0;
 
     /* 两种解析路径都失败时保留 bootstrap 分配器。
      * 绝不 fallback 到 malloc/free/calloc 符号：在 LD_PRELOAD

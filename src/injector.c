@@ -396,20 +396,22 @@ fail:
 static int ptrace_write_mem(pid_t pid, unsigned long addr,
                             const void* data, size_t len)
 {
-    const unsigned long* words = (const unsigned long*)data;
+    const char* bytes = (const char*)data;
     size_t nwords = (len + PTRACE_WORD_SIZE - 1) / PTRACE_WORD_SIZE;
 
     for (size_t i = 0; i < nwords; i++) {
         unsigned long word = 0;
-        size_t remain = len - i * PTRACE_WORD_SIZE;
+        size_t off = i * PTRACE_WORD_SIZE;
+        size_t remain = len - off;
         if (remain >= PTRACE_WORD_SIZE) {
-            word = words[i];
+            /* 使用 memcpy 避免非对齐访问 UB（ARM 上可能 SIGBUS） */
+            memcpy(&word, bytes + off, PTRACE_WORD_SIZE);
         } else {
             /* 部分字：先读出现有内容，再拼接 */
             long existing = ptrace(PTRACE_PEEKDATA, pid,
-                                   (void*)(addr + i * PTRACE_WORD_SIZE), NULL);
+                                   (void*)(addr + off), NULL);
             if (existing == -1 && errno != 0) return -1;
-            memcpy(&word, &words[i], remain);
+            memcpy(&word, bytes + off, remain);
             /* 保留原数据的高位部分 */
             memcpy((char*)&word + remain,
                    (char*)&existing + remain,
@@ -1000,9 +1002,14 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
                     "injected process may crash\n");
         } else {
             unsigned long real_malloc = 0, real_free = 0, real_calloc = 0;
-            void* sym_malloc = dlsym(RTLD_DEFAULT, "malloc");
-            void* sym_free   = dlsym(RTLD_DEFAULT, "free");
-            void* sym_calloc = dlsym(RTLD_DEFAULT, "calloc");
+            /* 使用显式 libc 句柄解析符号，避免 dlsym(RTLD_DEFAULT) 在
+             * injector 自身被 LD_PRELOAD 时返回钩子函数的地址。
+             * RTLD_NOLOAD 确保使用已加载的 libc，不会重新加载。 */
+            void* libc_handle = dlopen("libc.so.6", RTLD_LAZY | RTLD_NOLOAD);
+            void* sym_malloc = libc_handle ? dlsym(libc_handle, "malloc") : NULL;
+            void* sym_free   = libc_handle ? dlsym(libc_handle, "free")   : NULL;
+            void* sym_calloc = libc_handle ? dlsym(libc_handle, "calloc") : NULL;
+            if (libc_handle) dlclose(libc_handle);
 
             if (our_libc_base && sym_malloc)
                 real_malloc = libc_base + ((unsigned long)sym_malloc - our_libc_base);
@@ -1090,7 +1097,14 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
                 int init_rc = ptrace_remote_call(pid, init_addr, 0, 0,
                                                   trap_addr, &init_regs);
                 if (init_rc != 0) {
-                    fprintf(stderr, "[DEBUG] remote-init: FAILED (rc=%d)\n", init_rc);
+                    fprintf(stderr, "[DEBUG] remote-init: FAILED (rc=%d) — target may crash\n",
+                            init_rc);
+                    REGS_SET(pid, saved_regs);
+                    ptrace(PTRACE_DETACH, pid, NULL, NULL);
+                    set_error(&res, INJECT_ERR_CRASH,
+                              "mtt_ensure_init remote call failed (rc=%d); "
+                              "target may not be trackable", init_rc);
+                    return res;
                 } else {
                     fprintf(stderr, "[DEBUG] remote-init: OK (init done, HELLO sent)\n");
                 }

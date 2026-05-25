@@ -72,6 +72,11 @@ void* malloc(size_t size)
     /* 0 字节分配按标准放行 */
     if (size == 0) return raw_malloc(0);
 
+    /* 解析器窗口内直接透传：此时 raw_* 可能是 bootstrap 分配器，
+     * 追踪记录后续被 real free 释放会导致堆损坏 */
+    if (g_in_resolver)
+        return raw_malloc(size);
+
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
 
@@ -120,6 +125,13 @@ void* malloc(size_t size)
 void* calloc(size_t count, size_t size)
 {
     mtt_resolve_raw_allocators();
+    if (g_in_resolver) {
+        if (count > 0 && size > SIZE_MAX / count) return NULL;
+        size_t total = count * size;
+        void* ptr = raw_malloc(total);
+        if (ptr) memset(ptr, 0, total);
+        return ptr;
+    }
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
 
@@ -159,6 +171,16 @@ void* realloc(void* ptr, size_t size)
     mtt_resolve_raw_allocators();
     if (!ptr) return malloc(size);
     if (!size) { free(ptr); return NULL; }
+
+    /* 解析器窗口：跳过追踪直接操作 */
+    if (g_in_resolver) {
+        void* new_ptr = raw_malloc(size);
+        if (!new_ptr) return NULL;
+        size_t old_size = malloc_usable_size(ptr);
+        memcpy(new_ptr, ptr, old_size < size ? old_size : size);
+        raw_free(ptr);
+        return new_ptr;
+    }
 
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
@@ -227,6 +249,7 @@ void free(void* ptr)
 {
     mtt_resolve_raw_allocators();
     if (!ptr) return;
+    if (g_in_resolver) { raw_free(ptr); return; }
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
 

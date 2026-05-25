@@ -282,13 +282,9 @@ static void persist_proc(mttd_proc_t* p)
         fprintf(f, "%s{\"size\":%zu,\"file\":\"%s\",\"line\":%d,\"nframes\":%d,\"frames\":[",
                 i > 0 ? "," : "", l->size, escaped, l->line, l->nframes);
         for (int j = 0; j < l->nframes; j++) {
-            fprintf(f, "%s\"", j > 0 ? "," : "");
-            /* 转义 JSON 特殊字符 */
-            for (char* s = l->frames[j]; *s; s++) {
-                if (*s == '"' || *s == '\\') fputc('\\', f);
-                fputc(*s, f);
-            }
-            fputc('"', f);
+            char escaped_frame[MTT_SYMBOL_MAX * 2];
+            json_escape(escaped_frame, l->frames[j], sizeof(escaped_frame));
+            fprintf(f, "%s\"%s\"", j > 0 ? "," : "", escaped_frame);
         }
         fprintf(f, "]}");
     }
@@ -351,16 +347,14 @@ static void load_persisted(void)
             }
         }
 
-        free(json);
-
-        if (pid <= 1) continue;
+        if (pid <= 1) { free(json); continue; }
 
         /* 检查是否已有此 PID 的记录 */
         int exists = 0;
         for (int i = 0; i < g_nprocs; i++) {
             if (g_procs[i].pid == pid) { exists = 1; break; }
         }
-        if (exists) continue;
+        if (exists) { free(json); continue; }
 
         /* 创建记录（标记为非活跃，等待 HELLO 恢复） */
         if (g_nprocs < MTT_MAX_PROCS) {
@@ -368,16 +362,87 @@ static void load_persisted(void)
             memset(p, 0, sizeof(*p));
             p->pid = pid;
             snprintf(p->name, sizeof(p->name), "%s", name[0] ? name : "?");
-            p->active = persisted_active; /* 使用持久化的状态 */
-            p->total_leaked = total_leaked; /* 恢复历史泄漏字节数 */
-            p->leak_count = leak_count;     /* 恢复历史泄漏记录条数 */
+            p->active = persisted_active;
+            p->total_leaked = total_leaked;
+            p->leak_count = 0; /* 由实际解析决定 */
             p->last_seen = time(NULL);
             p->leak_cap = leak_count > 32 ? leak_count : 32;
+            if (p->leak_cap > MTT_MAX_LEAKS) p->leak_cap = MTT_MAX_LEAKS;
             p->leaks = calloc((size_t)p->leak_cap, sizeof(mttd_leak_t));
             pthread_mutex_init(&p->lock, NULL);
+
+            /* 解析每条泄漏记录 */
+            {
+                char* leakp = strstr(json, "\"leaks\":[");
+                if (leakp) {
+                    leakp += 8; /* 跳过 "leaks":[ */
+                    char* start = leakp;
+                    while (*start && p->leak_count < p->leak_cap) {
+                        char* lb = strstr(start, "{\"size\":");
+                        if (!lb) break;
+                        mttd_leak_t* lk = &p->leaks[p->leak_count];
+
+                        /* size */
+                        char* szp = strstr(lb, "\"size\":");
+                        if (szp) lk->size = (size_t)atoll(szp + 7);
+
+                        /* file */
+                        char* fp_str = strstr(lb, "\"file\":\"");
+                        if (fp_str) {
+                            fp_str += 8;
+                            int fi = 0;
+                            while (*fp_str && *fp_str != '"' && fi < 127)
+                                lk->file[fi++] = *fp_str++;
+                            lk->file[fi] = '\0';
+                        }
+
+                        /* line */
+                        char* lnp = strstr(lb, "\"line\":");
+                        if (lnp) lk->line = atoi(lnp + 7);
+
+                        /* nframes */
+                        char* nfp = strstr(lb, "\"nframes\":");
+                        if (nfp) {
+                            lk->nframes = atoi(nfp + 10);
+                            if (lk->nframes > MTT_MAX_STACK) lk->nframes = MTT_MAX_STACK;
+                            if (lk->nframes < 0) lk->nframes = 0;
+                        }
+
+                        /* frames 数组 */
+                        char* frames_start = strstr(lb, "\"frames\":[");
+                        if (frames_start) {
+                            frames_start += 10; /* 跳过 "frames":[ */
+                            char* fc = frames_start;
+                            for (int fj = 0; fj < lk->nframes; ) {
+                                char* fq = strchr(fc, '"');
+                                if (!fq) break;
+                                char* fe = strchr(fq + 1, '"');
+                                if (!fe) break;
+                                size_t flen = (size_t)(fe - fq - 1);
+                                if (flen > MTT_SYMBOL_MAX - 1) flen = MTT_SYMBOL_MAX - 1;
+                                memcpy(lk->frames[fj], fq + 1, flen);
+                                lk->frames[fj][flen] = '\0';
+                                fj++;
+                                fc = fe + 1;
+                            }
+                        }
+
+                        p->leak_count++;
+                        p->total_leaked += lk->size;
+                        /* 更新全局计数器 */
+                        atomic_fetch_add(&g_total_leaks_global, 1);
+
+                        /* 找下一个 leak 起始 or 数组结束 */
+                        char* next = strstr(lb + 1, "{\"size\":");
+                        start = next;
+                    }
+                }
+            }
+
             printf("[mttd] 已加载历史记录: PID %d (%s), 总计=%zu, 泄漏=%d 条\n",
-                   pid, name, total_leaked, leak_count);
+                   pid, name, p->total_leaked, p->leak_count);
         }
+        free(json);
     }
     closedir(d);
 }
@@ -415,6 +480,7 @@ typedef struct {
     char buf[MTT_UNIX_BUF_SZ];
     int  bufpos;
     mttd_proc_t* proc;
+    int  skip_frames; /* LEAK sscanf 失败时置 1，跳过后续 FRAME 防止串帧 */
 } unix_client_ctx_t;
 
 /* ---- Unix Socket 客户端处理 ---- */
@@ -488,8 +554,7 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
         else if (strncmp(line, "LEAK ", 5) == 0 && ctx->proc) {
             mttd_leak_t leak;
             memset(&leak, 0, sizeof(leak));
-            /* 缺陷修复 #2: 检查 sscanf 返回值，防止格式化错误
-             * 缺陷修复 #3: %127s 防止缓冲区溢出 */
+            ctx->skip_frames = 1; /* 预设跳过 FRAME，sscanf 成功后清除 */
             if (sscanf(line, "LEAK %zu %127s %d %d",
                        &leak.size, leak.file, &leak.line, &leak.nframes) >= 4) {
                 fprintf(stderr, "[mttd] LEAK pid=%d name=%s size=%zu file=%s:%d frames=%d\n",
@@ -498,13 +563,15 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
                 if (leak.nframes > MTT_MAX_STACK) leak.nframes = MTT_MAX_STACK;
                 if (leak.nframes < 0) leak.nframes = 0;
                 pthread_mutex_lock(&ctx->proc->lock);
-                add_leak(ctx->proc, &leak);
+                int added = add_leak(ctx->proc, &leak);
                 int should_persist = (ctx->proc->leak_count % 5 == 0);
                 pthread_mutex_unlock(&ctx->proc->lock);
+                ctx->skip_frames = (added != 0); /* add_leak 失败则跳过后续 FRAME */
                 if (should_persist) persist_proc(ctx->proc);
             }
         }
-        else if (strncmp(line, "FRAME ", 6) == 0 && ctx->proc) {
+        else if (strncmp(line, "FRAME ", 6) == 0 && ctx->proc
+                 && !ctx->skip_frames) {
             int idx = -1;
             char sym[MTT_SYMBOL_MAX] = {0};
             if (sscanf(line, "FRAME %d %255[^\n]", &idx, sym) >= 2) {
