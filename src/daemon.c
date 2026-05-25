@@ -60,6 +60,27 @@ static int             g_ninjected = 0;               /* 当前注入数 */
 /* 长期监控安全: 全局泄漏记录计数器 */
 static _Atomic size_t g_total_leaks_global = 0;
 
+/* 被清除的 PID 黑名单：/api/clear 或 /api/reset 移除的进程不可通过 HELLO 重连 */
+#define MTT_BLOCKED_MAX 256
+static int g_blocked_pids[MTT_BLOCKED_MAX];
+static int g_nblocked = 0;
+
+/** 检查 PID 是否在黑名单中 */
+static int is_pid_blocked(int pid)
+{
+    for (int i = 0; i < g_nblocked; i++)
+        if (g_blocked_pids[i] == pid) return 1;
+    return 0;
+}
+
+/** 将 PID 加入黑名单（去重） */
+static void block_pid(int pid)
+{
+    if (g_nblocked >= MTT_BLOCKED_MAX) return;
+    if (is_pid_blocked(pid)) return;
+    g_blocked_pids[g_nblocked++] = pid;
+}
+
 /* ---- 辅助函数 ---- */
 
 /**
@@ -349,6 +370,9 @@ static void load_persisted(void)
 
         if (pid <= 1) { free(json); continue; }
 
+        /* 跳过黑名单中的 PID */
+        if (is_pid_blocked(pid)) { free(json); continue; }
+
         /* 检查是否已有此 PID 的记录 */
         int exists = 0;
         for (int i = 0; i < g_nprocs; i++) {
@@ -534,9 +558,14 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
             if (sscanf(line, "HELLO %d %255[^\n]", &pid, name) >= 1) {
                 fprintf(stderr, "[mttd] HELLO pid=%d name=%s\n", pid, name);
                 pthread_mutex_lock(&g_lock);
-                ctx->proc = find_or_create_proc(pid, name);
-                if (ctx->proc) ctx->proc->active = 1;
-                pthread_mutex_unlock(&g_lock);
+                if (is_pid_blocked(pid)) {
+                    fprintf(stderr, "[mttd] HELLO pid=%d ignored (blocked)\n", pid);
+                    pthread_mutex_unlock(&g_lock);
+                } else {
+                    ctx->proc = find_or_create_proc(pid, name);
+                    if (ctx->proc) ctx->proc->active = 1;
+                    pthread_mutex_unlock(&g_lock);
+                }
             }
         }
         else if (strncmp(line, "STAT ", 5) == 0 && ctx->proc) {
@@ -2640,7 +2669,8 @@ static void handle_api_reset(int fd)
             if (kept != i) g_procs[kept] = g_procs[i];
             kept++;
         } else {
-            /* 销毁已退出进程的互斥锁 */
+            /* 销毁已退出进程的互斥锁，加入黑名单防止 HELLO 重连 */
+            block_pid(g_procs[i].pid);
             pthread_mutex_destroy(&g_procs[i].lock);
             removed++;
         }
@@ -2691,8 +2721,9 @@ static void handle_api_clear(int fd)
 
     pthread_mutex_lock(&g_lock);
 
-    /* 释放所有进程（包括活跃进程），销毁互斥锁 */
+    /* 释放所有进程（包括活跃进程），销毁互斥锁，加入黑名单防止 HELLO 重连 */
     for (int i = 0; i < g_nprocs; i++) {
+        block_pid(g_procs[i].pid);
         free(g_procs[i].leaks);
         g_procs[i].leaks = NULL;
         pthread_mutex_destroy(&g_procs[i].lock);

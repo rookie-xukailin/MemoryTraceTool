@@ -1081,39 +1081,11 @@ inject_result_t inject_library(pid_t pid, const char* lib_path)
     int patched = patch_got_entries(pid, exe_path, exe_base, hook_addrs);
     res.patched_count = patched;
 
-    /* ---- Step 8.5: 远程调用 mtt_ensure_init() 立即初始化 ----
-     * 注入后目标进程可能长时间不调用 malloc，导致 mtt_ensure_init
-     * 不被触发，进程永不连接 daemon、不出现在 Web 看板上。
-     * 此处通过一次额外的 ptrace 远程调用主动触发初始化，
-     * 使 .so 立即发送 HELLO 到 daemon，注入后即时可见。 */
-    {
-        unsigned long init_off = 0;
-        if (elf_find_symbol(abs_lib, "mtt_ensure_init", &init_off) == 0) {
-            unsigned long init_addr = so_base + init_off;
-            fprintf(stderr, "[DEBUG] remote-init: calling mtt_ensure_init at 0x%lx\n",
-                    init_addr);
-
-            native_regs_t init_regs;
-            if (REGS_GET(pid, init_regs) == 0) {
-                int init_rc = ptrace_remote_call(pid, init_addr, 0, 0,
-                                                  trap_addr, &init_regs);
-                if (init_rc != 0) {
-                    fprintf(stderr, "[DEBUG] remote-init: FAILED (rc=%d) — target may crash\n",
-                            init_rc);
-                    REGS_SET(pid, saved_regs);
-                    ptrace(PTRACE_DETACH, pid, NULL, NULL);
-                    set_error(&res, INJECT_ERR_CRASH,
-                              "mtt_ensure_init remote call failed (rc=%d); "
-                              "target may not be trackable", init_rc);
-                    return res;
-                } else {
-                    fprintf(stderr, "[DEBUG] remote-init: OK (init done, HELLO sent)\n");
-                }
-            }
-        } else {
-            fprintf(stderr, "[DEBUG] remote-init: mtt_ensure_init symbol not found in .so\n");
-        }
-    }
+    /* 注意：不在此处远程调用 mtt_ensure_init()。
+     * ptrace 远程调用上下文中执行 mtt_ensure_init 在 ARM32 上会触发 SIGSEGV，
+     * 原因是该函数内部调用 pthread_create / fprintf 等，在远程调用栈上不安全。
+     * 库设计为懒初始化：目标进程下一次调用 malloc 时，钩子自然触发
+     * mtt_ensure_init → mtt_start_periodic_report → 发送 HELLO 到 daemon。 */
 
     /* ---- Step 9: 恢复并分离 ---- */
     REGS_SET(pid, saved_regs);
