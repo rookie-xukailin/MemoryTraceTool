@@ -1056,7 +1056,6 @@ static const char* g_dashboard_html =
 ".cn .src-tip{color:var(--green);font-size:12px;margin-left:6px;font-family:var(--mono)}\n"
 ".cn:not(.lk)::after{content:'\\25be';position:absolute;left:21px;bottom:0;font-size:7px;color:var(--accent);transform:translateY(55%);opacity:0.45;pointer-events:none}\n"
 "\n"
-"
 ".pg{\n"
 "  background:transparent;border:1px solid var(--border);color:var(--text2);\n"
 "  padding:2px 7px;border-radius:3px;cursor:pointer;font-size:11px;\n"
