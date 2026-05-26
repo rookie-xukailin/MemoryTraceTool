@@ -93,6 +93,18 @@ static inline int hook_is_over_capacity(mtt_state_t* s)
  */
 void* malloc(size_t size)
 {
+    /* 无条件首次进入诊断：确认 malloc hook 是否被调用（无论任何条件） */
+    {
+        static int first_entry = 1;
+        if (first_entry) {
+            first_entry = 0;
+            char tr[128];
+            snprintf(tr, sizeof(tr), "DIAG: malloc hook ENTERED size=%zu pid=%d g_in_resolver=%d",
+                size, (int)getpid(), g_in_resolver);
+            client_trace(tr);
+        }
+    }
+
     /* 首次钩子调用 trace：确认 GOT 修补后钩子确实被触发 */
     {
         unsigned long nth = atomic_fetch_add(&g_hook_trace_throttle, 1);
@@ -200,6 +212,18 @@ void* calloc(size_t count, size_t size)
 
     /* 完全禁用时直接透传到 raw_calloc */
     if (s->disabled) {
+        /* 诊断：disabled 被触发，记录原因上下文 */
+        {
+            static int first_disabled = 1;
+            if (first_disabled) {
+                first_disabled = 0;
+                char tr[160];
+                snprintf(tr, sizeof(tr),
+                    "DIAG: calloc DISABLED path count=%zu size=%zu filter='%s' env_checked=%d",
+                    count, size, s->proc_filter, s->env_checked);
+                client_trace(tr);
+            }
+        }
         /* 仍然做整数溢出检查 */
         if (count > 0 && size > SIZE_MAX / count) {
             return NULL;
@@ -218,6 +242,18 @@ void* calloc(size_t count, size_t size)
         return NULL;
     }
     size_t total = count * size;
+    /* 诊断：打印 disabled/采样 状态，确认走到非禁用路径 */
+    {
+        static int first_calloc_malloc = 1;
+        if (first_calloc_malloc) {
+            first_calloc_malloc = 0;
+            char tr[160];
+            snprintf(tr, sizeof(tr),
+                "DIAG: calloc about to call malloc(total=%zu) disabled=%d sample=%u env_checked=%d",
+                total, s->disabled, s->sample_period, s->env_checked);
+            client_trace(tr);
+        }
+    }
     void*  ptr   = malloc(total); /* 调用本文件的 LD_PRELOAD 版 malloc */
     if (ptr) memset(ptr, 0, total);
     return ptr;
