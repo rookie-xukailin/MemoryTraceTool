@@ -18,6 +18,7 @@ SHARED_LIB = $(BUILD_DIR)/libmemorytracetool.so
 .PHONY: all clean daemon demo demo_preload test test_daemon run_daemon_demo run_demo_long_running stop_daemon injector demo_stealth_leak run_demo_stealth_leak
 
 all: $(SHARED_LIB) daemon
+	@rm -f $(BUILD_DIR)/*.o
 
 # Shared library
 $(SHARED_LIB): $(LIB_OBJS) | $(BUILD_DIR)
