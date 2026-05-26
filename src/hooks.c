@@ -39,6 +39,11 @@
 #define HOOK_LOG_INTERVAL 128
 static _Atomic unsigned long g_hook_malloc_calls = 0;
 static _Atomic unsigned long g_hook_free_calls   = 0;
+/* trace 节流：避免每次钩子调用都写 trace 文件，产生 IO 风暴 */
+static _Atomic unsigned long g_hook_trace_throttle = 0;
+static _Atomic unsigned long g_hook_calloc_throttle = 0;
+static _Atomic unsigned long g_hook_realloc_throttle = 0;
+#define HOOK_TRACE_INTERVAL 256
 
 static void hook_diag_tick(void)
 {
@@ -88,6 +93,25 @@ static inline int hook_is_over_capacity(mtt_state_t* s)
  */
 void* malloc(size_t size)
 {
+    /* 首次钩子调用 trace：确认 GOT 修补后钩子确实被触发 */
+    {
+        unsigned long nth = atomic_fetch_add(&g_hook_trace_throttle, 1);
+        if (nth == 0) {
+            char tr[96];
+            snprintf(tr, sizeof(tr), "hook: FIRST malloc(size=%zu) pid=%d — hooks ARE firing",
+                size, (int)getpid());
+            client_trace(tr);
+        } else if ((nth % HOOK_TRACE_INTERVAL) == 0) {
+            mtt_state_t* ts = mtt_state_get();
+            char tr[160];
+            snprintf(tr, sizeof(tr),
+                "hook: malloc #%lu cur_bytes=%zu allocs=%zu frees=%zu",
+                nth, atomic_load(&ts->current_bytes),
+                atomic_load(&ts->alloc_count), atomic_load(&ts->free_count));
+            client_trace(tr);
+        }
+    }
+
     hook_diag_tick();
     mtt_resolve_raw_allocators();
 
@@ -146,6 +170,23 @@ void* malloc(size_t size)
  */
 void* calloc(size_t count, size_t size)
 {
+    /* 首次钩子调用 trace */
+    {
+        unsigned long nth = atomic_fetch_add(&g_hook_calloc_throttle, 1);
+        if (nth == 0) {
+            char tr[128];
+            snprintf(tr, sizeof(tr), "hook: FIRST calloc(count=%zu,size=%zu) pid=%d",
+                count, size, (int)getpid());
+            client_trace(tr);
+        } else if ((nth % HOOK_TRACE_INTERVAL) == 0) {
+            char tr[160];
+            snprintf(tr, sizeof(tr),
+                "hook: calloc #%lu count=%zu size=%zu total=%zu",
+                nth, count, size, count * size);
+            client_trace(tr);
+        }
+    }
+
     mtt_resolve_raw_allocators();
     if (g_in_resolver) {
         if (count > 0 && size > SIZE_MAX / count) return NULL;
@@ -190,6 +231,23 @@ void* calloc(size_t count, size_t size)
  */
 void* realloc(void* ptr, size_t size)
 {
+    /* 首次钩子调用 trace */
+    {
+        unsigned long nth = atomic_fetch_add(&g_hook_realloc_throttle, 1);
+        if (nth == 0) {
+            char tr[128];
+            snprintf(tr, sizeof(tr), "hook: FIRST realloc(ptr=%p,size=%zu) pid=%d",
+                ptr, size, (int)getpid());
+            client_trace(tr);
+        } else if ((nth % HOOK_TRACE_INTERVAL) == 0) {
+            char tr[160];
+            snprintf(tr, sizeof(tr),
+                "hook: realloc #%lu ptr=%p size=%zu",
+                nth, ptr, size);
+            client_trace(tr);
+        }
+    }
+
     mtt_resolve_raw_allocators();
     if (!ptr) return malloc(size);
     if (!size) { free(ptr); return NULL; }
@@ -276,6 +334,22 @@ void free(void* ptr)
     if (g_in_resolver) return;
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
+
+    /* free 节流 trace：仅首次和每 512 次输出 */
+    {
+        unsigned long n = atomic_fetch_add(&g_hook_free_calls, 1);
+        if (n == 0) {
+            char tr[96];
+            snprintf(tr, sizeof(tr), "hook: FIRST free(ptr=%p) pid=%d", ptr, (int)getpid());
+            client_trace(tr);
+        } else if ((n % 512) == 0) {
+            char tr[128];
+            snprintf(tr, sizeof(tr), "hook: free #%lu cur_bytes=%zu allocs=%zu frees=%zu",
+                n, atomic_load(&s->current_bytes),
+                atomic_load(&s->alloc_count), atomic_load(&s->free_count));
+            client_trace(tr);
+        }
+    }
 
     if (s->disabled) {
         raw_free(ptr);

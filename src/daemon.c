@@ -596,6 +596,19 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
     ctx->bufpos += (int)n;
     ctx->buf[ctx->bufpos] = '\0';
 
+    /* 原始 socket 数据日志：截取前 120 字符防止日志爆炸 */
+    {
+        char preview[128];
+        int plen = n < 120 ? (int)n : 120;
+        memcpy(preview, ctx->buf + ctx->bufpos - (int)n, (size_t)plen);
+        preview[plen] = '\0';
+        /* 换行符替换为可读标记 */
+        for (int i = 0; i < plen; i++)
+            if (preview[i] == '\n') preview[i] = '|';
+        log_event(MTT_EVT_CLIENT, "RAW fd=%d n=%zd proc=%d [%s]",
+                  fd, n, ctx->proc ? ctx->proc->pid : 0, preview);
+    }
+
     char* line = ctx->buf;
     char* nl;
 

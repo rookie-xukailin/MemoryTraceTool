@@ -242,7 +242,7 @@ typedef struct {
  * daemon 通过 /api/debug/trace?pid=N URL 读取这些日志，
  * 用于诊断报告线程的精确失败点。
  */
-static void client_trace(const char* msg)
+void client_trace(const char* msg)
 {
     char path[96];
     int n = snprintf(path, sizeof(path), "/tmp/mtt_trace_%d.log", getpid());

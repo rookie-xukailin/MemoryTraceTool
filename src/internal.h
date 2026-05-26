@@ -166,5 +166,7 @@ void        mtt_client_report(void);
 void        mtt_client_report_final(void);
 /** 启动周期性报告线程（每 3 秒推送一次，供实时看板使用） */
 void        mtt_start_periodic_report(void);
+/** 客户端诊断 trace：纯 syscall 写 /tmp/mtt_trace_<PID>.log（不触发 malloc） */
+void        client_trace(const char* msg);
 
 #endif /* MEMORYTRACETOOL_INTERNAL_H */

@@ -458,9 +458,12 @@ void mtt_ensure_init(void)
     mtt_state_t* s = &g_state;
 
     /* 快速路径：初始化已完成 */
-    if (atomic_load(&s->initialized))
+    if (atomic_load(&s->initialized)) {
+        /* 非首次调用不写 trace，避免每 3 秒报告线程触发 */
         return;
+    }
 
+    client_trace("init: mtt_ensure_init entering (first call, will init)");
     fprintf(stderr, "[mtt-core] mtt_ensure_init: initializing...\n");
 
     /* ---- 阶段 1: 读取环境变量（无需持锁，getenv 只读 environ 不触发 malloc） ---- */
@@ -523,6 +526,8 @@ void mtt_ensure_init(void)
         return;
     }
 
+    client_trace("init: bucket table allocated, initializing locks and counters");
+
     s->hash_seed = ((unsigned long)time(NULL) ^
                     ((unsigned long)getpid() << 16) ^
                     0x9e3779b97f4a7c15UL);
@@ -559,7 +564,9 @@ void mtt_ensure_init(void)
 
     /* ---- 阶段 3: 注册回调（不持锁，允许内部调用 malloc/fopen 等） ---- */
     atexit(mtt_atexit_report);
+    client_trace("init: atexit registered, starting periodic report");
     mtt_start_periodic_report();
+    client_trace("init: mtt_ensure_init complete");
 }
 
 /** 显式初始化（等同于 mtt_ensure_init） */
