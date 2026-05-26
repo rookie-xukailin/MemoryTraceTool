@@ -28,7 +28,8 @@
 
 /** 守护进程存储的单条泄漏信息（从客户端 LEAK/FRAME 消息反序列化） */
 typedef struct {
-    size_t  size;                            /* 泄漏字节数 */
+    size_t  size;                            /* 该调用点泄漏总字节数（累加） */
+    int     count;                           /* 该调用点分配次数（聚合） */
     char    file[128];                       /* 源文件名 */
     int     line;                            /* 源文件行号 */
     int     nframes;                         /* 实际栈帧数 */

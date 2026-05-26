@@ -557,7 +557,89 @@ typedef struct {
     int  bufpos;
     mttd_proc_t* proc;
     int  skip_frames; /* LEAK sscanf 失败时置 1，跳过后续 FRAME 防止串帧 */
+    mttd_leak_t pending_leak; /* 正接收的泄漏（FRAME 收完前暂存） */
+    int         has_pending;   /* 1 = pending_leak 待提交 */
 } unix_client_ctx_t;
+
+/**
+ * 从泄漏记录的 file/line/frames 提取去重签名。
+ *
+ * Macro 模式（file:line 明确）: 返回 "file:line"
+ * LD_PRELOAD 模式（file=="?", line==0）: 取第一个非内部帧的函数名+偏移作为 key
+ *
+ * @param leak      泄漏记录
+ * @param key       输出缓冲区
+ * @param key_size  缓冲区大小
+ */
+static void leak_signature(mttd_leak_t* leak, char* key, size_t key_size)
+{
+    /* Macro 模式：用源文件位置精确标识 */
+    if (leak->file[0] != '?' || leak->line != 0) {
+        snprintf(key, key_size, "%s:%d", leak->file, leak->line);
+        return;
+    }
+
+    /* LD_PRELOAD 模式：找第一个用户帧 */
+    for (int i = 0; i < leak->nframes; i++) {
+        const char* f = leak->frames[i];
+        if (!f[0]) continue;
+        /* 跳过内部帧 */
+        if (strstr(f, "libmemorytracetool")) continue;
+        if (strncmp(f, "mtt_", 4) == 0) continue;
+        if (strstr(f, "capture_stack")) continue;
+        if (strstr(f, "backtrace")) continue;
+        /* 提取 func+offset 部分: "func+0xNN (lib)|..." → "func+0xNN" */
+        const char* paren = strchr(f, '(');
+        const char* pipe  = strchr(f, '|');
+        const char* end   = paren;
+        if (!end || (pipe && pipe < paren)) end = pipe;
+        if (end) {
+            /* 去掉末尾空格 */
+            while (end > f && end[-1] == ' ') end--;
+            size_t len = (size_t)(end - f);
+            if (len >= key_size) len = key_size - 1;
+            memcpy(key, f, len);
+            key[len] = '\0';
+        } else {
+            snprintf(key, key_size, "%s", f);
+        }
+        return;
+    }
+
+    /* 无用户帧 */
+    snprintf(key, key_size, "?:0");
+}
+
+/**
+ * 提交暂存的泄漏记录：计算签名 → 查重 → 合并或新增。
+ *
+ * 调用者需持有 proc->lock。
+ *
+ * @param proc     目标进程记录
+ * @param pending  待提交的泄漏（含完整 frames）
+ */
+static void commit_pending_leak(mttd_proc_t* proc, mttd_leak_t* pending)
+{
+    char sig[320];
+    leak_signature(pending, sig, sizeof(sig));
+
+    /* 查找同签名已有记录 */
+    for (int i = 0; i < proc->leak_count; i++) {
+        char existing_sig[320];
+        leak_signature(&proc->leaks[i], existing_sig, sizeof(existing_sig));
+        if (strcmp(sig, existing_sig) == 0) {
+            /* 合并到已有记录 */
+            proc->leaks[i].size += pending->size;
+            proc->leaks[i].count++;
+            proc->total_leaked += pending->size;
+            return;
+        }
+    }
+
+    /* 新调用点：新增记录 */
+    pending->count = 1;
+    add_leak(proc, pending);
+}
 
 /* ---- Unix Socket 客户端处理 ---- */
 
@@ -583,6 +665,15 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
     ssize_t n = read(fd, ctx->buf + ctx->bufpos,
                      sizeof(ctx->buf) - ctx->bufpos - 1);
     if (n <= 0) {
+        /* 提交未完成的 pending leak */
+        if (ctx->has_pending && ctx->proc) {
+            pthread_mutex_lock(&ctx->proc->lock);
+            commit_pending_leak(ctx->proc, &ctx->pending_leak);
+            ctx->has_pending = 0;
+            int persist = (ctx->proc->leak_count > 0);
+            pthread_mutex_unlock(&ctx->proc->lock);
+            if (persist) persist_proc(ctx->proc);
+        }
         if (ctx->proc)
             fprintf(stderr, "[mttd] client fd=%d disconnected (pid=%d name=%s n=%zd errno=%d)\n",
                     fd, ctx->proc->pid, ctx->proc->name, n, errno);
@@ -636,6 +727,15 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
             }
         }
         else if (strncmp(line, "STAT ", 5) == 0 && ctx->proc) {
+            /* 提交未完成的 pending leak（STAT 表示新一轮报告开始） */
+            if (ctx->has_pending) {
+                pthread_mutex_lock(&ctx->proc->lock);
+                commit_pending_leak(ctx->proc, &ctx->pending_leak);
+                int should_persist = (ctx->proc->leak_count > 0);
+                ctx->has_pending = 0;
+                pthread_mutex_unlock(&ctx->proc->lock);
+                if (should_persist) persist_proc(ctx->proc);
+            }
             size_t cur_bytes = 0, allocs = 0, frees = 0, vm_rss = 0;
             if (sscanf(line, "STAT %zu %zu %zu %zu",
                        &cur_bytes, &allocs, &frees, &vm_rss) >= 4) {
@@ -652,40 +752,52 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
             }
         }
         else if (strncmp(line, "LEAK ", 5) == 0 && ctx->proc) {
-            mttd_leak_t leak;
-            memset(&leak, 0, sizeof(leak));
+            /* 若上一轮 LEAK 的 FRAME 未提交，先提交 */
+            if (ctx->has_pending) {
+                pthread_mutex_lock(&ctx->proc->lock);
+                commit_pending_leak(ctx->proc, &ctx->pending_leak);
+                ctx->has_pending = 0;
+                pthread_mutex_unlock(&ctx->proc->lock);
+            }
+            memset(&ctx->pending_leak, 0, sizeof(ctx->pending_leak));
             ctx->skip_frames = 1; /* 预设跳过 FRAME，sscanf 成功后清除 */
             if (sscanf(line, "LEAK %zu %127s %d %d",
-                       &leak.size, leak.file, &leak.line, &leak.nframes) >= 4) {
+                       &ctx->pending_leak.size, ctx->pending_leak.file,
+                       &ctx->pending_leak.line, &ctx->pending_leak.nframes) >= 4) {
                 fprintf(stderr, "[mttd] LEAK pid=%d name=%s size=%zu file=%s:%d frames=%d\n",
                         ctx->proc->pid, ctx->proc->name,
-                        leak.size, leak.file, leak.line, leak.nframes);
+                        ctx->pending_leak.size, ctx->pending_leak.file,
+                        ctx->pending_leak.line, ctx->pending_leak.nframes);
                 log_event(MTT_EVT_CLIENT, "LEAK pid=%d size=%zu file=%s:%d frames=%d",
-                        ctx->proc->pid, leak.size, leak.file, leak.line, leak.nframes);
-                if (leak.nframes > MTT_MAX_STACK) leak.nframes = MTT_MAX_STACK;
-                if (leak.nframes < 0) leak.nframes = 0;
-                pthread_mutex_lock(&ctx->proc->lock);
-                int added = add_leak(ctx->proc, &leak);
-                int should_persist = (ctx->proc->leak_count % 5 == 0);
-                pthread_mutex_unlock(&ctx->proc->lock);
-                ctx->skip_frames = (added != 0); /* add_leak 失败则跳过后续 FRAME */
-                if (should_persist) persist_proc(ctx->proc);
+                        ctx->proc->pid, ctx->pending_leak.size,
+                        ctx->pending_leak.file, ctx->pending_leak.line,
+                        ctx->pending_leak.nframes);
+                if (ctx->pending_leak.nframes > MTT_MAX_STACK)
+                    ctx->pending_leak.nframes = MTT_MAX_STACK;
+                if (ctx->pending_leak.nframes < 0)
+                    ctx->pending_leak.nframes = 0;
+                ctx->skip_frames = 0;
+                ctx->has_pending = 1;
             }
         }
         else if (strncmp(line, "FRAME ", 6) == 0 && ctx->proc
-                 && !ctx->skip_frames) {
+                 && !ctx->skip_frames && ctx->has_pending) {
             int idx = -1;
             char sym[MTT_SYMBOL_MAX] = {0};
             if (sscanf(line, "FRAME %d %255[^\n]", &idx, sym) >= 2) {
-                pthread_mutex_lock(&ctx->proc->lock);
-                if (ctx->proc->leak_count > 0 && idx >= 0 && idx < MTT_MAX_STACK) {
-                    mttd_leak_t* last = &ctx->proc->leaks[ctx->proc->leak_count - 1];
-                    snprintf(last->frames[idx], MTT_SYMBOL_MAX, "%s", sym);
+                if (idx >= 0 && idx < MTT_MAX_STACK) {
+                    snprintf(ctx->pending_leak.frames[idx], MTT_SYMBOL_MAX, "%s", sym);
                 }
-                pthread_mutex_unlock(&ctx->proc->lock);
             }
         }
         else if (strcmp(line, "BYE") == 0) {
+            /* 提交未完成的 pending leak */
+            if (ctx->has_pending && ctx->proc) {
+                pthread_mutex_lock(&ctx->proc->lock);
+                commit_pending_leak(ctx->proc, &ctx->pending_leak);
+                ctx->has_pending = 0;
+                pthread_mutex_unlock(&ctx->proc->lock);
+            }
             if (ctx->proc) {
                 fprintf(stderr, "[mttd] BYE pid=%d name=%s leak_count=%d\n",
                         ctx->proc->pid, ctx->proc->name, ctx->proc->leak_count);
@@ -877,10 +989,6 @@ static const char* g_dashboard_html =
 "tbody tr.clickable{cursor:pointer}\n"
 "tbody tr.clickable:hover td{color:var(--accent)}\n"
 "\n"
-"/* 可注入进程表保持紧凑字体 */\n"
-".inj-table thead th{font-size:10px;padding:6px 8px}\n"
-".inj-table tbody td{font-size:12px;padding:5px 8px}\n"
-"\n"
 "\n"
 ".badge{\n"
 "  display:inline-flex;align-items:center;gap:4px;padding:1px 7px;\n"
@@ -890,21 +998,6 @@ static const char* g_dashboard_html =
 ".badge-live::before{content:'';width:5px;height:5px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}\n"
 ".badge-gone{background:rgba(255,255,255,.03);color:var(--text3)}\n"
 "@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}\n"
-".badge-ok{background:rgba(0,230,118,.06);color:var(--green);font-size:11px;padding:1px 7px;border-radius:3px;font-family:var(--font)}\n"
-".badge-fail{background:rgba(255,59,59,.06);color:var(--red);font-size:11px;padding:1px 7px;border-radius:3px;font-family:var(--font)}\n"
-".badge-pend{background:rgba(255,184,0,.06);color:var(--orange);font-size:11px;padding:1px 7px;border-radius:3px;font-family:var(--font)}\n"
-"\n"
-".btn-sm{\n"
-"  padding:2px 8px;font-size:11px;border-radius:3px;font-family:var(--font);\n"
-"  border:1px solid var(--border-strong);background:transparent;color:var(--text);cursor:pointer;\n"
-"  cursor:pointer;transition:all .12s;position:relative;overflow:hidden;\n"
-"}\n"
-".btn-sm:hover{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}\n"
-".btn-sm:disabled{opacity:.35;cursor:not-allowed}\n"
-".btn-sm:disabled:hover{background:transparent;color:var(--text);border-color:var(--border-strong)}\n"
-"\n"
-".cmdline{font-family:var(--mono);font-size:12px;color:var(--text3);max-width:220px;overflow:hidden;text-overflow:ellipsis;display:inline-block}\n"
-"\n"
 "/* ===== CONTROLS ===== */\n"
 ".ctrls{display:flex;gap:6px;align-items:center;margin-bottom:6px;flex-wrap:wrap}\n"
 ".ctrls input{\n"
@@ -913,7 +1006,7 @@ static const char* g_dashboard_html =
 "  transition:border-color .15s;\n"
 "}\n"
 ".ctrls input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(0,212,255,.3)}\n"
-"button:focus-visible,.btn:focus-visible,.btn-sm:focus-visible,.pg:focus-visible,.sort:focus-visible,.sb-item:focus-visible{outline:none;box-shadow:0 0 0 2px var(--accent)}\n"
+"button:focus-visible,.btn:focus-visible,.pg:focus-visible,.sort:focus-visible,.sb-item:focus-visible{outline:none;box-shadow:0 0 0 2px var(--accent)}\n"
 ".ctrls input::placeholder{color:var(--text3)}\n"
 ".sort{font-size:11px;padding:2px 9px;cursor:pointer}\n"
 ".sort.on{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}\n"
@@ -963,8 +1056,7 @@ static const char* g_dashboard_html =
 ".cn .src-tip{color:var(--green);font-size:12px;margin-left:6px;font-family:var(--mono)}\n"
 ".cn:not(.lk)::after{content:'\\25be';position:absolute;left:21px;bottom:0;font-size:7px;color:var(--accent);transform:translateY(55%);opacity:0.45;pointer-events:none}\n"
 "\n"
-"/* ===== PAGER ===== */\n"
-".pager{display:flex;align-items:center;justify-content:center;gap:2px;margin-top:6px}\n"
+"
 ".pg{\n"
 "  background:transparent;border:1px solid var(--border);color:var(--text2);\n"
 "  padding:2px 7px;border-radius:3px;cursor:pointer;font-size:11px;\n"
@@ -1114,7 +1206,7 @@ static const char* g_dashboard_html =
 "  </div>\n"
 "  <div>\n"
 "    <button class=\"btn\" id=\"btn-pause\" onclick=\"toggleAuto()\">暂停刷新</button>\n"
-"    <button class=\"btn\" onclick=\"refresh();loadProcs()\">立即刷新</button>\n"
+"    <button class=\"btn\" onclick=\"refresh()\">立即刷新</button>\n"
 "    <button class=\"btn warn\" onclick=\"openResetModal()\">重新监控</button>\n"
 "    <button class=\"btn warn\" onclick=\"openClearModal()\">清除所有历史数据</button>\n"
 "  </div>\n"
@@ -1143,18 +1235,6 @@ static const char* g_dashboard_html =
 "        <tbody id=\"mtb\"><tr><td colspan=\"7\"><div class=\"empty\">等待进程接入...</div></td></tr></tbody>\n"
 "      </table>\n"
 "    </div>\n"
-"  </div>\n"
-"  <!-- INJECTABLE -->\n"
-"  <div>\n"
-"    <div class=\"sec-head\"><h2>可注入进程</h2><span class=\"cnt\" id=\"ic-cnt\"></span></div>\n"
-"    <div class=\"ctrls\"><input type=\"text\" id=\"proc-filter\" placeholder=\"搜索...\" oninput=\"debounceLoadProcs()\"></div>\n"
-"    <div class=\"panel\">\n"
-"      <table class=\"inj-table\">\n"
-"        <thead><tr><th style=\"width:48px\">PID</th><th style=\"width:90px\">进程</th><th style=\"width:150px\">命令行</th><th style=\"width:62px\">堆</th><th style=\"width:60px\">运行</th><th style=\"width:56px\">注入</th><th style=\"width:50px\">操作</th></tr></thead>\n"
-"        <tbody id=\"ptb\"><tr><td colspan=\"7\"><div class=\"empty\">加载中...</div></td></tr></tbody>\n"
-"      </table>\n"
-"    </div>\n"
-"    <div class=\"pager\" id=\"pg\"></div>\n"
 "  </div>\n"
 "</div>\n"
 "</div><!-- /#panel-overview -->\n"
@@ -1195,14 +1275,12 @@ static const char* g_dashboard_html =
 "<script>\n"
 "var autoRefresh=true,failCount=0,gLastUpdateTime=Date.now()/1000;\n"
 "var gAllLeaks=[],gSortMode='bytes';\n"
-"var gProcPage=1,gPageSize=15,gAllProcs=[];\n"
 "var gPrevLeaked={}; /* pid -> prev total_leaked */\n"
 "var gPrevTime=0;    /* timestamp of last snapshot */\n"
 "var gPrevLeakMap={},gPrevLeakTime=0; /* 泄漏站点速率快照 */\n"
 "var gHistory={};    /* pid -> [{t,bytes},...] */\n"
 "var gDetailPid=0,gCachedProcs=null,gLastDetailSig='';\n"
-"var gLoadSeq=0,toastTimer=0,gDebounceProc=0,gDebounceLeak=0,toastQueue=[],toastBusy=0;\n"
-"function debounceLoadProcs(){clearTimeout(gDebounceProc);gDebounceProc=setTimeout(loadProcs,280)}\n"
+"var toastTimer=0,gDebounceLeak=0,toastQueue=[],toastBusy=0;\n"
 "function debounceRenderLeaks(){clearTimeout(gDebounceLeak);gDebounceLeak=setTimeout(renderLeaks,280)}\n"
 "\n"
 "/* ===== SIDEBAR ===== */\n"
@@ -1219,7 +1297,7 @@ static const char* g_dashboard_html =
 "\n"
 "/* ===== RIPPLE ===== */\n"
 "document.addEventListener('click',function(e){\n"
-"  var el=e.target.closest('.btn,.btn-sm,.pg');\n"
+"  var el=e.target.closest('.btn,.pg');\n"
 "  if(!el)return;\n"
 "  var r=document.createElement('span');r.className='ripple';\n"
 "  var rect=el.getBoundingClientRect(),s=Math.max(rect.width,rect.height);\n"
@@ -1292,7 +1370,7 @@ static const char* g_dashboard_html =
 "      gAllLeaks=[];gHistory={};gPrevLeaked={};gPrevTime=0;gDetailPid=0;gPrevLeakMap={};gPrevLeakTime=0;\n"
 "      toast('已清除所有泄漏历史数据');\n"
 "      closeResetModal();\n"
-"      refresh();loadProcs();\n"
+"      refresh();\n"
 "      closeDetail();\n"
 "    }else{toast('清除失败: '+(d.message||'未知错误'))}\n"
 "    btn.disabled=false;btn.textContent='确认重新监控';\n"
@@ -1320,7 +1398,7 @@ static const char* g_dashboard_html =
 "      gCachedProcs=[];\n"
 "      toast('已清除所有历史数据（含进程列表和持久化文件），刷新中...');\n"
 "      closeClearModal();\n"
-"      refresh();loadProcs();\n"
+"      refresh();\n"
 "      closeDetail();\n"
 "    }else{toast('清除失败: '+(d.message||'未知错误'))}\n"
 "    btn.disabled=false;btn.textContent='确认清除所有';\n"
@@ -1339,7 +1417,7 @@ static const char* g_dashboard_html =
 "  var rkeys=Object.keys(gResolvedFrames);\n"
 "  if(rkeys.length>300){var drop=rkeys.slice(0,rkeys.length-200);for(var di=0;di<drop.length;di++)delete gResolvedFrames[drop[di]]}\n"
 "},30000);\n"
-"setInterval(function(){if(autoRefresh){refresh();loadProcs()}},3000);\n"
+"setInterval(function(){if(autoRefresh){refresh()}},3000);\n"
 "setInterval(function(){\n"
 "  var stale=Math.round(Date.now()/1000-gLastUpdateTime);\n"
 "  var el=document.getElementById('stale');if(!el)return;\n"
@@ -1421,7 +1499,7 @@ static const char* g_dashboard_html =
 "        var key=pp.pid+':'+l.file+':'+(l.file==='?'&&l.line===0&&l.nframes>0?getTopUserFn(l):l.line);\n"
 "        if(!leakMap[key])leakMap[key]={pid:pp.pid,name:pp.name,file:l.file,line:l.line,total:0,count:0,frames:l.frames,nframes:l.nframes};\n"
 "        else if(leakMap[key].nframes===0&&l.nframes>0){leakMap[key].frames=l.frames;leakMap[key].nframes=l.nframes;}\n"
-"        leakMap[key].total+=l.size;leakMap[key].count++;\n"
+"        leakMap[key].total+=l.size;leakMap[key].count+=l.count;\n"
 "      }\n"
 "    }\n"
 "    /* 计算每条泄漏站点的速率 (delta bytes / delta time) */\n"
@@ -1527,63 +1605,6 @@ static const char* g_dashboard_html =
 "}\n"
 "\n"
 "/* ===== PROCESS LIST ===== */\n"
-"function loadProcs(){\n"
-"  var filter=(document.getElementById('proc-filter').value||'').toLowerCase();\n"
-"  var seq=++gLoadSeq;\n"
-"  fetch('/api/processes').then(function(r){return r.json()}).then(function(d){\n"
-"    if(seq!==gLoadSeq)return;\n"
-"    gAllProcs=d.processes;\n"
-"    if(filter)gAllProcs=gAllProcs.filter(function(p){return p.name.toLowerCase().indexOf(filter)>=0});\n"
-"    gProcPage=Math.min(gProcPage,Math.max(1,Math.ceil(gAllProcs.length/gPageSize)));\n"
-"    renderProcPage();renderPager();\n"
-"  }).catch(function(){document.getElementById('ptb').innerHTML='<tr><td colspan=\"7\"><div class=\"empty\">加载失败</div></td></tr>'});\n"
-"}\n"
-"\n"
-"function renderProcPage(){\n"
-"  var s=(gProcPage-1)*gPageSize,page=gAllProcs.slice(s,s+gPageSize),rows='';\n"
-"  for(var i=0;i<page.length;i++){\n"
-"    var p=page[i];\n"
-"    var inj=p.injected&&p.inj_status===1?'<span class=\"badge-ok\">已注入</span>':\n"
-"      (p.injected?'<span class=\"badge-fail\" title=\"'+escAttr(p.inj_err||'')+'\">失败</span>':'<span class=\"badge-pend\">未注入</span>');\n"
-"    var btn=p.injected&&p.inj_status===1?'<span class=\"badge-ok\">已注入</span>':\n"
-"      '<button class=\"btn-sm\" onclick=\"inject('+p.pid+',this)\">注入</button>';\n"
-"    var heap=p.heap_kb>=1024?(p.heap_kb/1024).toFixed(1)+'MB':p.heap_kb+'KB';\n"
-"    var uptime=fmtUptime(p.uptime_sec||0);\n"
-"    var cl=p.cmdline||p.name;\n"
-"    rows+='<tr>'+\n"
-"      '<td>'+p.pid+'</td><td style=\"font-family:var(--font)\">'+esc(p.name)+'</td>'+\n"
-"      '<td><span class=\"cmdline\" title=\"'+escAttr(cl)+'\">'+esc(cl)+'</span></td>'+\n"
-"      '<td style=\"color:var(--text2)\">'+heap+'</td><td style=\"font-size:10px;color:var(--text3)\">'+uptime+'</td>'+\n"
-"      '<td>'+inj+'</td><td>'+btn+'</td></tr>';\n"
-"  }\n"
-"  document.getElementById('ptb').innerHTML=rows||'<tr><td colspan=\"7\"><div class=\"empty\">'+(gAllProcs.length?'无匹配':'无可用进程')+'</div></td></tr>';\n"
-"  document.getElementById('ic-cnt').textContent=gAllProcs.length?'('+gAllProcs.length+')':'';\n"
-"}\n"
-"\n"
-"function renderPager(){\n"
-"  var t=Math.max(1,Math.ceil(gAllProcs.length/gPageSize)),h='';\n"
-"  h+='<button class=\"pg\" role=\"button\" tabindex=\"0\" '+(gProcPage<=1?'disabled':'')+' onclick=\"goPage('+(gProcPage-1)+')\">&laquo;</button>';\n"
-"  /* show pages 1..8 plus ensure current page always visible */\n"
-"  var shown=Math.min(8,t),pg=gProcPage;\n"
-"  if(pg>8){shown=Math.min(pg+1,t);var start=Math.max(1,pg-6)}\n"
-"  else{var start=1}\n"
-"  for(var i=start;i<=shown;i++)h+='<button class=\"pg'+(i===pg?' on':'')+'\" onclick=\"goPage('+i+')\" role=\"button\" tabindex=\"0\">'+i+'</button>';\n"
-"  if(shown<t)h+='<button class=\"pg\" onclick=\"goPage('+Math.max(9,t-3)+')\" title=\"跳转到后段\" role=\"button\" tabindex=\"0\">...'+t+'</button>';\n"
-"  h+='<button class=\"pg\" role=\"button\" tabindex=\"0\" '+(gProcPage>=t?'disabled':'')+' onclick=\"goPage('+(gProcPage+1)+')\">&raquo;</button>';\n"
-"  document.getElementById('pg').innerHTML=h;\n"
-"}\n"
-"\n"
-"function goPage(n){gProcPage=n;renderProcPage();renderPager()}\n"
-"\n"
-"function inject(pid,btn){\n"
-"  btn.disabled=true;btn.textContent='...';toast('注入 PID '+pid+' ...');\n"
-"  fetch('/api/inject?pid='+pid).then(function(r){return r.json()}).then(function(d){\n"
-"    if(d.status==='ok'){toast('注入成功! '+d.patched+' GOT');loadProcs()}\n"
-"    else{toast('失败: '+d.error);btn.disabled=false;btn.textContent='重试'}\n"
-"  }).catch(function(){toast('请求失败');btn.disabled=false;btn.textContent='重试'});\n"
-"}\n"
-"\n"
-"loadProcs();\n"
 "\n"
 "/* ===== DETAIL PANEL ===== */\n"
 "function openDetail(pid){\n"
@@ -1639,7 +1660,7 @@ static const char* g_dashboard_html =
 "      var l=proc.leaks[j],key=l.file+':'+(l.file==='?'&&l.line===0&&l.nframes>0?getTopUserFn(l):l.line);\n"
 "      if(!leakMap[key])leakMap[key]={file:l.file,line:l.line,total:0,count:0,frames:l.frames,nframes:l.nframes};\n"
 "      else if(leakMap[key].nframes===0&&l.nframes>0){leakMap[key].frames=l.frames;leakMap[key].nframes=l.nframes;}\n"
-"      leakMap[key].total+=l.size;leakMap[key].count++;\n"
+"      leakMap[key].total+=l.size;leakMap[key].count+=l.count;\n"
 "    }\n"
 "    var leaks=Object.values(leakMap);\n"
 "    leaks.sort(function(a,b){return b.total-a.total});\n"
@@ -2097,8 +2118,8 @@ static void send_api_data(int fd)
             mttd_leak_t* l = &p->leaks[j];
             json_escape(escaped, l->file, sizeof(escaped));
             truncated |= (safe_append(buf, &pos, JSON_BUF_SIZE,
-                "%s{\"size\":%zu,\"file\":\"%s\",\"line\":%d,\"nframes\":%d,\"frames\":[",
-                j > 0 ? "," : "", l->size, escaped, l->line, l->nframes) == 0);
+                "%s{\"size\":%zu,\"count\":%d,\"file\":\"%s\",\"line\":%d,\"nframes\":%d,\"frames\":[",
+                j > 0 ? "," : "", l->size, l->count, escaped, l->line, l->nframes) == 0);
             for (int k = 0; k < l->nframes; k++) {
                 if (l->frames[k][0]) {
                     char fe[MTT_SYMBOL_MAX * 2];
