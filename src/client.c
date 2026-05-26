@@ -241,11 +241,20 @@ static void do_client_report(int is_final)
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
 
+    /* 报告线程重入防护：设置 g_in_resolver=1 使本线程内所有 libc
+     * 函数（backtrace_symbols、snprintf 等）触发的 malloc/free
+     * 全部绕过钩子，直接透传到 raw_* 分配器，从根本上杜绝：
+     *   1. fopen→malloc→hook→bucket锁 重入死锁
+     *   2. backtrace_symbols→malloc→hook→backtrace 递归
+     * g_in_resolver 是 __thread 变量，不影响主线程的追踪功能。 */
+    int saved_resolver = g_in_resolver;
+    if (!saved_resolver) g_in_resolver = 1;
+
     /* g_sock_lock 保护整段 connect→I/O→close，避免多线程共享 fd 竞争 */
     pthread_mutex_lock(&g_sock_lock);
 
     int fd = connect_daemon();
-    if (fd < 0) { pthread_mutex_unlock(&g_sock_lock); return; }
+    if (fd < 0) { pthread_mutex_unlock(&g_sock_lock); g_in_resolver = saved_resolver; return; }
 
     /* 发送 STAT 消息：上报当前进程堆内存状态到 daemon，用于看板 chart 时序展示。
      * 使用 open/read/close 系统调用读取 /proc/self/status，避免 fopen()
@@ -284,6 +293,7 @@ static void do_client_report(int is_final)
     if (!snaps) {
         shutdown(fd, SHUT_RDWR); close(fd); g_sock_fd = -1;
         pthread_mutex_unlock(&g_sock_lock);
+        g_in_resolver = saved_resolver;
         return;
     }
 
@@ -336,6 +346,7 @@ static void do_client_report(int is_final)
     pthread_mutex_unlock(&g_sock_lock);
 
     raw_free(snaps);
+    g_in_resolver = saved_resolver;
 }
 
 /**
