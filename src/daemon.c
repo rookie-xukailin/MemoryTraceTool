@@ -92,6 +92,47 @@ static void unblock_pid(int pid)
     }
 }
 
+/* ---- 事件日志环形缓冲区（/api/debug/events 诊断用） ---- */
+
+#define MTT_EVENT_LOG_CAP 512  /* 环形缓冲区容量 */
+
+typedef enum {
+    MTT_EVT_INFO   = 0,  /* 一般信息 */
+    MTT_EVT_CLIENT = 1,  /* 客户端连接/协议事件 */
+    MTT_EVT_INJECT = 2,  /* 注入操作 */
+    MTT_EVT_ERROR  = 3,  /* 错误/异常 */
+} mtt_event_type_t;
+
+typedef struct {
+    time_t           timestamp;
+    mtt_event_type_t type;
+    char             msg[320];
+} mtt_event_t;
+
+static mtt_event_t g_event_log[MTT_EVENT_LOG_CAP];
+static int         g_event_head  = 0;  /* 环形写入位置 */
+static int         g_event_count = 0;  /* 累计写入总数 */
+static pthread_mutex_t g_event_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/** 向环形缓冲区追加一条事件（线程安全） */
+static void log_event(mtt_event_type_t type, const char* fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
+static void log_event(mtt_event_type_t type, const char* fmt, ...)
+{
+    pthread_mutex_lock(&g_event_lock);
+    int idx = g_event_head % MTT_EVENT_LOG_CAP;
+    g_event_head++;
+    g_event_count++;
+    g_event_log[idx].timestamp = time(NULL);
+    g_event_log[idx].type = type;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_event_log[idx].msg, sizeof(g_event_log[idx].msg), fmt, ap);
+    va_end(ap);
+    pthread_mutex_unlock(&g_event_lock);
+}
+
 /* ---- 辅助函数 ---- */
 
 /**
@@ -568,9 +609,11 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
             /* 缺陷修复 #2: 检查 sscanf 返回值 */
             if (sscanf(line, "HELLO %d %255[^\n]", &pid, name) >= 1) {
                 fprintf(stderr, "[mttd] HELLO pid=%d name=%s\n", pid, name);
+                log_event(MTT_EVT_CLIENT, "HELLO pid=%d name=%s", pid, name);
                 pthread_mutex_lock(&g_lock);
                 if (is_pid_blocked(pid)) {
                     fprintf(stderr, "[mttd] HELLO pid=%d ignored (blocked)\n", pid);
+                    log_event(MTT_EVT_CLIENT, "HELLO pid=%d BLOCKED (黑名单)", pid);
                     pthread_mutex_unlock(&g_lock);
                 } else {
                     ctx->proc = find_or_create_proc(pid, name);
@@ -591,6 +634,8 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
                 pthread_mutex_unlock(&ctx->proc->lock);
                 fprintf(stderr, "[mttd] STAT pid=%d cur=%zuKB allocs=%zu frees=%zu rss=%zuKB\n",
                     ctx->proc->pid, cur_bytes / 1024, allocs, frees, vm_rss);
+                log_event(MTT_EVT_CLIENT, "STAT pid=%d cur=%zuKB allocs=%zu frees=%zu rss=%zuKB",
+                    ctx->proc->pid, cur_bytes / 1024, allocs, frees, vm_rss);
             }
         }
         else if (strncmp(line, "LEAK ", 5) == 0 && ctx->proc) {
@@ -602,6 +647,8 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
                 fprintf(stderr, "[mttd] LEAK pid=%d name=%s size=%zu file=%s:%d frames=%d\n",
                         ctx->proc->pid, ctx->proc->name,
                         leak.size, leak.file, leak.line, leak.nframes);
+                log_event(MTT_EVT_CLIENT, "LEAK pid=%d size=%zu file=%s:%d frames=%d",
+                        ctx->proc->pid, leak.size, leak.file, leak.line, leak.nframes);
                 if (leak.nframes > MTT_MAX_STACK) leak.nframes = MTT_MAX_STACK;
                 if (leak.nframes < 0) leak.nframes = 0;
                 pthread_mutex_lock(&ctx->proc->lock);
@@ -628,6 +675,8 @@ static int parse_unix_client(int fd, unix_client_ctx_t* ctx,
         else if (strcmp(line, "BYE") == 0) {
             if (ctx->proc) {
                 fprintf(stderr, "[mttd] BYE pid=%d name=%s leak_count=%d\n",
+                        ctx->proc->pid, ctx->proc->name, ctx->proc->leak_count);
+                log_event(MTT_EVT_CLIENT, "BYE pid=%d name=%s leak_count=%d",
                         ctx->proc->pid, ctx->proc->name, ctx->proc->leak_count);
                 pthread_mutex_lock(&ctx->proc->lock);
                 ctx->proc->active = 0; /* 标记进程已退出 */
@@ -2580,6 +2629,13 @@ static void handle_api_inject(int fd, int pid)
         if (g_injected[i].pid == pid) { existing = i; break; }
     }
     if (existing >= 0) {
+        if (result.status == INJECT_OK) {
+            log_event(MTT_EVT_INJECT, "重新注入成功 pid=%d patched=%d symbols=%s",
+                      pid, result.patched_count,
+                      result.patched_names[0] ? result.patched_names : "none");
+        } else {
+            log_event(MTT_EVT_ERROR, "重新注入失败 pid=%d err=%s", pid, result.err_msg);
+        }
         g_injected[existing].inject_time = time(NULL);
         g_injected[existing].inject_status = (result.status == INJECT_OK) ? 1 : 2;
         g_injected[existing].lib_base = result.lib_base;
@@ -2591,6 +2647,9 @@ static void handle_api_inject(int fd, int pid)
                  sizeof(g_injected[existing].inject_err),
                  "%s", result.err_msg);
     } else if (g_ninjected < MTT_MAX_INJECTED) {
+        if (result.status != INJECT_OK) {
+            log_event(MTT_EVT_ERROR, "注入失败 pid=%d err=%s", pid, result.err_msg);
+        }
         g_injected[g_ninjected].pid = pid;
         g_injected[g_ninjected].inject_time = time(NULL);
         g_injected[g_ninjected].inject_status = (result.status == INJECT_OK) ? 1 : 2;
@@ -2610,6 +2669,9 @@ static void handle_api_inject(int fd, int pid)
      * 在此之前 daemon 没有该进程的 proc 条目，不会出现在被监控列表。
      * 此处提前创建条目，确保注入后进程即时可见。 */
     if (result.status == INJECT_OK) {
+        log_event(MTT_EVT_INJECT, "注入成功 pid=%d patched=%d symbols=%s",
+                  pid, result.patched_count,
+                  result.patched_names[0] ? result.patched_names : "none");
         /* 重新注入时从黑名单移除，否则目标进程的 HELLO 会被拦截 */
         unblock_pid(pid);
         char proc_name[256] = {0};
@@ -2687,6 +2749,247 @@ static void send_api_injected(int fd)
 /* ======================================================================== *
  *                    调试诊断 API（仅 GET，无副操作）                          *
  * ======================================================================== */
+
+/**
+ * GET /api/debug/events — 事件日志环形缓冲区内容。
+ * 返回最近 N 条事件（最多 256 条），按时间倒序（最新在前）。
+ * 查询参数: ?n=50 控制返回条数（默认 50，最大 256）。
+ */
+static void handle_debug_events(int fd, const char* query)
+{
+    int want = 50;
+    if (query) {
+        const char* np = strstr(query, "n=");
+        if (np) { int v = atoi(np + 2); if (v > 0 && v <= 256) want = v; }
+    }
+
+    char buf[262144];
+    int pos = 0;
+    int size = (int)sizeof(buf);
+
+    pthread_mutex_lock(&g_event_lock);
+    int total = g_event_count;
+    int avail = (total < MTT_EVENT_LOG_CAP) ? total : MTT_EVENT_LOG_CAP;
+    int show  = want < avail ? want : avail;
+    int oldest = (total >= MTT_EVENT_LOG_CAP)
+        ? (g_event_head - avail) : 0;
+
+    pos += snprintf(buf + pos, size - pos,
+        "{\"total\":%d,\"avail\":%d,\"shown\":%d,\"cap\":%d,\"events\":[",
+        total, avail, show, MTT_EVENT_LOG_CAP);
+
+    for (int i = 0; i < show; i++) {
+        /* 从最新到最旧遍历 */
+        int idx = (g_event_head - 1 - i) % MTT_EVENT_LOG_CAP;
+        if (idx < 0) idx += MTT_EVENT_LOG_CAP;
+        mtt_event_t* ev = &g_event_log[idx];
+        const char* type_str = (ev->type == MTT_EVT_ERROR)  ? "error"  :
+                               (ev->type == MTT_EVT_INJECT) ? "inject" :
+                               (ev->type == MTT_EVT_CLIENT) ? "client" : "info";
+        char escaped_msg[640];
+        /* 简易 JSON 转义 */
+        {
+            size_t di = 0;
+            for (const char* s = ev->msg; *s && di < sizeof(escaped_msg) - 1; s++) {
+                switch (*s) {
+                case '"':  if (di < sizeof(escaped_msg) - 2) { escaped_msg[di++] = '\\'; escaped_msg[di++] = '"';  } break;
+                case '\\': if (di < sizeof(escaped_msg) - 2) { escaped_msg[di++] = '\\'; escaped_msg[di++] = '\\'; } break;
+                case '\n': if (di < sizeof(escaped_msg) - 2) { escaped_msg[di++] = '\\'; escaped_msg[di++] = 'n';  } break;
+                case '\r': if (di < sizeof(escaped_msg) - 2) { escaped_msg[di++] = '\\'; escaped_msg[di++] = 'r';  } break;
+                case '\t': if (di < sizeof(escaped_msg) - 2) { escaped_msg[di++] = '\\'; escaped_msg[di++] = 't';  } break;
+                default:   escaped_msg[di++] = *s; break;
+                }
+            }
+            escaped_msg[di] = '\0';
+        }
+        pos += snprintf(buf + pos, size - pos,
+            "%s{\"seq\":%d,\"ts\":%ld,\"type\":\"%s\",\"msg\":\"%s\"}",
+            i > 0 ? "," : "",
+            oldest + (g_event_head - 1 - i), (long)ev->timestamp,
+            type_str, escaped_msg);
+    }
+    pos += snprintf(buf + pos, size - pos, "]}");
+    pthread_mutex_unlock(&g_event_lock);
+
+    char hdr[256];
+    int hdrlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+        "Connection: close\r\n\r\n", pos);
+    send_all(fd, hdr, hdrlen);
+    send_all(fd, buf, pos);
+}
+
+/**
+ * GET /api/debug/proc/<pid> — 指定进程的 /proc 诊断信息。
+ * 返回 /proc/<pid>/status、/proc/<pid>/stat、/proc/<pid>/maps 摘要、
+ * 以及该 PID 是否在注入列表/被监控列表/黑名单中。
+ */
+static void handle_debug_proc(int fd, int pid)
+{
+    char buf[131072];
+    int pos = 0;
+    int size = (int)sizeof(buf);
+
+    /* 基础检查 */
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
+    int exists = (access(proc_path, F_OK) == 0);
+
+    pos += snprintf(buf + pos, size - pos,
+        "{\"pid\":%d,\"exists\":%s", pid, exists ? "true" : "false");
+
+    /* daemon 侧状态 */
+    pthread_mutex_lock(&g_lock);
+    {
+        /* 黑名单 */
+        int blocked = is_pid_blocked(pid);
+        pos += snprintf(buf + pos, size - pos, ",\"blocked\":%s", blocked ? "true" : "false");
+
+        /* 被监控列表 */
+        int monitored = 0, m_idx = -1;
+        for (int i = 0; i < g_nprocs; i++) {
+            if (g_procs[i].pid == pid) { monitored = 1; m_idx = i; break; }
+        }
+        pos += snprintf(buf + pos, size - pos, ",\"monitored\":%s", monitored ? "true" : "false");
+        if (monitored && m_idx >= 0) {
+            mttd_proc_t* p = &g_procs[m_idx];
+            pos += snprintf(buf + pos, size - pos,
+                ",\"proc_name\":\"%s\",\"proc_active\":%d,"
+                "\"proc_leak_count\":%d,\"proc_total_leaked\":%zu,"
+                "\"proc_heap_rss_kb\":%zu,\"proc_current_bytes\":%zu,"
+                "\"proc_alloc_count\":%zu,\"proc_free_count\":%zu",
+                p->name, p->active, p->leak_count, p->total_leaked,
+                p->heap_rss_kb, p->current_bytes,
+                p->alloc_count, p->free_count);
+        }
+
+        /* 注入列表 */
+#ifndef WITHOUT_INJECTOR
+        int injected = 0, inj_idx = -1;
+        for (int i = 0; i < g_ninjected; i++) {
+            if (g_injected[i].pid == pid) { injected = 1; inj_idx = i; break; }
+        }
+        pos += snprintf(buf + pos, size - pos, ",\"injected\":%s", injected ? "true" : "false");
+        if (injected && inj_idx >= 0) {
+            mttd_injected_t* inj = &g_injected[inj_idx];
+            pos += snprintf(buf + pos, size - pos,
+                ",\"inj_status\":%d,\"inj_patched\":%d,\"inj_names\":\"%s\","
+                "\"inj_lib_base\":\"0x%lx\",\"inj_err\":\"%s\"",
+                inj->inject_status, inj->patched_count,
+                inj->patched_names[0] ? inj->patched_names : "none",
+                inj->lib_base, inj->inject_err);
+        }
+#else
+        pos += snprintf(buf + pos, size - pos, ",\"injected\":false");
+#endif
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    /* /proc/<pid>/status 关键字段 */
+    if (exists) {
+        char spath[64];
+        snprintf(spath, sizeof(spath), "/proc/%d/status", pid);
+        FILE* fs = fopen(spath, "r");
+        if (fs) {
+            pos += snprintf(buf + pos, size - pos, ",\"proc_status\":{");
+            char line[512];
+            int first = 1;
+            const char* keys[] = {"Name","State","VmRSS","VmSize","VmData","VmStk",
+                                  "Threads","voluntary_ctxt_switches","nonvoluntary_ctxt_switches",NULL};
+            while (fgets(line, sizeof(line), fs)) {
+                for (int ki = 0; keys[ki]; ki++) {
+                    size_t klen = strlen(keys[ki]);
+                    if (strncmp(line, keys[ki], klen) == 0 && line[klen] == ':') {
+                        const char* val = line + klen + 1;
+                        while (*val == ' ' || *val == '\t') val++;
+                        size_t vlen = strlen(val);
+                        while (vlen > 0 && (val[vlen-1] == '\n' || val[vlen-1] == '\r'))
+                            vlen--;
+                        char escaped[128];
+                        size_t edi = 0;
+                        for (size_t vi = 0; vi < vlen && edi < sizeof(escaped) - 1; vi++) {
+                            char c = val[vi];
+                            if (c == '"') { if (edi < sizeof(escaped)-2) { escaped[edi++]='\\'; escaped[edi++]='"'; } }
+                            else if (c == '\\') { if (edi < sizeof(escaped)-2) { escaped[edi++]='\\'; escaped[edi++]='\\'; } }
+                            else escaped[edi++] = c;
+                        }
+                        escaped[edi] = '\0';
+                        pos += snprintf(buf + pos, size - pos,
+                            "%s\"%s\":\"%s\"", first ? "" : ",", keys[ki], escaped);
+                        first = 0;
+                        break;
+                    }
+                }
+            }
+            pos += snprintf(buf + pos, size - pos, "}");
+            fclose(fs);
+        }
+
+        /* /proc/<pid>/maps: 仅检查 libmemorytracetool.so 是否存在 */
+        snprintf(spath, sizeof(spath), "/proc/%d/maps", pid);
+        FILE* fm = fopen(spath, "r");
+        int so_in_maps = 0;
+        char so_line[512] = "";
+        if (fm) {
+            char mline[1024];
+            while (fgets(mline, sizeof(mline), fm)) {
+                if (strstr(mline, "libmemorytracetool")) {
+                    so_in_maps = 1;
+                    size_t mlen = strlen(mline);
+                    if (mlen > 0 && mline[mlen-1] == '\n') mline[mlen-1] = '\0';
+                    /* 取最后 256 字符 */
+                    size_t start = mlen > 256 ? mlen - 256 : 0;
+                    snprintf(so_line, sizeof(so_line), "%s", mline + start);
+                }
+            }
+            fclose(fm);
+        }
+        pos += snprintf(buf + pos, size - pos,
+            ",\"libmt_in_maps\":%s", so_in_maps ? "true" : "false");
+        if (so_in_maps) {
+            char escaped_map[640];
+            size_t edi = 0;
+            for (const char* s = so_line; *s && edi < sizeof(escaped_map) - 1; s++) {
+                char c = *s;
+                if (c == '"') { if (edi < sizeof(escaped_map)-2) { escaped_map[edi++]='\\'; escaped_map[edi++]='"'; } }
+                else if (c == '\\') { if (edi < sizeof(escaped_map)-2) { escaped_map[edi++]='\\'; escaped_map[edi++]='\\'; } }
+                else escaped_map[edi++] = c;
+            }
+            escaped_map[edi] = '\0';
+            pos += snprintf(buf + pos, size - pos,
+                ",\"libmt_map_line\":\"%s\"", escaped_map);
+        }
+
+        /* /proc/<pid>/exe 链接目标 */
+        char exe_buf[512] = "";
+        snprintf(spath, sizeof(spath), "/proc/%d/exe", pid);
+        ssize_t elen = readlink(spath, exe_buf, sizeof(exe_buf) - 1);
+        if (elen > 0) exe_buf[elen] = '\0';
+        char escaped_exe[640];
+        {
+            size_t edi = 0;
+            for (const char* s = exe_buf; *s && edi < sizeof(escaped_exe) - 1; s++) {
+                char c = *s;
+                if (c == '"') { if (edi < sizeof(escaped_exe)-2) { escaped_exe[edi++]='\\'; escaped_exe[edi++]='"'; } }
+                else if (c == '\\') { if (edi < sizeof(escaped_exe)-2) { escaped_exe[edi++]='\\'; escaped_exe[edi++]='\\'; } }
+                else escaped_exe[edi++] = c;
+            }
+            escaped_exe[edi] = '\0';
+        }
+        pos += snprintf(buf + pos, size - pos, ",\"exe\":\"%s\"", escaped_exe);
+    }
+
+    pos += snprintf(buf + pos, size - pos, "}");
+
+    char hdr[256];
+    int hdrlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+        "Connection: close\r\n\r\n", pos);
+    send_all(fd, hdr, hdrlen);
+    send_all(fd, buf, pos);
+}
 
 /**
  * GET /api/debug/state — daemon 整体状态摘要。
@@ -2970,14 +3273,20 @@ static void handle_api_clear(int fd)
  * 缺陷修复 #8: 添加请求方法验证和基本请求大小限制。
  *
  * 支持的路由：
- *   GET /api/data       → JSON 泄漏数据（send_api_data）
- *   GET /api/addr2line  → addr2line 源码解析（send_addr2line）
- *   GET /api/processes  → 进程列表（send_api_processes）
- *   GET /api/inject     → 运行时注入（handle_api_inject）
- *   GET /api/injected   → 注入记录（send_api_injected）
- *   GET /api/reset      → 清除泄漏历史（handle_api_reset）
- *   GET /api/clear      → 清除所有历史数据含进程列表（handle_api_clear）
- *   其他                → 看板 HTML 页面（g_dashboard_html）
+ *   GET /api/data          → JSON 泄漏数据（send_api_data）
+ *   GET /api/addr2line     → addr2line 源码解析（send_addr2line）
+ *   GET /api/processes     → 进程列表（send_api_processes）
+ *   GET /api/inject        → 运行时注入（handle_api_inject）
+ *   GET /api/injected      → 注入记录（send_api_injected）
+ *   GET /api/debug/events  → 事件日志环形缓冲区
+ *   GET /api/debug/proc/N  → 指定PID的/proc诊断信息
+ *   GET /api/debug/state   → daemon 整体状态摘要
+ *   GET /api/debug/procs   → 所有被监控进程完整数据
+ *   GET /api/debug/injected→ 所有注入记录完整数据
+ *   GET /api/debug/blocked → 黑名单PID列表
+ *   GET /api/reset         → 清除泄漏历史（handle_api_reset）
+ *   GET /api/clear         → 清除所有历史数据含进程列表（handle_api_clear）
+ *   其他                   → 看板 HTML 页面（g_dashboard_html）
  */
 static void handle_http(int fd)
 {
@@ -3069,6 +3378,20 @@ static void handle_http(int fd)
             "{\"status\":\"fail\",\"error\":\"injector not compiled (WITHOUT_INJECTOR=1)\"}";
         send_all(fd, noinj_err, strlen(noinj_err));
 #endif
+    } else if (strncmp(buf, "GET /api/debug/events", 21) == 0) {
+        char* q = strchr(buf, '?');
+        handle_debug_events(fd, q);
+    } else if (strncmp(buf, "GET /api/debug/proc/", 20) == 0) {
+        int pid = atoi(buf + 20);
+        if (pid > 1)
+            handle_debug_proc(fd, pid);
+        else {
+            const char* err =
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n"
+                "Connection: close\r\n\r\n"
+                "{\"error\":\"invalid pid\"}";
+            send_all(fd, err, strlen(err));
+        }
     } else if (strncmp(buf, "GET /api/debug/state", 20) == 0) {
         handle_debug_state(fd);
     } else if (strncmp(buf, "GET /api/debug/procs", 20) == 0) {
@@ -3180,6 +3503,7 @@ int main(int argc, char** argv)
     pthread_mutex_unlock(&g_lock);
 
     printf("[mttd] Ready.\n");
+    log_event(MTT_EVT_INFO, "mttd 启动完成 port=%d", port);
 
     /* ---- 事件循环 ---- */
     unsigned loop_ticks = 0;
@@ -3248,6 +3572,7 @@ int main(int argc, char** argv)
             int cfd = accept(unix_fd, NULL, NULL);
             if (cfd >= 0) {
                 fprintf(stderr, "[mttd] new unix client fd=%d\n", cfd);
+                log_event(MTT_EVT_CLIENT, "新Unix客户端 fd=%d 已连接", cfd);
                 set_nonblock(cfd);
                 set_recv_timeout(cfd, MTT_CLIENT_TIMEOUT_S);
                 if (nclients < MAX_CLIENTS) {
