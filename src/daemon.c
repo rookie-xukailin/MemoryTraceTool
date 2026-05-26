@@ -606,8 +606,8 @@ static void leak_signature(mttd_leak_t* leak, char* key, size_t key_size)
         return;
     }
 
-    /* 无用户帧 */
-    snprintf(key, key_size, "?:0");
+    /* 无用户帧：用分配大小作为区分键，避免不同 size 的泄漏全部合并 */
+    snprintf(key, key_size, "?:%zu:0", leak->size);
 }
 
 /**
@@ -1570,7 +1570,7 @@ static const char* g_dashboard_html =
 "  else if(gSortMode==='count'){arr.sort(function(a,b){return b.count-a.count})}\n"
 "  else{arr.sort(function(a,b){return b.total-a.total})}\n"
 "\n"
-"  var top=arr.slice(0,15),html='';\n"
+"  var top=arr.slice(0,200),html='';\n"
 "  for(var i=0;i<top.length;i++){\n"
 "    var l=top[i];\n"
 "    var cardKey=leakCardKey(l,l.pid);\n"
@@ -1597,7 +1597,7 @@ static const char* g_dashboard_html =
 "    }else{html+='<div class=\"cn\"><span class=\"fn\" style=\"color:var(--text3)\">(无调用栈)</span></div>'}\n"
 "    html+='</div></div>';\n"
 "  }\n"
-"  var total=arr.length,shown=filter?Math.min(top.length,15):Math.min(total,15);\n"
+"  var total=arr.length,shown=filter?Math.min(top.length,200):Math.min(total,200);\n"
 "  document.getElementById('leak-list').innerHTML=html||'<div class=\"empty\">'+(filter?'无匹配':'暂无泄漏')+'</div>';\n"
 "  document.getElementById('lk-cnt').textContent=total>0?(filter?'(匹配'+shown+'/'+total+')':'(Top '+shown+'/'+total+')'):'';\n"
 "  setTimeout(scheduleAutoResolve,500);\n"
@@ -1664,7 +1664,7 @@ static const char* g_dashboard_html =
 "    var leaks=Object.values(leakMap);\n"
 "    leaks.sort(function(a,b){return b.total-a.total});\n"
 "    body+='<div class=\"leak-sec\"><h4>该进程泄漏明细 ('+leaks.length+' 个站点)</h4>';\n"
-"    for(var j=0;j<Math.min(leaks.length,10);j++){\n"
+"    for(var j=0;j<Math.min(leaks.length,200);j++){\n"
 "      var l=leaks[j],lkIdx=0;\n"
 "      var cardKey=leakCardKey(l,pid);\n"
 "      var expanded=!!gExpandedLeaks[cardKey];\n"
