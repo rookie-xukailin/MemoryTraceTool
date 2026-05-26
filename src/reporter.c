@@ -1,0 +1,636 @@
+/*
+ * MemoryTraceTool — 周期报告引擎。
+ *
+ * 后台线程每 MTT_REPORT_INTERVAL_SEC（60）秒唤醒一次，
+ * 扫描分配追踪表，按栈帧 hash 去重后生成泄漏报告，
+ * 原子写入 /var/log/mtt/<pid>_<name>.log。
+ *
+ * 线程安全：仅在单个后台线程中运行，与 hooks.c 高频路径零竞争。
+ * 防递归：报告线程全程 g_in_hook=1，所有 libc 调用绕过 hook。
+ * 内存控制：临时快照数组在每次扫描后释放，不累积。
+ */
+
+#define _GNU_SOURCE
+#include "reporter.h"
+#include "stack_cache.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <time.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+/* ---- 报告器全局状态（单例，仅 reporter 线程访问） ---- */
+
+static mtt_reporter_t g_reporter = {0};
+static atomic_int      g_reporter_started = 0;
+
+/* ---- 快照条目（逐锁拷贝，避免持锁期间访问链表） ---- */
+
+typedef struct {
+    void   *ptr;
+    size_t  size;
+    time_t  timestamp;
+    void   *stack[MTT_STACK_DEPTH];
+    int     stack_frames;
+} mtt_alloc_snap_t;
+
+/* ======================================================================== *
+ *                      日志目录与文件路径                                      *
+ * ======================================================================== */
+
+/**
+ * 获取日志目录路径。
+ *
+ * 优先 /var/log/mtt，若不可写则 fallback 到 /tmp/mtt-logs。
+ * 尝试创建目录（0755），失败时使用 fallback。
+ *
+ * @param buf   输出缓冲区
+ * @param size  缓冲区大小
+ * @return      日志目录路径
+ */
+static const char* ensure_log_dir(char *buf, size_t size)
+{
+    if (buf == NULL || size == 0) return "/tmp";
+
+    const char *primary = "/var/log/mtt";
+    if (mkdir(primary, 0755) == 0 || access(primary, W_OK) == 0) {
+        snprintf(buf, size, "%s", primary);
+        return buf;
+    }
+
+    const char *fallback = "/tmp/mtt-logs";
+    mkdir(fallback, 0755);
+    snprintf(buf, size, "%s", fallback);
+    return buf;
+}
+
+/* ======================================================================== *
+ *                     格式化输出辅助函数                                       *
+ * ======================================================================== */
+
+/** 格式化字节数为人类可读的带单位字符串 */
+static const char* fmt_bytes(size_t bytes, char *buf, size_t buf_size)
+{
+    if (buf == NULL || buf_size == 0) return "";
+    buf[0] = '\0';
+
+    if (bytes >= 1048576) {
+        double mb = (double)bytes / 1048576.0;
+        snprintf(buf, buf_size, "%.2f MB", mb);
+    } else if (bytes >= 1024) {
+        double kb = (double)bytes / 1024.0;
+        snprintf(buf, buf_size, "%.2f KB", kb);
+    } else {
+        snprintf(buf, buf_size, "%zu B", bytes);
+    }
+    return buf;
+}
+
+/** 格式化时间戳为本地时间字符串 "YYYY-MM-DD HH:MM:SS" */
+static const char* fmt_time(time_t t, char *buf, size_t buf_size)
+{
+    if (buf == NULL || buf_size == 0) return "";
+    buf[0] = '\0';
+
+    struct tm tm_buf;
+    memset(&tm_buf, 0, sizeof(tm_buf));
+    if (localtime_r(&t, &tm_buf) != NULL) {
+        strftime(buf, buf_size, "%Y-%m-%d %H:%M:%S", &tm_buf);
+    } else {
+        snprintf(buf, buf_size, "%ld", (long)t);
+    }
+    return buf;
+}
+
+/** 格式化时间间隔为可读字符串 "HH:MM:SS" */
+static const char* fmt_duration(time_t seconds, char *buf, size_t buf_size)
+{
+    if (buf == NULL || buf_size == 0) return "";
+    buf[0] = '\0';
+
+    long h = (long)(seconds / 3600);
+    long m = (long)((seconds % 3600) / 60);
+    long s = (long)(seconds % 60);
+    snprintf(buf, buf_size, "%02ld:%02ld:%02ld", h, m, s);
+    return buf;
+}
+
+/** 格式化频率：leaks/sec 和 "every N sec" */
+static void fmt_frequency(double leaks_per_sec, char *buf, size_t buf_size)
+{
+    if (buf == NULL || buf_size == 0) return;
+    buf[0] = '\0';
+
+    if (leaks_per_sec > 0.0) {
+        double interval = 1.0 / leaks_per_sec;
+        snprintf(buf, buf_size, "%.4f leaks/sec  (every %.1f sec)",
+                 leaks_per_sec, interval);
+    } else {
+        snprintf(buf, buf_size, "N/A (first scan)");
+    }
+}
+
+/** 判断帧是否为内部帧（应被过滤） */
+static int is_internal_frame(const char *symbol)
+{
+    if (symbol == NULL) return 1;
+    if (symbol[0] == '\0') return 1;
+    if (strstr(symbol, "libmemorytracetool") != NULL) return 1;
+    if (strstr(symbol, "mtt_") == symbol) return 1;        /* 以 mtt_ 开头 */
+    if (strstr(symbol, "capture_stack") != NULL) return 1;
+    if (strstr(symbol, "backtrace") != NULL) return 1;
+    if (strstr(symbol, "__libc_start") != NULL) return 0;   /* libc 入口可以显示 */
+    return 0;
+}
+
+/* ======================================================================== *
+ *                   qsort 比较函数：按 total_size 降序                        *
+ * ======================================================================== */
+
+static int cmp_leak_by_size(const void *a, const void *b)
+{
+    const mtt_leak_site_t *sa = *(const mtt_leak_site_t**)a;
+    const mtt_leak_site_t *sb = *(const mtt_leak_site_t**)b;
+    if (sb->total_size > sa->total_size) return  1;
+    if (sb->total_size < sa->total_size) return -1;
+    return 0;
+}
+
+/* ======================================================================== *
+ *                    核心扫描与报告函数                                       *
+ * ======================================================================== */
+
+/**
+ * 执行一次完整的扫描与报告。
+ *
+ * 流程：
+ *   1. 逐分段锁快照所有活跃分配条目
+ *   2. 按调用栈 hash 去重，构建泄漏站点表
+ *   3. 懒解析栈符号
+ *   4. 排序后写入报告文件（原子 write+rename）
+ */
+static void scan_and_report(void)
+{
+    mtt_state_t *s = mtt_state_get();
+    if (s == NULL) return;
+    if (!atomic_load(&s->initialized)) return;
+
+    time_t now = time(NULL);
+    unsigned long entry_total = atomic_load(&s->entry_count);
+
+    /* ---- 阶段 1: 逐锁快照活跃条目 ---- */
+    mtt_alloc_snap_t *snaps = NULL;
+    size_t snap_count = 0;
+
+    if (entry_total > 0) {
+        /* raw_malloc 分配快照数组，全程 raw_* 不触发 hook */
+        snaps = (mtt_alloc_snap_t*)raw_malloc(
+            entry_total * sizeof(mtt_alloc_snap_t));
+        if (snaps == NULL) return; /* 内存不足，跳过本次扫描 */
+        memset(snaps, 0, entry_total * sizeof(mtt_alloc_snap_t));
+
+        /* 逐锁遍历所有桶，持锁期间拷贝字段，释放锁后安全访问 */
+        for (unsigned lock_idx = 0;
+             lock_idx < MTT_LOCK_STRIPES && snap_count < entry_total;
+             lock_idx++) {
+            pthread_mutex_lock(&s->bucket_locks[lock_idx]);
+            for (unsigned b = lock_idx;
+                 b < s->bucket_count && snap_count < entry_total;
+                 b += MTT_LOCK_STRIPES) {
+                mtt_entry_t *e = s->buckets[b];
+                while (e != NULL && snap_count < entry_total) {
+                    mtt_alloc_snap_t *sn = &snaps[snap_count++];
+                    sn->ptr      = e->ptr;
+                    sn->size     = e->size;
+                    sn->timestamp = e->timestamp;
+                    sn->stack_frames = e->stack_frames;
+                    memset(sn->stack, 0, sizeof(sn->stack));
+                    memcpy(sn->stack, e->stack,
+                           (size_t)e->stack_frames * sizeof(void*));
+                    e = e->next;
+                }
+            }
+            pthread_mutex_unlock(&s->bucket_locks[lock_idx]);
+        }
+    }
+
+    /* ---- 阶段 2: 去重 —— 按栈 hash 分组到泄漏站点表 ---- */
+    mtt_leak_table_t leak_table;
+    memset(&leak_table, 0, sizeof(leak_table));
+
+    for (size_t i = 0; i < snap_count; i++) {
+        mtt_alloc_snap_t *sn = &snaps[i];
+
+        /* 跳过空栈（捕获失败） */
+        if (sn->stack_frames <= 0) continue;
+
+        /* 获取栈缓存条目（含 hash） */
+        mtt_stack_entry_t *stack_entry = mtt_stack_cache_lookup(
+            sn->stack, sn->stack_frames);
+
+        uint64_t hash;
+        if (stack_entry != NULL) {
+            hash = stack_entry->hash;
+        } else {
+            /* 缓存满或分配失败，直接计算 hash（不去重缓存但不影响去重） */
+            hash = mtt_stack_hash_compute(sn->stack, sn->stack_frames);
+        }
+
+        /* 查/插泄漏站点 */
+        unsigned bucket = (unsigned)(hash & (uint64_t)(MTT_LEAK_DEDUP_SIZE - 1));
+        mtt_leak_site_t *site = leak_table.entries[bucket];
+
+        while (site != NULL) {
+            if (site->stack_hash == hash) {
+                break;
+            }
+            site = site->next;
+        }
+
+        if (site != NULL) {
+            /* 命中已有站点：累加 */
+            site->count++;
+            site->total_size += sn->size;
+            if (sn->timestamp > site->last_seen)
+                site->last_seen = sn->timestamp;
+        } else if (leak_table.count < MTT_LEAK_DEDUP_SIZE) {
+            /* 新建站点 */
+            mtt_leak_site_t *new_site = (mtt_leak_site_t*)raw_malloc(
+                sizeof(mtt_leak_site_t));
+            if (new_site == NULL) continue; /* 跳过，继续处理下一条 */
+
+            memset(new_site, 0, sizeof(*new_site));
+            new_site->stack_hash    = hash;
+            new_site->first_seen    = sn->timestamp;
+            new_site->last_seen     = sn->timestamp;
+            new_site->count         = 1;
+            new_site->per_leak_size = sn->size;
+            new_site->total_size    = sn->size;
+
+            /* 插入链表头部 */
+            new_site->next = leak_table.entries[bucket];
+            leak_table.entries[bucket] = new_site;
+            leak_table.count++;
+        }
+        /* else: 泄漏表满，静默跳过 */
+    }
+
+    /* ---- 阶段 3: 懒解析栈符号 ---- */
+    for (unsigned b = 0; b < MTT_LEAK_DEDUP_SIZE; b++) {
+        mtt_leak_site_t *site = leak_table.entries[b];
+        while (site != NULL) {
+             /* 遍历快照找到对应 hash 的栈帧并懒解析 */
+            for (size_t i = 0; i < snap_count; i++) {
+                mtt_alloc_snap_t *sn = &snaps[i];
+                if (sn->stack_frames <= 0) continue;
+                uint64_t h = mtt_stack_hash_compute(sn->stack, sn->stack_frames);
+                if (h == site->stack_hash) {
+                    mtt_stack_entry_t *se = mtt_stack_cache_lookup(
+                        sn->stack, sn->stack_frames);
+                    if (se != NULL && !se->is_resolved)
+                        mtt_stack_resolve(se);
+                    /* 找到一个就跳出，后续同 hash 的已解析 */
+                    break;
+                }
+            }
+            site = site->next;
+        }
+    }
+
+    /* ---- 阶段 4: 构建排序数组 ---- */
+    size_t site_count = leak_table.count;
+    mtt_leak_site_t **sorted = NULL;
+    if (site_count > 0) {
+        sorted = (mtt_leak_site_t**)raw_malloc(
+            site_count * sizeof(mtt_leak_site_t*));
+        if (sorted != NULL) {
+            size_t idx = 0;
+            for (unsigned b = 0; b < MTT_LEAK_DEDUP_SIZE && idx < site_count; b++) {
+                mtt_leak_site_t *site = leak_table.entries[b];
+                while (site != NULL && idx < site_count) {
+                    sorted[idx++] = site;
+                    site = site->next;
+                }
+            }
+            /* 按 total_size 降序排列 */
+            qsort(sorted, idx, sizeof(mtt_leak_site_t*), cmp_leak_by_size);
+            site_count = idx;
+        }
+    }
+
+    /* ---- 阶段 5: 收集符号缓存（用于写入报告） ---- */
+    /* 重新构建 site→stack_entry 映射 */
+    typedef struct {
+        mtt_leak_site_t  *site;
+        mtt_stack_entry_t *stack_entry;
+    } site_stack_pair_t;
+
+    site_stack_pair_t *pairs = NULL;
+    if (sorted != NULL && site_count > 0) {
+        pairs = (site_stack_pair_t*)raw_malloc(
+            site_count * sizeof(site_stack_pair_t));
+        if (pairs != NULL) {
+            memset(pairs, 0, site_count * sizeof(site_stack_pair_t));
+            for (size_t i = 0; i < site_count; i++) {
+                pairs[i].site = sorted[i];
+                pairs[i].stack_entry = NULL;
+                /* 在快照中寻找匹配的栈 */
+                for (size_t j = 0; j < snap_count; j++) {
+                    mtt_alloc_snap_t *sn = &snaps[j];
+                    if (sn->stack_frames <= 0) continue;
+                    uint64_t h = mtt_stack_hash_compute(
+                        sn->stack, sn->stack_frames);
+                    if (h == sorted[i]->stack_hash) {
+                        pairs[i].stack_entry = mtt_stack_cache_lookup(
+                            sn->stack, sn->stack_frames);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /* ---- 阶段 6: 写入报告文件 ---- */
+    {
+        /* 确保日志目录存在 */
+        char log_dir[256] = {0};
+        ensure_log_dir(log_dir, sizeof(log_dir));
+
+        /* 构建文件路径：/var/log/mtt/<pid>_<name>.log */
+        mtt_state_t *st = mtt_state_get();
+        const char *proc_name = "unknown";
+        if (st != NULL && st->proc_name_ready && st->proc_name[0] != '\0')
+            proc_name = st->proc_name;
+
+        char log_path[512] = {0};
+        char tmp_path[512] = {0};
+        snprintf(log_path, sizeof(log_path), "%s/%d_%s.log",
+                 log_dir, (int)getpid(), proc_name);
+        snprintf(tmp_path, sizeof(tmp_path), "%s/%d_%s.log.tmp",
+                 log_dir, (int)getpid(), proc_name);
+
+        /* 更新全局路径 */
+        snprintf(g_reporter.log_path, sizeof(g_reporter.log_path),
+                 "%s", log_path);
+        snprintf(g_reporter.tmp_path, sizeof(g_reporter.tmp_path),
+                 "%s", tmp_path);
+
+        FILE *fp = fopen(tmp_path, "w");
+        if (fp == NULL) {
+            /* 写文件失败：记录错误到 stderr（使用 write 避免 malloc） */
+            char err_buf[128] = {0};
+            int err_len = snprintf(err_buf, sizeof(err_buf),
+                "[MTT] ERROR: cannot open %s for writing: %s\n",
+                tmp_path, strerror(errno));
+            if (err_len > 0 && err_len < (int)sizeof(err_buf))
+                write(STDERR_FILENO, err_buf, (size_t)err_len);
+            goto cleanup;
+        }
+
+        /* 报告头部 */
+        time_t session_start = (g_reporter.session_start != 0)
+            ? g_reporter.session_start : now;
+        time_t elapsed = now - session_start;
+
+        {
+            char time_buf[32] = {0};
+            char dur_buf[32]  = {0};
+            char size_buf[32] = {0};
+            char peak_buf[32] = {0};
+
+            fprintf(fp,
+                "=== MemoryTraceTool Leak Report ===\n"
+                "PID: %d  Process: %s\n"
+                "Session:  %s  Duration: %s\n"
+                "Scanned:  %s  |  Active allocs: %zu  |  Unique leaks: %zu\n",
+                (int)getpid(), proc_name,
+                fmt_time(session_start, time_buf, sizeof(time_buf)),
+                fmt_duration(elapsed, dur_buf, sizeof(dur_buf)),
+                fmt_time(now, time_buf, sizeof(time_buf)),
+                snap_count, site_count);
+
+            size_t cur_bytes  = atomic_load(&st->current_bytes);
+            size_t peak_bytes = atomic_load(&st->peak_bytes);
+            size_t allocs     = atomic_load(&st->alloc_count);
+            size_t frees      = atomic_load(&st->free_count);
+
+            fprintf(fp,
+                "Total unfreed: %s  |  Peak: %s\n"
+                "Allocations: %zu  |  Frees: %zu\n"
+                "Skipped (sample): %zu  |  Skipped (overflow): %zu\n"
+                "\n",
+                fmt_bytes(cur_bytes, size_buf, sizeof(size_buf)),
+                fmt_bytes(peak_bytes, peak_buf, sizeof(peak_buf)),
+                allocs, frees,
+                atomic_load(&st->skipped_sampled),
+                atomic_load(&st->skipped_overcap));
+        }
+
+        /* 每条泄漏站点 */
+        if (pairs != NULL) {
+            for (size_t i = 0; i < site_count; i++) {
+                mtt_leak_site_t *site = pairs[i].site;
+                if (site == NULL || site->count == 0) continue;
+
+                char size_buf[32] = {0};
+                char total_buf[32] = {0};
+                char freq_buf[64] = {0};
+                char time_buf1[32] = {0};
+                char time_buf2[32] = {0};
+
+                double elapsed_sec = difftime(site->last_seen, site->first_seen);
+                double frequency = 0.0;
+                if (elapsed_sec > 0.0 && site->count > 0)
+                    frequency = (double)site->count / elapsed_sec;
+
+                fprintf(fp,
+                    "--- Leak #%zu ---\n"
+                    "Count:        %zu\n"
+                    "Per-leak:     %s\n"
+                    "Total:        %s\n"
+                    "Frequency:    ",
+                    i + 1,
+                    site->count,
+                    fmt_bytes(site->per_leak_size, size_buf, sizeof(size_buf)),
+                    fmt_bytes(site->total_size, total_buf, sizeof(total_buf)));
+                fmt_frequency(frequency, freq_buf, sizeof(freq_buf));
+                fprintf(fp, "%s\n", freq_buf);
+
+                fprintf(fp,
+                    "First seen:   %s\n"
+                    "Last seen:    %s\n"
+                    "\nStack trace (top = malloc call site):\n",
+                    fmt_time(site->first_seen, time_buf1, sizeof(time_buf1)),
+                    fmt_time(site->last_seen,  time_buf2, sizeof(time_buf2)));
+
+                /* 输出栈帧（跳过内部帧） */
+                mtt_stack_entry_t *stack_entry = pairs[i].stack_entry;
+                if (stack_entry != NULL && stack_entry->is_resolved) {
+                    int frame_idx = 0;
+                    for (int j = 0; j < stack_entry->frame_count; j++) {
+                        const char *sym = stack_entry->resolved[j];
+                        if (is_internal_frame(sym)) continue;
+
+                        const char *marker = (frame_idx == 0)
+                            ? "  <-- LEAK HERE" : "";
+                        fprintf(fp, "  #%-2d %s%s\n", frame_idx, sym, marker);
+                        frame_idx++;
+                    }
+                } else {
+                    fprintf(fp, "  (symbols not resolved)\n");
+                }
+                fprintf(fp, "\n");
+            }
+        } else if (snap_count > 0) {
+            fprintf(fp, "(No leak sites — all allocations freed or dedup table full)\n\n");
+        } else {
+            fprintf(fp, "(No active allocations — no leaks detected)\n\n");
+        }
+
+        fprintf(fp, "=== End of Report ===\n");
+        fclose(fp);
+
+        /* 原子替换：rename 在同一文件系统上是原子操作 */
+        if (rename(tmp_path, log_path) != 0) {
+            /* rename 失败：删除临时文件 */
+            unlink(tmp_path);
+        }
+    }
+
+cleanup:
+    /* 释放快照数组 */
+    if (snaps != NULL) raw_free(snaps);
+    /* 释放排序数组 */
+    if (sorted != NULL) raw_free(sorted);
+    if (pairs != NULL) raw_free(pairs);
+    /* 释放泄漏站点链表 */
+    for (unsigned b = 0; b < MTT_LEAK_DEDUP_SIZE; b++) {
+        mtt_leak_site_t *site = leak_table.entries[b];
+        while (site != NULL) {
+            mtt_leak_site_t *next = site->next;
+            raw_free(site);
+            site = next;
+        }
+    }
+}
+
+/* ======================================================================== *
+ *                     后台报告线程                                           *
+ * ======================================================================== */
+
+/** 后台报告线程主函数 */
+static void* reporter_thread_fn(void *arg)
+{
+    (void)arg;
+    pthread_detach(pthread_self());
+
+    /* 报告线程全程设置 g_in_hook，确保所有 libc 调用绕过 hook，
+     * 避免 fopen/fprintf/snprintf 等内部 malloc 导致递归死锁。 */
+    int saved_hook = g_in_hook;
+    g_in_hook = 1;
+
+    while (g_reporter.running) {
+        /* 分段睡眠，每 1 秒检查一次 running 标志（响应退出请求） */
+        for (int i = 0; i < MTT_REPORT_INTERVAL_SEC && g_reporter.running; i++)
+            sleep(1);
+
+        if (g_reporter.running)
+            scan_and_report();
+    }
+
+    /* 运行标志已清除，执行最后一次扫描 */
+    scan_and_report();
+
+    g_in_hook = saved_hook;
+    return NULL;
+}
+
+/* ======================================================================== *
+ *                     atexit 处理（进程退出时生成最终报告）                       *
+ * ======================================================================== */
+
+/**
+ * 进程退出时执行最终扫描。
+ *
+ * 先通知后台线程停止，再同步调用 scan_and_report() 输出最终报告。
+ * atexit 在 main 返回/exit 调用后执行，此时主线程外的大部分线程已结束。
+ */
+static void mtt_atexit_handler(void)
+{
+    g_reporter.running = 0;
+    scan_and_report();
+}
+
+/* ======================================================================== *
+ *                     公共接口                                              *
+ * ======================================================================== */
+
+/**
+ * 启动周期报告后台线程。
+ *
+ * 初始化日志路径和会话起始时间，创建 detach 线程。
+ * 通过 CAS 确保仅启动一次。
+ */
+void mtt_reporter_start(void)
+{
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_reporter_started, &expected, 1))
+        return;
+
+    /* 注册退出处理：进程结束时输出最终报告 */
+    atexit(mtt_atexit_handler);
+
+    mtt_state_t *s = mtt_state_get();
+
+    g_reporter.running = 1;
+    g_reporter.session_start = time(NULL);
+
+    /* 构建日志路径 */
+    const char *proc_name = "unknown";
+    if (s != NULL && s->proc_name_ready && s->proc_name[0] != '\0')
+        proc_name = s->proc_name;
+
+    char log_dir[256] = {0};
+    ensure_log_dir(log_dir, sizeof(log_dir));
+    snprintf(g_reporter.log_path, sizeof(g_reporter.log_path),
+             "%s/%d_%s.log", log_dir, (int)getpid(), proc_name);
+    snprintf(g_reporter.tmp_path, sizeof(g_reporter.tmp_path),
+             "%s/%d_%s.log.tmp", log_dir, (int)getpid(), proc_name);
+
+    memset(&g_reporter.leak_table, 0, sizeof(g_reporter.leak_table));
+
+    pthread_t tid;
+    int rc = pthread_create(&tid, NULL, reporter_thread_fn, NULL);
+    if (rc != 0) {
+        /* 创建线程失败：静默降级，不输出日志以预防递归 */
+        g_reporter.running = 0;
+        g_reporter_started = 0;
+        return;
+    }
+
+    /* 首次诊断输出（使用 write 避免 malloc） */
+    char diag[256] = {0};
+    int len = snprintf(diag, sizeof(diag),
+        "[MTT] Reporter thread started (pid=%d, log=%s, interval=%ds)\n",
+        (int)getpid(), g_reporter.log_path, MTT_REPORT_INTERVAL_SEC);
+    if (len > 0 && len < (int)sizeof(diag))
+        write(STDERR_FILENO, diag, (size_t)len);
+}
+
+/**
+ * 停止报告线程并执行最后一次扫描。
+ *
+ * 由 atexit 回调调用。设置 running=0，等待线程自然退出
+ * 后（最多等待约 MTT_REPORT_INTERVAL_SEC），线程会执行最终扫描。
+ */
+void mtt_reporter_stop(void)
+{
+    g_reporter.running = 0;
+    /* 不 join：线程是 detached，会在下一次检查 running 时自行退出。
+     * atexit 上下文中 pthread_join 可能导致死锁。 */
+}

@@ -1,0 +1,55 @@
+/*
+ * MemoryTraceTool — 周期报告引擎。
+ *
+ * 后台线程每 60 秒扫描分配追踪表，按调用栈去重后生成泄漏报告，
+ * 原子写入 /var/log/mtt/<pid>_<name>.log。
+ *
+ * 线程安全：本模块仅在单个后台线程中运行，与 hooks.c 高频路径零竞争。
+ * 防递归：报告线程全程设置 g_in_hook=1，所有 libc 调用绕过 hook。
+ */
+#ifndef MTT_REPORTER_H
+#define MTT_REPORTER_H
+
+#include "mtt_internal.h"
+
+/* ---- 泄漏去重记录 ---- */
+
+/** 单条泄漏站点记录（按调用栈 hash 去重） */
+typedef struct mtt_leak_site {
+    uint64_t  stack_hash;      /* 关联的栈帧 hash */
+    time_t    first_seen;      /* 首次观察到的时间 */
+    time_t    last_seen;       /* 最近一次扫描观察到的时间 */
+    size_t    count;           /* 当前未释放的分配次数 */
+    size_t    per_leak_size;   /* 单次泄漏大小（字节） */
+    size_t    total_size;      /* 累计泄漏大小（count × per_leak_size） */
+    struct mtt_leak_site *next; /* 哈希碰撞链表 */
+} mtt_leak_site_t;
+
+/** 泄漏去重表（开放哈希，数组+链表） */
+typedef struct {
+    mtt_leak_site_t *entries[MTT_LEAK_DEDUP_SIZE];
+    size_t           count;                       /* 当前站点数 */
+    pthread_mutex_t  lock;
+} mtt_leak_table_t;
+
+/* ---- API ---- */
+
+/**
+ * 启动周期报告后台线程。
+ *
+ * 初始化日志路径 /var/log/mtt/<pid>_<name>.log，
+ * 创建 detach 线程，每 MTT_REPORT_INTERVAL_SEC 秒执行一次 scan_and_report()。
+ * 线程安全：通过 CAS 确保仅启动一次。
+ */
+void mtt_reporter_start(void);
+
+/**
+ * 请求报告线程停止并执行最后一次扫描。
+ *
+ * 设置 running=0 标志，等待当前扫描完成（最多等待 5 秒），
+ * 执行最终 scan_and_report() 后线程退出。
+ * 由 mtt_atexit_report() 调用。
+ */
+void mtt_reporter_stop(void);
+
+#endif /* MTT_REPORTER_H */
