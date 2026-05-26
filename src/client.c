@@ -34,6 +34,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 
 /* 缓存的套接字文件描述符，避免重复连接。
  * 由 g_sock_lock 保护，防止周期报告线程与 atexit 并发 double-close。 */
@@ -235,8 +236,33 @@ typedef struct {
     void*  stack[MTT_STACK_DEPTH];
 } mtt_entry_snap_t;
 
+/**
+ * 客户端 trace 日志：使用纯 syscall 写入临时文件，不触发任何 libc 分配。
+ *
+ * daemon 通过 /api/debug/trace?pid=N URL 读取这些日志，
+ * 用于诊断报告线程的精确失败点。
+ */
+static void client_trace(const char* msg)
+{
+    char path[96];
+    int n = snprintf(path, sizeof(path), "/tmp/mtt_trace_%d.log", getpid());
+    if (n <= 0 || n >= (int)sizeof(path)) return;
+    int tfd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (tfd >= 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        char buf[640];
+        int len = snprintf(buf, sizeof(buf), "[%ld.%06ld] tid=%lu %s\n",
+            (long)ts.tv_sec, (long)(ts.tv_nsec / 1000),
+            (unsigned long)pthread_self(), msg);
+        if (len > 0) write(tfd, buf, (size_t)len);
+        close(tfd);
+    }
+}
+
 static void do_client_report(int is_final)
 {
+    client_trace(is_final ? "report: entry is_final=1" : "report: entry is_final=0");
     fprintf(stderr, "[mtt-client] do_client_report is_final=%d\n", is_final);
     mtt_ensure_init();
     mtt_state_t* s = mtt_state_get();
@@ -254,12 +280,17 @@ static void do_client_report(int is_final)
     pthread_mutex_lock(&g_sock_lock);
 
     int fd = connect_daemon();
-    if (fd < 0) { pthread_mutex_unlock(&g_sock_lock); g_in_resolver = saved_resolver; return; }
+    if (fd < 0) {
+        client_trace("report: connect_daemon FAILED");
+        pthread_mutex_unlock(&g_sock_lock); g_in_resolver = saved_resolver; return;
+    }
+    client_trace("report: connect_daemon OK, sending STAT block");
 
     /* 发送 STAT 消息：上报当前进程堆内存状态到 daemon，用于看板 chart 时序展示。
      * 使用 open/read/close 系统调用读取 /proc/self/status，避免 fopen()
      * 内部调用 malloc() 触发我们的钩子函数，在报告线程中造成重入死锁。 */
     {
+        client_trace("report: reading /proc/self/status");
         size_t vm_rss = 0;
         char stat_path[64];
         snprintf(stat_path, sizeof(stat_path), "/proc/%d/status", getpid());
@@ -276,15 +307,28 @@ static void do_client_report(int is_final)
             }
             close(sfd);
         }
+        {
+            char tr[128];
+            snprintf(tr, sizeof(tr), "report: /proc/self/status done, vm_rss=%zu", vm_rss);
+            client_trace(tr);
+        }
         size_t cur_bytes = atomic_load(&s->current_bytes);
         size_t allocs    = atomic_load(&s->alloc_count);
         size_t frees     = atomic_load(&s->free_count);
+
+        {
+            char tr[160];
+            snprintf(tr, sizeof(tr), "report: sending STAT cur=%zu allocs=%zu frees=%zu rss=%zu",
+                cur_bytes, allocs, frees, vm_rss);
+            client_trace(tr);
+        }
 
         char stat_line[256];
         int sn = snprintf(stat_line, sizeof(stat_line),
             "STAT %zu %zu %zu %zu\n", cur_bytes, allocs, frees, vm_rss);
         if (sn > 0 && sn < (int)sizeof(stat_line))
             send_all(fd, stat_line, (size_t)sn);
+        client_trace("report: STAT sent, collecting snapshots");
     }
 
     /* 收集快照（逐锁遍历，持锁期间拷贝字段，避免 UAF） */
@@ -314,6 +358,12 @@ static void do_client_report(int is_final)
             }
         }
         pthread_mutex_unlock(&s->bucket_locks[lock_idx]);
+    }
+
+    {
+        char tr[64];
+        snprintf(tr, sizeof(tr), "report: snapshots done, nleaks=%d", nleaks);
+        client_trace(tr);
     }
 
     /* 序列化并发送每条泄漏（锁已释放，只访问快照） */
@@ -346,6 +396,7 @@ static void do_client_report(int is_final)
     pthread_mutex_unlock(&g_sock_lock);
 
     raw_free(snaps);
+    client_trace("report: complete");
     g_in_resolver = saved_resolver;
 }
 
@@ -376,11 +427,17 @@ static void* reporter_thread_func(void* arg)
 {
     (void)arg;
     pthread_detach(pthread_self());
+    client_trace("reporter: thread started");
     while (g_reporter_running) {
         sleep(3);
-        if (g_reporter_running)
+        client_trace("reporter: iteration start");
+        if (g_reporter_running) {
+            client_trace("reporter: calling do_client_report");
             do_client_report(0);
+            client_trace("reporter: do_client_report returned");
+        }
     }
+    client_trace("reporter: thread exiting");
     return NULL;
 }
 

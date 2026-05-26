@@ -3146,6 +3146,105 @@ static void handle_debug_blocked(int fd)
 }
 
 /**
+ * GET /api/debug/trace — 读取客户端 trace 日志文件。
+ *
+ * 客户端（被注入进程的报告线程）通过 client_trace() 将诊断日志
+ * 写入 /tmp/mtt_trace_<PID>.log（纯 syscall，不触发 malloc）。
+ * 本端点读取该文件并以 JSON 格式返回，用于定位报告线程失败点。
+ *
+ * 查询参数：
+ *   pid=N   (必需) 目标进程 PID
+ *   tail=M  (可选) 仅返回最后 M 行
+ */
+static void handle_debug_trace(int fd, const char* query)
+{
+    /* 解析 pid 参数 */
+    int pid = 0, tail = 0;
+    if (query) {
+        const char* p = strstr(query, "pid=");
+        if (p) pid = atoi(p + 4);
+        p = strstr(query, "tail=");
+        if (p) tail = atoi(p + 5);
+    }
+
+    char buf[8192];
+    int pos = 0;
+    int cap = (int)sizeof(buf);
+
+    if (pid <= 1) {
+        pos += snprintf(buf + pos, cap - pos,
+            "{\"error\":\"invalid or missing pid parameter\",\"pid\":%d}", pid);
+    } else {
+        char tpath[128];
+        snprintf(tpath, sizeof(tpath), "/tmp/mtt_trace_%d.log", pid);
+        int tfd = open(tpath, O_RDONLY);
+        if (tfd < 0) {
+            pos += snprintf(buf + pos, cap - pos,
+                "{\"pid\":%d,\"error\":\"cannot open trace file: %s\",\"lines\":[],\"nlines\":0}",
+                pid, strerror(errno));
+        } else {
+            /* 读取整个文件 */
+            char content[65536];
+            ssize_t nr = read(tfd, content, sizeof(content) - 1);
+            close(tfd);
+
+            if (nr < 0) nr = 0;
+            content[nr] = '\0';
+
+            /* 分割为行并收集 */
+            char* lines[2048];
+            int nlines = 0;
+            char* saveptr;
+            char* line = strtok_r(content, "\n", &saveptr);
+            while (line && nlines < 2048) {
+                lines[nlines++] = line;
+                line = strtok_r(NULL, "\n", &saveptr);
+            }
+
+            /* tail 截断 */
+            int start = 0;
+            int shown = nlines;
+            if (tail > 0 && tail < nlines) {
+                start = nlines - tail;
+                shown = tail;
+            }
+
+            pos += snprintf(buf + pos, cap - pos,
+                "{\"pid\":%d,\"nlines\":%d,\"shown\":%d,\"tail\":%d,\"lines\":[",
+                pid, nlines, shown, tail);
+
+            for (int i = 0; i < shown; i++) {
+                /* JSON 转义行内容 */
+                char escaped[640];
+                int ei = 0;
+                const char* src = lines[start + i];
+                while (*src && ei < (int)sizeof(escaped) - 1) {
+                    char c = *src++;
+                    if (c == '"') { if (ei < (int)sizeof(escaped)-2) { escaped[ei++]='\\'; escaped[ei++]='"'; } }
+                    else if (c == '\\') { if (ei < (int)sizeof(escaped)-2) { escaped[ei++]='\\'; escaped[ei++]='\\'; } }
+                    else if (c == '\r') { /* skip */ }
+                    else if (c == '\t') escaped[ei++] = c;
+                    else if (c >= 32) escaped[ei++] = c;
+                }
+                escaped[ei] = '\0';
+                pos += snprintf(buf + pos, cap - pos,
+                    "%s\"%s\"", i > 0 ? "," : "", escaped);
+                if (pos >= cap - 256) break; /* 缓冲区保护 */
+            }
+            pos += snprintf(buf + pos, cap - pos, "]}");
+        }
+    }
+
+    char hdr[256];
+    int hdrlen = snprintf(hdr, sizeof(hdr),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n"
+        "Access-Control-Allow-Origin: *\r\nContent-Length: %d\r\n"
+        "Connection: close\r\n\r\n", pos);
+    send_all(fd, hdr, hdrlen);
+    send_all(fd, buf, pos);
+}
+
+/**
  * GET /api/reset — 清除所有泄漏历史数据。
  *
  * 释放所有被监控进程的泄漏记录数组，归零计数器，
@@ -3279,6 +3378,7 @@ static void handle_api_clear(int fd)
  *   GET /api/inject        → 运行时注入（handle_api_inject）
  *   GET /api/injected      → 注入记录（send_api_injected）
  *   GET /api/debug/events  → 事件日志环形缓冲区
+ *   GET /api/debug/trace?pid=N → 客户端 trace 诊断日志
  *   GET /api/debug/proc/N  → 指定PID的/proc诊断信息
  *   GET /api/debug/state   → daemon 整体状态摘要
  *   GET /api/debug/procs   → 所有被监控进程完整数据
@@ -3381,6 +3481,9 @@ static void handle_http(int fd)
     } else if (strncmp(buf, "GET /api/debug/events", 21) == 0) {
         char* q = strchr(buf, '?');
         handle_debug_events(fd, q);
+    } else if (strncmp(buf, "GET /api/debug/trace", 20) == 0) {
+        char* q = strchr(buf, '?');
+        handle_debug_trace(fd, q);
     } else if (strncmp(buf, "GET /api/debug/proc/", 20) == 0) {
         int pid = atoi(buf + 20);
         if (pid > 1)
