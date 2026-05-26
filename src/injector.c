@@ -278,6 +278,8 @@ static const mem_region_t* find_region(const mem_region_t* regions, int count,
             if (strstr(regions[i].path, name_hint))
                 return &regions[i];
         } else {
+            /* 跳过虚拟映射 [vvar]/[vdso]/[vsyscall] 等，避免误匹配为主可执行文件 */
+            if (regions[i].path[0] == '[') continue;
             if (regions[i].path[0] && !strstr(regions[i].path, ".so"))
                 return &regions[i];
         }
@@ -721,6 +723,17 @@ static int patch_got_entries(pid_t pid, const char* exe_path,
         unsigned long hook_addr = hook_addrs[hook_idx];
 
         errno = 0;
+        /* GOT 可写性预检查：先 PTRACE_PEEKDATA 读取当前值，验证地址有效 */
+        {
+            unsigned long old_got_val = 0;
+            errno = 0;
+            old_got_val = ptrace(PTRACE_PEEKDATA, pid, (void*)got_addr, NULL);
+            if (old_got_val == (unsigned long)-1 && errno != 0) {
+                fprintf(stderr, "[DEBUG] POKEDATA %s: PEEKDATA failed got=0x%lx errno=%d (%s)\n",
+                        name, got_addr, errno, strerror(errno));
+                continue;
+            }
+        }
         if (ptrace(PTRACE_POKEDATA, pid, (void*)got_addr,
                    (void*)hook_addr) != -1) {
             fprintf(stderr, "[DEBUG] POKEDATA %s: got=0x%lx hook=0x%lx OK\n",

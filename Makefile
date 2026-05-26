@@ -1,7 +1,7 @@
 CROSS_COMPILE ?=
 CC       = $(if $(CROSS_COMPILE),$(CROSS_COMPILE)gcc,gcc)
 WITHOUT_INJECTOR ?= 0
-CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
+CFLAGS   = -Wall -Wextra -g -O1 -fPIC -ftls-model=global-dynamic -funwind-tables -fno-omit-frame-pointer
 CFLAGS_NOPIC = -Wall -Wextra -g -O1 -funwind-tables -fno-omit-frame-pointer
 LDFLAGS  = -lpthread -ldl
 
