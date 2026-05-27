@@ -130,6 +130,18 @@ void* malloc(size_t size)
 
     /* 持锁插入哈希表 + 原子更新计数器 */
     mtt_stripe_lock(s, ptr);
+
+    /* 锁内二次检查容量：消除 TOCTOU 竞争窗口。
+     * 20 线程同时通过外部 mtt_is_over_capacity() 检查后，
+     * 此处仅允许前若干线程真正插入，其余丢弃追踪记录。 */
+    if (atomic_load(&s->entry_count) >= MTT_MAX_ENTRIES) {
+        atomic_fetch_add(&s->skipped_overcap, 1);
+        mtt_stripe_unlock(s, ptr);
+        raw_free(e);
+        g_in_hook = saved_hook;
+        return ptr; /* 用户内存已分配，仅跳过追踪 */
+    }
+
     e->alloc_num = atomic_fetch_add(&s->alloc_seq, 1) + 1;
     atomic_fetch_add(&s->alloc_count, 1);
     atomic_fetch_add(&s->current_bytes, size);
@@ -331,6 +343,17 @@ void* realloc(void *ptr, size_t size)
 
     /* 插入新追踪记录 */
     mtt_stripe_lock(s, new_ptr);
+
+    /* 锁内容量检查：旧条目已删，新条目可能超限（仅当旧 ptr 未被追踪时净增 1） */
+    if (atomic_load(&s->entry_count) >= MTT_MAX_ENTRIES) {
+        atomic_fetch_add(&s->skipped_overcap, 1);
+        mtt_stripe_unlock(s, new_ptr);
+        raw_free(new_e);
+        raw_free(ptr);
+        g_in_hook = saved_hook;
+        return new_ptr;
+    }
+
     new_e->alloc_num = atomic_fetch_add(&s->alloc_seq, 1) + 1;
     atomic_fetch_add(&s->alloc_count, 1);
     atomic_fetch_add(&s->current_bytes, size);

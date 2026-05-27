@@ -58,6 +58,9 @@ raw_calloc_fn raw_calloc = NULL;
 /* CAS 保护的一次性解析标志 */
 static atomic_int g_raw_resolved = 0;
 
+/* raw_* 指针是否已完成 dlsym 解析（发布/订阅屏障） */
+static atomic_int g_raw_ready = 0;
+
 /* 递归保护：dlsym 内部可能触发 malloc，防止 resolve 自身递归 */
 static __thread int g_raw_resolving = 0;
 
@@ -121,7 +124,11 @@ static void* bootstrap_calloc(size_t count, size_t size)
  */
 void mtt_resolve_raw_allocators(void)
 {
-    /* 快速路径：已解析完成 */
+    /* 快速路径：已完全解析（发布/订阅屏障确保 raw_* 指针对其他线程可见） */
+    if (atomic_load(&g_raw_ready))
+        return;
+
+    /* 快速路径：前一次 CAS 失败后预置了 bootstrap，但 winner 尚未完成 */
     if (raw_malloc != NULL)
         return;
 
@@ -130,7 +137,10 @@ void mtt_resolve_raw_allocators(void)
         return;
 
     /* 预置 bootstrap 分配器：必须在 CAS 之前完成。
-     * 确保 CAS 失败线程使用 bootstrap_*（非 NULL），避免空指针崩溃。 */
+     * 确保 CAS 失败线程使用 bootstrap_*（非 NULL），避免空指针崩溃。
+     * CAS 失败后，线程在下一次 mtt_resolve_raw_allocators() 调用时
+     * 通过 g_raw_ready 检查（而非 raw_malloc != NULL）得知真正完成。
+     * Winner 线程在约 0.1ms 内完成 dlsym，bootstrap 缓冲区足以支撑。 */
     raw_malloc = bootstrap_malloc;
     raw_free   = bootstrap_free;
     raw_calloc = bootstrap_calloc;
@@ -171,7 +181,8 @@ void mtt_resolve_raw_allocators(void)
     g_in_hook = saved_hook;
     g_raw_resolving = 0;
 
-    /* 两种路径均失败时保留 bootstrap 分配器（至少不崩溃） */
+    /* 发布屏障：确保 raw_* 指针写入对所有线程可见后，再置 ready 标志 */
+    atomic_store(&g_raw_ready, 1);
 }
 
 /* ======================================================================== *
@@ -526,6 +537,15 @@ void* mtt_malloc(size_t size)
 
     /* 持锁插入哈希表 + 更新统计 */
     mtt_stripe_lock(s, ptr);
+
+    /* 锁内二次检查容量：消除 TOCTOU 竞争窗口 */
+    if (atomic_load(&s->entry_count) >= MTT_MAX_ENTRIES) {
+        atomic_fetch_add(&s->skipped_overcap, 1);
+        mtt_stripe_unlock(s, ptr);
+        raw_free(e);
+        return ptr; /* 用户内存已分配，仅跳过追踪 */
+    }
+
     e->alloc_num = atomic_fetch_add(&s->alloc_seq, 1) + 1;
     atomic_fetch_add(&s->alloc_count, 1);
     atomic_fetch_add(&s->current_bytes, size);
@@ -673,6 +693,16 @@ void* mtt_realloc(void *ptr, size_t size)
 
     /* 插入新追踪记录 */
     mtt_stripe_lock(s, new_ptr);
+
+    /* 锁内容量检查：旧条目已删，新条目可能超限 */
+    if (atomic_load(&s->entry_count) >= MTT_MAX_ENTRIES) {
+        atomic_fetch_add(&s->skipped_overcap, 1);
+        mtt_stripe_unlock(s, new_ptr);
+        raw_free(new_e);
+        raw_free(ptr);
+        return new_ptr;
+    }
+
     new_e->alloc_num = atomic_fetch_add(&s->alloc_seq, 1) + 1;
     atomic_fetch_add(&s->alloc_count, 1);
     atomic_fetch_add(&s->current_bytes, size);

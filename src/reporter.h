@@ -32,6 +32,17 @@ typedef struct {
     pthread_mutex_t  lock;
 } mtt_leak_table_t;
 
+/** 报告器全局状态（单例，仅 reporter 线程 + atexit 处理器访问） */
+typedef struct {
+    pthread_t        thread;
+    _Atomic int      running;                    /* 原子标志：1=运行中, 0=停止请求 */
+    pthread_mutex_t  scan_mutex;                 /* 串行化 scan_and_report（reporter 线程 vs atexit） */
+    mtt_leak_table_t leak_table;
+    time_t           session_start;
+    char             log_path[512];              /* 正式日志文件路径 */
+    char             tmp_path[512];              /* 临时文件路径（write+rename 原子写入） */
+} mtt_reporter_t;
+
 /* ---- API ---- */
 
 /**

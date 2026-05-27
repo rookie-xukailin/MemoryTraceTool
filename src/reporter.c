@@ -174,7 +174,8 @@ static int cmp_leak_by_size(const void *a, const void *b)
  *   3. 懒解析栈符号
  *   4. 排序后写入报告文件（原子 write+rename）
  */
-static void scan_and_report(void)
+/** scan_and_report 内部实现（假定调用者持有 g_reporter.scan_mutex） */
+static void scan_and_report_locked(void)
 {
     mtt_state_t *s = mtt_state_get();
     if (s == NULL) return;
@@ -519,6 +520,14 @@ cleanup:
     }
 }
 
+/** scan_and_report 加锁包装器（串行化 reporter 线程与 atexit 处理器） */
+static void scan_and_report(void)
+{
+    pthread_mutex_lock(&g_reporter.scan_mutex);
+    scan_and_report_locked();
+    pthread_mutex_unlock(&g_reporter.scan_mutex);
+}
+
 /* ======================================================================== *
  *                     后台报告线程                                           *
  * ======================================================================== */
@@ -534,12 +543,12 @@ static void* reporter_thread_fn(void *arg)
     int saved_hook = g_in_hook;
     g_in_hook = 1;
 
-    while (g_reporter.running) {
+    while (atomic_load(&g_reporter.running)) {
         /* 分段睡眠，每 1 秒检查一次 running 标志（响应退出请求） */
-        for (int i = 0; i < MTT_REPORT_INTERVAL_SEC && g_reporter.running; i++)
+        for (int i = 0; i < MTT_REPORT_INTERVAL_SEC && atomic_load(&g_reporter.running); i++)
             sleep(1);
 
-        if (g_reporter.running)
+        if (atomic_load(&g_reporter.running))
             scan_and_report();
     }
 
@@ -562,8 +571,13 @@ static void* reporter_thread_fn(void *arg)
  */
 static void mtt_atexit_handler(void)
 {
-    g_reporter.running = 0;
-    scan_and_report();
+    /* 通知后台线程停止 */
+    atomic_store(&g_reporter.running, 0);
+
+    /* 等待任何正在进行的扫描完成，然后执行最终扫描 */
+    pthread_mutex_lock(&g_reporter.scan_mutex);
+    scan_and_report_locked();
+    pthread_mutex_unlock(&g_reporter.scan_mutex);
 }
 
 /* ======================================================================== *
@@ -587,7 +601,10 @@ void mtt_reporter_start(void)
 
     mtt_state_t *s = mtt_state_get();
 
-    g_reporter.running = 1;
+    /* 初始化 scan 互斥锁（{0} 静态初始化在 Linux NPTL 上有效，显式 init 确保可移植） */
+    pthread_mutex_init(&g_reporter.scan_mutex, NULL);
+
+    atomic_store(&g_reporter.running, 1);
     g_reporter.session_start = time(NULL);
 
     /* 构建日志路径 */
@@ -608,8 +625,8 @@ void mtt_reporter_start(void)
     int rc = pthread_create(&tid, NULL, reporter_thread_fn, NULL);
     if (rc != 0) {
         /* 创建线程失败：静默降级，不输出日志以预防递归 */
-        g_reporter.running = 0;
-        g_reporter_started = 0;
+        atomic_store(&g_reporter.running, 0);
+        atomic_store(&g_reporter_started, 0);
         return;
     }
 
@@ -630,7 +647,7 @@ void mtt_reporter_start(void)
  */
 void mtt_reporter_stop(void)
 {
-    g_reporter.running = 0;
+    atomic_store(&g_reporter.running, 0);
     /* 不 join：线程是 detached，会在下一次检查 running 时自行退出。
      * atexit 上下文中 pthread_join 可能导致死锁。 */
 }
