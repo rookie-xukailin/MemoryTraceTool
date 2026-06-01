@@ -9,6 +9,10 @@
  *
  * 符号解析使用 dladdr() 为首选，backtrace_symbols() 为兜底。
  * 统一输出格式: "func+0xOFFSET (libname)"。
+ *
+ * ARM32 Thumb 兼容：帧地址在捕获阶段（tracker.c:mtt_capture_stack）
+ * 已清除 Thumb bit（LSB），本模块不再重复处理。若未来新增入口点
+ * 未经过 mtt_capture_stack，需确保传入的地址 LSB 已清除。
  */
 
 #define _GNU_SOURCE
@@ -18,7 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
+#if MTT_HAS_BACKTRACE
 #include <execinfo.h>
+#endif
 
 /* ---- 全局栈缓存单例 ---- */
 
@@ -51,7 +57,10 @@ static uint64_t xxhash64_round(uint64_t acc, uint64_t input)
 /**
  * 对一组原始帧地址计算 xxHash64。
  *
- * @param frames       原始帧地址数组（来自 backtrace）
+ * 在 ARM32 上，64-bit 移位操作（如 >> 33, >> 63）需要编译器生成
+ * 辅助指令序列，性能略低于 64-bit 架构，但功能正确。
+ *
+ * @param frames       原始帧地址数组（来自 backtrace，Thumb bit 已清除）
  * @param frame_count  帧数
  * @param seed         哈希种子
  * @return             64 位哈希值
@@ -139,6 +148,8 @@ static uint64_t xxhash64_frames(void **frames, int frame_count, uint64_t seed)
  * 对 frame_count 个帧地址计算 hash。
  *
  * 供外部（如 reporter）使用，在不缓存栈时也能获得去重键。
+ * 帧地址应已在捕获阶段（mtt_capture_stack）清除了 Thumb bit。
+ * 作为安全网，此处再次对每个地址执行 Thumb bit 清除。
  */
 uint64_t mtt_stack_hash_compute(void **frames, int frame_count)
 {
@@ -147,7 +158,15 @@ uint64_t mtt_stack_hash_compute(void **frames, int frame_count)
     int start = (frame_count > 1) ? 1 : 0;
     int count = frame_count - start;
     if (count <= 0) return 0;
-    return xxhash64_frames(frames + start, count, 0x9e3779b97f4a7c15ULL);
+
+    /* 安全网：对每个帧地址清除 Thumb bit（ARM32 兼容）。
+     * 正常路径下此操作是空操作（LSB 已在捕获阶段清除）。
+     * 使用栈上临时数组避免修改调用者数据。 */
+    void *clean_frames[MTT_STACK_DEPTH];
+    for (int i = 0; i < count; i++) {
+        clean_frames[i] = MTT_FIX_THUMB_ADDR(frames[start + i]);
+    }
+    return xxhash64_frames(clean_frames, count, 0x9e3779b97f4a7c15ULL);
 }
 
 /**
@@ -172,7 +191,7 @@ mtt_stack_entry_t* mtt_stack_cache_lookup(void **frames, int frame_count)
             /* 逐帧比较地址（避免 hash 碰撞误判） */
             int match = 1;
             for (int i = 0; i < frame_count; i++) {
-                if (e->frames[i] != frames[i]) {
+                if (e->frames[i] != MTT_FIX_THUMB_ADDR(frames[i])) {
                     match = 0;
                     break;
                 }
@@ -203,8 +222,10 @@ mtt_stack_entry_t* mtt_stack_cache_lookup(void **frames, int frame_count)
     new_entry->hash        = hash;
     new_entry->frame_count = frame_count;
     new_entry->is_resolved = 0;
-    memcpy(new_entry->frames, frames,
-           (size_t)frame_count * sizeof(void*));
+    /* 存入前清除 Thumb bit */
+    for (int i = 0; i < frame_count; i++) {
+        new_entry->frames[i] = MTT_FIX_THUMB_ADDR(frames[i]);
+    }
 
     /* 插入链表头部 */
     new_entry->next = cache->entries[bucket];
@@ -225,7 +246,10 @@ mtt_stack_entry_t* mtt_stack_cache_lookup(void **frames, int frame_count)
  * 格式: "func_name+0xOFFSET (libname)"
  * 首选 dladdr() 解析，失败时回退到 backtrace_symbols()。
  *
- * @param addr      帧地址
+ * 注意：addr 参数应已清除 Thumb bit（调用者负责确保）。
+ * 在 ARM32 上，若 addr 保留了 Thumb bit，dladdr() 可能找不到符号。
+ *
+ * @param addr      帧地址（Thumb bit 已清除）
  * @param out       输出缓冲区
  * @param out_size  缓冲区大小
  */
@@ -256,6 +280,7 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
             if (func_off < 0) func_off = 0;
         } else {
             /* dli_sname 为 NULL：尝试 backtrace_symbols 提取函数名 */
+#if MTT_HAS_BACKTRACE
             char **syms = backtrace_symbols(&addr, 1);
             if (syms != NULL && syms[0] != NULL) {
                 char *paren = strchr(syms[0], '(');
@@ -269,6 +294,7 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
                 }
                 free(syms);
             }
+#endif
             if (func_name[0] == '\0')
                 snprintf(func_name, sizeof(func_name), "??");
             func_off = (char*)addr - (char*)info.dli_fbase;
@@ -276,6 +302,7 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
         }
     } else {
         /* dladdr 完全失败：从 backtrace_symbols 解析 */
+#if MTT_HAS_BACKTRACE
         char **syms = backtrace_symbols(&addr, 1);
         if (syms != NULL && syms[0] != NULL) {
             char *paren = strchr(syms[0], '(');
@@ -293,10 +320,12 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
                 size_t nlen = (size_t)(rparen - paren - 1);
                 if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
                 memcpy(func_name, paren + 1, nlen);
+                func_name[nlen] = '\0';
                 /* 无偏移，保持 func_off=0 */
             }
             free(syms);
         }
+#endif
         if (func_name[0] == '\0')
             snprintf(func_name, sizeof(func_name), "%p", addr);
     }

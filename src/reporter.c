@@ -7,7 +7,7 @@
  *
  * 线程安全：仅在单个后台线程中运行，与 hooks.c 高频路径零竞争。
  * 防递归：报告线程全程 g_in_hook=1，所有 libc 调用绕过 hook。
- * 内存控制：临时快照数组在每次扫描后释放，不累积。
+ * 内存控制：快照数组在每次扫描时动态分配，分配失败时按降级策略处理。
  */
 
 #define _GNU_SOURCE
@@ -28,6 +28,7 @@
 
 static mtt_reporter_t g_reporter = {0};
 static atomic_int      g_reporter_started = 0;
+static int             g_atexit_registered = 0; /* 防止重复注册 atexit */
 
 /* ---- 快照条目（逐锁拷贝，避免持锁期间访问链表） ---- */
 
@@ -48,6 +49,8 @@ typedef struct {
  *
  * 优先 /var/log/mtt，若不可写则 fallback 到 /tmp/mtt-logs。
  * 尝试创建目录（0755），失败时使用 fallback。
+ * 修复了原 mkdir/access 之间的 TOCTOU 竞态：通过检查 errno 区分
+ * "目录已存在"与"权限不足/文件系统只读"两种情况。
  *
  * @param buf   输出缓冲区
  * @param size  缓冲区大小
@@ -58,10 +61,16 @@ static const char* ensure_log_dir(char *buf, size_t size)
     if (buf == NULL || size == 0) return "/tmp";
 
     const char *primary = "/var/log/mtt";
-    if (mkdir(primary, 0755) == 0 || access(primary, W_OK) == 0) {
-        snprintf(buf, size, "%s", primary);
-        return buf;
+    if (mkdir(primary, 0755) == 0 || errno == EEXIST) {
+        /* 目录创建成功或已存在 — 检查可写性 */
+        if (access(primary, W_OK) == 0) {
+            snprintf(buf, size, "%s", primary);
+            return buf;
+        }
+        /* 目录存在但不可写（权限问题），跳过 primary */
     }
+    /* mkdir 因 EROFS（只读文件系统）/ EACCES（权限不足）等失败，
+     * 或目录存在但不可写 — 统一 fallback */
 
     const char *fallback = "/tmp/mtt-logs";
     mkdir(fallback, 0755);
@@ -173,33 +182,50 @@ static int cmp_leak_by_size(const void *a, const void *b)
  *   2. 按调用栈 hash 去重，构建泄漏站点表
  *   3. 懒解析栈符号
  *   4. 排序后写入报告文件（原子 write+rename）
+ *
+ * 内存降级策略：
+ *   快照数组分配失败时，尝试以半数容量重试，若仍失败则跳过本次扫描。
+ *   下次扫描（60s 后）条目数可能减少，届时再尝试。
  */
 /** scan_and_report 内部实现（假定调用者持有 g_reporter.scan_mutex） */
 static void scan_and_report_locked(void)
 {
     mtt_state_t *s = mtt_state_get();
     if (s == NULL) return;
-    if (!atomic_load(&s->initialized)) return;
+    if (!atomic_load_explicit(&s->initialized, memory_order_acquire)) return;
 
     time_t now = time(NULL);
-    unsigned long entry_total = atomic_load(&s->entry_count);
+    uint64_t entry_total_orig = atomic_load_explicit(&s->entry_count, memory_order_relaxed);
+    uint64_t entry_total = entry_total_orig;
 
     /* ---- 阶段 1: 逐锁快照活跃条目 ---- */
     mtt_alloc_snap_t *snaps = NULL;
     size_t snap_count = 0;
 
     if (entry_total > 0) {
-        /* raw_malloc 分配快照数组，全程 raw_* 不触发 hook */
-        snaps = (mtt_alloc_snap_t*)raw_malloc(
-            entry_total * sizeof(mtt_alloc_snap_t));
-        if (snaps == NULL) return; /* 内存不足，跳过本次扫描 */
-        memset(snaps, 0, entry_total * sizeof(mtt_alloc_snap_t));
+        /* 尝试分配快照数组。
+         * 在 ARM 内存受限设备上可能失败 — 降级为半数容量重试。 */
+        size_t alloc_size = (size_t)(entry_total * sizeof(mtt_alloc_snap_t));
+        snaps = (mtt_alloc_snap_t*)raw_malloc(alloc_size);
+
+        if (snaps == NULL && entry_total > 1024) {
+            /* 降级：尝试半数容量（仍能覆盖大部分泄漏） */
+            entry_total = entry_total / 2;
+            alloc_size = (size_t)(entry_total * sizeof(mtt_alloc_snap_t));
+            snaps = (mtt_alloc_snap_t*)raw_malloc(alloc_size);
+        }
+
+        if (snaps == NULL) {
+            /* 分配完全失败：跳过本次扫描，下个周期重试 */
+            goto skip_scan;
+        }
+        memset(snaps, 0, alloc_size);
 
         /* 逐锁遍历所有桶，持锁期间拷贝字段，释放锁后安全访问 */
         for (unsigned lock_idx = 0;
              lock_idx < MTT_LOCK_STRIPES && snap_count < entry_total;
              lock_idx++) {
-            pthread_mutex_lock(&s->bucket_locks[lock_idx]);
+            pthread_mutex_lock(&s->bucket_locks[lock_idx].lock);
             for (unsigned b = lock_idx;
                  b < s->bucket_count && snap_count < entry_total;
                  b += MTT_LOCK_STRIPES) {
@@ -216,7 +242,7 @@ static void scan_and_report_locked(void)
                     e = e->next;
                 }
             }
-            pthread_mutex_unlock(&s->bucket_locks[lock_idx]);
+            pthread_mutex_unlock(&s->bucket_locks[lock_idx].lock);
         }
     }
 
@@ -415,10 +441,10 @@ static void scan_and_report_locked(void)
                 fmt_time(now, time_buf, sizeof(time_buf)),
                 snap_count, site_count);
 
-            size_t cur_bytes  = atomic_load(&st->current_bytes);
-            size_t peak_bytes = atomic_load(&st->peak_bytes);
-            size_t allocs     = atomic_load(&st->alloc_count);
-            size_t frees      = atomic_load(&st->free_count);
+            size_t cur_bytes  = atomic_load_explicit(&st->current_bytes, memory_order_relaxed);
+            size_t peak_bytes = atomic_load_explicit(&st->peak_bytes, memory_order_relaxed);
+            size_t allocs     = atomic_load_explicit(&st->alloc_count, memory_order_relaxed);
+            size_t frees      = atomic_load_explicit(&st->free_count, memory_order_relaxed);
 
             fprintf(fp,
                 "Total unfreed: %s  |  Peak: %s\n"
@@ -428,8 +454,8 @@ static void scan_and_report_locked(void)
                 fmt_bytes(cur_bytes, size_buf, sizeof(size_buf)),
                 fmt_bytes(peak_bytes, peak_buf, sizeof(peak_buf)),
                 allocs, frees,
-                atomic_load(&st->skipped_sampled),
-                atomic_load(&st->skipped_overcap));
+                atomic_load_explicit(&st->skipped_sampled, memory_order_relaxed),
+                atomic_load_explicit(&st->skipped_overcap, memory_order_relaxed));
         }
 
         /* 每条泄漏站点 */
@@ -504,19 +530,31 @@ static void scan_and_report_locked(void)
     }
 
 cleanup:
-    /* 释放快照数组 */
-    if (snaps != NULL) raw_free(snaps);
+    /* 释放快照数组（raw_free 非 NULL 检查，防御性编程） */
+    if (snaps != NULL && raw_free != NULL) raw_free(snaps);
     /* 释放排序数组 */
-    if (sorted != NULL) raw_free(sorted);
-    if (pairs != NULL) raw_free(pairs);
+    if (sorted != NULL && raw_free != NULL) raw_free(sorted);
+    if (pairs != NULL && raw_free != NULL) raw_free(pairs);
     /* 释放泄漏站点链表 */
     for (unsigned b = 0; b < MTT_LEAK_DEDUP_SIZE; b++) {
         mtt_leak_site_t *site = leak_table.entries[b];
         while (site != NULL) {
             mtt_leak_site_t *next = site->next;
-            raw_free(site);
+            if (raw_free != NULL) raw_free(site);
             site = next;
         }
+    }
+    return;
+
+skip_scan:
+    /* 快照分配失败 — 静默跳过本次扫描 */
+    {
+        char err_buf[128] = {0};
+        int err_len = snprintf(err_buf, sizeof(err_buf),
+            "[MTT] WARNING: snapshot alloc failed for %llu entries, skipping scan\n",
+            (unsigned long long)entry_total_orig);
+        if (err_len > 0 && err_len < (int)sizeof(err_buf))
+            write(STDERR_FILENO, err_buf, (size_t)err_len);
     }
 }
 
@@ -543,12 +581,15 @@ static void* reporter_thread_fn(void *arg)
     int saved_hook = g_in_hook;
     g_in_hook = 1;
 
-    while (atomic_load(&g_reporter.running)) {
+    while (atomic_load_explicit(&g_reporter.running, memory_order_acquire)) {
         /* 分段睡眠，每 1 秒检查一次 running 标志（响应退出请求） */
-        for (int i = 0; i < MTT_REPORT_INTERVAL_SEC && atomic_load(&g_reporter.running); i++)
+        for (int i = 0;
+             i < MTT_REPORT_INTERVAL_SEC &&
+             atomic_load_explicit(&g_reporter.running, memory_order_acquire);
+             i++)
             sleep(1);
 
-        if (atomic_load(&g_reporter.running))
+        if (atomic_load_explicit(&g_reporter.running, memory_order_acquire))
             scan_and_report();
     }
 
@@ -572,7 +613,7 @@ static void* reporter_thread_fn(void *arg)
 static void mtt_atexit_handler(void)
 {
     /* 通知后台线程停止 */
-    atomic_store(&g_reporter.running, 0);
+    atomic_store_explicit(&g_reporter.running, 0, memory_order_release);
 
     /* 等待任何正在进行的扫描完成，然后执行最终扫描 */
     pthread_mutex_lock(&g_reporter.scan_mutex);
@@ -589,6 +630,9 @@ static void mtt_atexit_handler(void)
  *
  * 初始化日志路径和会话起始时间，创建 detach 线程。
  * 通过 CAS 确保仅启动一次。
+ *
+ * 修复了 atexit 注册时序：先创建线程成功，再注册 atexit，
+ * 避免线程创建失败但 atexit 已注册导致重复调用。
  */
 void mtt_reporter_start(void)
 {
@@ -596,15 +640,12 @@ void mtt_reporter_start(void)
     if (!atomic_compare_exchange_strong(&g_reporter_started, &expected, 1))
         return;
 
-    /* 注册退出处理：进程结束时输出最终报告 */
-    atexit(mtt_atexit_handler);
-
     mtt_state_t *s = mtt_state_get();
 
     /* 初始化 scan 互斥锁（{0} 静态初始化在 Linux NPTL 上有效，显式 init 确保可移植） */
     pthread_mutex_init(&g_reporter.scan_mutex, NULL);
 
-    atomic_store(&g_reporter.running, 1);
+    atomic_store_explicit(&g_reporter.running, 1, memory_order_release);
     g_reporter.session_start = time(NULL);
 
     /* 构建日志路径 */
@@ -624,10 +665,16 @@ void mtt_reporter_start(void)
     pthread_t tid;
     int rc = pthread_create(&tid, NULL, reporter_thread_fn, NULL);
     if (rc != 0) {
-        /* 创建线程失败：静默降级，不输出日志以预防递归 */
-        atomic_store(&g_reporter.running, 0);
+        /* 创建线程失败：静默降级，重置状态，不注册 atexit */
+        atomic_store_explicit(&g_reporter.running, 0, memory_order_release);
         atomic_store(&g_reporter_started, 0);
         return;
+    }
+
+    /* 线程创建成功后才注册 atexit（确保仅在线程存在时注册） */
+    if (!g_atexit_registered) {
+        atexit(mtt_atexit_handler);
+        g_atexit_registered = 1;
     }
 
     /* 首次诊断输出（使用 write 避免 malloc） */
@@ -647,7 +694,7 @@ void mtt_reporter_start(void)
  */
 void mtt_reporter_stop(void)
 {
-    atomic_store(&g_reporter.running, 0);
+    atomic_store_explicit(&g_reporter.running, 0, memory_order_release);
     /* 不 join：线程是 detached，会在下一次检查 running 时自行退出。
      * atexit 上下文中 pthread_join 可能导致死锁。 */
 }

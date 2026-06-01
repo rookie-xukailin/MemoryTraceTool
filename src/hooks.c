@@ -15,6 +15,8 @@
  *   - 错误诊断使用 write() 系统调用（无 malloc）
  *
  * 线程安全：64 分段锁保护全局状态。
+ *
+ * 原子操作内存序：统计计数器用 relaxed，控制标志用 acquire/release。
  */
 
 #define _GNU_SOURCE
@@ -32,9 +34,9 @@
 
 /* ---- hook 诊断计数器（仅首次记录，避免高频 IO） ---- */
 
-static _Atomic int g_first_malloc_diag = 1;
-static _Atomic int g_first_free_diag   = 1;
-static _Atomic int g_first_calloc_diag = 1;
+static _Atomic int g_first_malloc_diag  = 1;
+static _Atomic int g_first_free_diag    = 1;
+static _Atomic int g_first_calloc_diag  = 1;
 static _Atomic int g_first_realloc_diag = 1;
 
 /** 仅在首次调用时输出诊断（确认 hook 被调用） */
@@ -102,7 +104,7 @@ void* malloc(size_t size)
     }
 
     /* 紧急禁用：直接透传 */
-    if (atomic_load(&s->disabled)) {
+    if (atomic_load_explicit(&s->disabled, memory_order_acquire)) {
         void *ret = raw_malloc(size);
         g_in_hook = saved_hook;
         return ret;
@@ -134,24 +136,25 @@ void* malloc(size_t size)
     /* 锁内二次检查容量：消除 TOCTOU 竞争窗口。
      * 20 线程同时通过外部 mtt_is_over_capacity() 检查后，
      * 此处仅允许前若干线程真正插入，其余丢弃追踪记录。 */
-    if (atomic_load(&s->entry_count) >= MTT_MAX_ENTRIES) {
-        atomic_fetch_add(&s->skipped_overcap, 1);
+    if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
+        atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
         mtt_stripe_unlock(s, ptr);
-        raw_free(e);
+        if (raw_free != NULL) raw_free(e);
         g_in_hook = saved_hook;
         return ptr; /* 用户内存已分配，仅跳过追踪 */
     }
 
-    e->alloc_num = atomic_fetch_add(&s->alloc_seq, 1) + 1;
-    atomic_fetch_add(&s->alloc_count, 1);
-    atomic_fetch_add(&s->current_bytes, size);
-    atomic_fetch_add(&s->total_bytes,   size);
+    e->alloc_num = atomic_fetch_add_explicit(&s->alloc_seq, 1, memory_order_relaxed) + 1;
+    atomic_fetch_add_explicit(&s->alloc_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->current_bytes, size, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->total_bytes,   size, memory_order_relaxed);
 
     /* CAS 更新峰值 */
-    size_t cur = atomic_load(&s->current_bytes);
-    size_t old_peak = atomic_load(&s->peak_bytes);
+    size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
+    size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
     while (cur > old_peak) {
-        if (atomic_compare_exchange_weak(&s->peak_bytes, &old_peak, cur))
+        if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
+                memory_order_relaxed, memory_order_relaxed))
             break;
     }
 
@@ -194,7 +197,7 @@ void free(void *ptr)
         return;
     }
 
-    if (atomic_load(&s->disabled)) {
+    if (atomic_load_explicit(&s->disabled, memory_order_acquire)) {
         raw_free(ptr);
         g_in_hook = saved_hook;
         return;
@@ -203,11 +206,11 @@ void free(void *ptr)
     mtt_stripe_lock(s, ptr);
     mtt_entry_t *e = mtt_entry_find(s, ptr);
     if (e != NULL) {
-        if (e->size <= atomic_load(&s->current_bytes))
-            atomic_fetch_sub(&s->current_bytes, e->size);
+        if (e->size <= atomic_load_explicit(&s->current_bytes, memory_order_relaxed))
+            atomic_fetch_sub_explicit(&s->current_bytes, e->size, memory_order_relaxed);
         else
-            atomic_store(&s->current_bytes, 0);
-        atomic_fetch_add(&s->free_count, 1);
+            atomic_store_explicit(&s->current_bytes, 0, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s->free_count, 1, memory_order_relaxed);
         mtt_entry_remove(s, ptr);
     }
     mtt_stripe_unlock(s, ptr);
@@ -252,6 +255,10 @@ void* calloc(size_t count, size_t size)
 
 /**
  * LD_PRELOAD 拦截的 realloc。
+ *
+ * 优先使用 raw_realloc（libc 原生 realloc），避免手动 memcpy 带来的
+ * 越界读取风险。仅在 raw_realloc 不可用（bootstrap 阶段）时降级为
+ * malloc+memcpy+free 方案。
  */
 void* realloc(void *ptr, size_t size)
 {
@@ -262,11 +269,14 @@ void* realloc(void *ptr, size_t size)
 
     int saved_hook = g_in_hook;
     if (g_in_hook) {
+        /* 递归上下文：直接透传到 raw_realloc（若可用），否则模拟 */
         mtt_resolve_raw_allocators();
+        if (raw_realloc != NULL)
+            return raw_realloc(ptr, size);
+        /* raw_realloc 不可用时的降级（极端情况） */
         if (raw_malloc == NULL) return NULL;
         void *new_ptr = raw_malloc(size);
         if (new_ptr == NULL) return NULL;
-        /* 无旧大小信息，保守拷贝 */
         memcpy(new_ptr, ptr, size);
         if (raw_free != NULL) raw_free(ptr);
         return new_ptr;
@@ -281,32 +291,91 @@ void* realloc(void *ptr, size_t size)
 
     mtt_ensure_init();
     mtt_state_t *s = mtt_state_get();
-    if (s == NULL) {
-        void *new_ptr = raw_malloc(size);
-        if (new_ptr != NULL) {
-            memcpy(new_ptr, ptr, size);
-            raw_free(ptr);
+    if (s == NULL || atomic_load_explicit(&s->disabled, memory_order_acquire)) {
+        /* 降级：优先使用 raw_realloc */
+        if (raw_realloc != NULL) {
+            void *ret = raw_realloc(ptr, size);
+            g_in_hook = saved_hook;
+            return ret;
         }
-        g_in_hook = saved_hook;
-        return new_ptr;
-    }
-
-    if (atomic_load(&s->disabled)) {
+        /* 无 raw_realloc：malloc+memcpy+free 降级 */
         void *new_ptr = raw_malloc(size);
         if (new_ptr == NULL) {
             g_in_hook = saved_hook;
             return NULL;
         }
-        mtt_stripe_lock(s, ptr);
-        mtt_entry_t *old_e = mtt_entry_find(s, ptr);
-        size_t old_size = (old_e != NULL) ? old_e->size : size;
-        mtt_stripe_unlock(s, ptr);
-        size_t copy_n = (old_size < size) ? old_size : size;
-        memcpy(new_ptr, ptr, copy_n);
+        memcpy(new_ptr, ptr, size);
         raw_free(ptr);
         g_in_hook = saved_hook;
         return new_ptr;
     }
+
+    /* ---- 正常追踪路径：使用 raw_realloc ---- */
+
+    if (raw_realloc != NULL) {
+        /* 分配前从追踪表读取旧大小（用于后续统计更新） */
+        mtt_stripe_lock(s, ptr);
+        mtt_entry_t *old_e = mtt_entry_find(s, ptr);
+        size_t old_size = (old_e != NULL) ? old_e->size : 0;
+        mtt_stripe_unlock(s, ptr);
+
+        void *new_ptr = raw_realloc(ptr, size);
+        if (new_ptr == NULL) {
+            g_in_hook = saved_hook;
+            return NULL;
+        }
+
+        if (old_e != NULL) {
+            /* 旧指针有追踪记录：更新统计 + 替换条目 */
+            mtt_stripe_lock(s, ptr);
+            old_e = mtt_entry_find(s, ptr); /* 锁内再次确认 */
+            if (old_e != NULL) {
+                size_t sub_size = (old_e->size <= atomic_load_explicit(&s->current_bytes, memory_order_relaxed))
+                    ? old_e->size : 0;
+                if (sub_size > 0)
+                    atomic_fetch_sub_explicit(&s->current_bytes, sub_size, memory_order_relaxed);
+                else
+                    atomic_store_explicit(&s->current_bytes, 0, memory_order_relaxed);
+                atomic_fetch_add_explicit(&s->free_count, 1, memory_order_relaxed);
+                mtt_entry_remove(s, ptr);
+            }
+            mtt_stripe_unlock(s, ptr);
+
+            /* 创建新追踪记录（不阻塞业务） */
+            if (!mtt_is_over_capacity(s)) {
+                mtt_entry_t *new_e = mtt_entry_new(new_ptr, size);
+                if (new_e != NULL) {
+                    mtt_stripe_lock(s, new_ptr);
+                    if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) < MTT_MAX_ENTRIES) {
+                        new_e->alloc_num = atomic_fetch_add_explicit(&s->alloc_seq, 1, memory_order_relaxed) + 1;
+                        atomic_fetch_add_explicit(&s->alloc_count, 1, memory_order_relaxed);
+                        atomic_fetch_add_explicit(&s->current_bytes, size, memory_order_relaxed);
+                        atomic_fetch_add_explicit(&s->total_bytes, size, memory_order_relaxed);
+
+                        size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
+                        size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
+                        while (cur > old_peak) {
+                            if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
+                                    memory_order_relaxed, memory_order_relaxed))
+                                break;
+                        }
+                        mtt_entry_add(s, new_e);
+                    } else {
+                        atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
+                        if (raw_free != NULL) raw_free(new_e);
+                    }
+                    mtt_stripe_unlock(s, new_ptr);
+                }
+            }
+        }
+        /* else: 旧指针不在追踪表中（tracking 之前分配的），
+         * raw_realloc 已完成实际内存操作，无需维护追踪表 */
+
+        g_in_hook = saved_hook;
+        return new_ptr;
+    }
+
+    /* ---- raw_realloc 不可用（bootstrap 阶段）的降级路径 ---- */
 
     /* 先分配新内存（失败不破坏旧状态） */
     void *new_ptr = raw_malloc(size);
@@ -323,46 +392,47 @@ void* realloc(void *ptr, size_t size)
         return NULL;
     }
 
-    /* 删除旧追踪记录 */
+    /* 删除旧追踪记录（并获取旧大小以安全拷贝） */
     mtt_stripe_lock(s, ptr);
     mtt_entry_t *old_e = mtt_entry_find(s, ptr);
-    size_t old_size = (old_e != NULL) ? old_e->size : size;
+    size_t old_size = (old_e != NULL) ? old_e->size : 0;
     if (old_e != NULL) {
-        if (old_e->size <= atomic_load(&s->current_bytes))
-            atomic_fetch_sub(&s->current_bytes, old_e->size);
+        if (old_e->size <= atomic_load_explicit(&s->current_bytes, memory_order_relaxed))
+            atomic_fetch_sub_explicit(&s->current_bytes, old_e->size, memory_order_relaxed);
         else
-            atomic_store(&s->current_bytes, 0);
-        atomic_fetch_add(&s->free_count, 1);
+            atomic_store_explicit(&s->current_bytes, 0, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s->free_count, 1, memory_order_relaxed);
         mtt_entry_remove(s, ptr);
     }
     mtt_stripe_unlock(s, ptr);
 
-    /* 拷贝数据 */
-    size_t copy_n = (old_size < size) ? old_size : size;
-    memcpy(new_ptr, ptr, copy_n);
+    /* 安全拷贝：仅拷贝已知的旧大小字节数，避免越界读取 */
+    size_t copy_n = (old_size > 0) ? ((old_size < size) ? old_size : size) : 0;
+    if (copy_n > 0)
+        memcpy(new_ptr, ptr, copy_n);
 
     /* 插入新追踪记录 */
     mtt_stripe_lock(s, new_ptr);
 
-    /* 锁内容量检查：旧条目已删，新条目可能超限（仅当旧 ptr 未被追踪时净增 1） */
-    if (atomic_load(&s->entry_count) >= MTT_MAX_ENTRIES) {
-        atomic_fetch_add(&s->skipped_overcap, 1);
+    if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
+        atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
         mtt_stripe_unlock(s, new_ptr);
-        raw_free(new_e);
+        if (raw_free != NULL) raw_free(new_e);
         raw_free(ptr);
         g_in_hook = saved_hook;
         return new_ptr;
     }
 
-    new_e->alloc_num = atomic_fetch_add(&s->alloc_seq, 1) + 1;
-    atomic_fetch_add(&s->alloc_count, 1);
-    atomic_fetch_add(&s->current_bytes, size);
-    atomic_fetch_add(&s->total_bytes,   size);
+    new_e->alloc_num = atomic_fetch_add_explicit(&s->alloc_seq, 1, memory_order_relaxed) + 1;
+    atomic_fetch_add_explicit(&s->alloc_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->current_bytes, size, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->total_bytes,   size, memory_order_relaxed);
 
-    size_t cur = atomic_load(&s->current_bytes);
-    size_t old_peak = atomic_load(&s->peak_bytes);
+    size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
+    size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
     while (cur > old_peak) {
-        if (atomic_compare_exchange_weak(&s->peak_bytes, &old_peak, cur))
+        if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
+                memory_order_relaxed, memory_order_relaxed))
             break;
     }
 
