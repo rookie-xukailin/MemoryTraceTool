@@ -1,7 +1,7 @@
 CROSS_COMPILE ?=
 CC       = $(CROSS_COMPILE)gcc
 CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
-LDFLAGS  = -lpthread -ldl
+LDFLAGS  = -lpthread -ldl -latomic
 
 INC_SHARED = -Isrc
 INC_PUBLIC = -Iinclude -Isrc
