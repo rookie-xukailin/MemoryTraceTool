@@ -13,6 +13,8 @@
 #define _GNU_SOURCE
 #include "reporter.h"
 #include "stack_cache.h"
+#include "time_series.h"
+#include "flamegraph.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -527,6 +529,10 @@ static void scan_and_report_locked(void)
             /* rename 失败：删除临时文件 */
             unlink(tmp_path);
         }
+
+        /* 同时输出 collapsed stacks 文件（兼容 flamegraph.pl） */
+        mtt_flamegraph_write(log_dir, proc_name, sorted, site_count,
+                             (void**)pairs);
     }
 
 cleanup:
@@ -581,13 +587,27 @@ static void* reporter_thread_fn(void *arg)
     int saved_hook = g_in_hook;
     g_in_hook = 1;
 
+    /* 首次立即扫描：用户不需要等 60 秒才看到第一批数据 */
+    scan_and_report();
+
     while (atomic_load_explicit(&g_reporter.running, memory_order_acquire)) {
         /* 分段睡眠，每 1 秒检查一次 running 标志（响应退出请求） */
         for (int i = 0;
              i < MTT_REPORT_INTERVAL_SEC &&
              atomic_load_explicit(&g_reporter.running, memory_order_acquire);
-             i++)
+             i++) {
             sleep(1);
+            /* 每秒记录时序数据点 */
+            mtt_ts_record_point();
+
+            /* 检查峰值是否刚被更新（借鉴 jemalloc prof_gdump） */
+            mtt_state_t *st = mtt_state_get();
+            if (st != NULL &&
+                atomic_exchange_explicit(&st->peak_updated, 0, memory_order_relaxed)) {
+                /* 新高水位：立即触发一次扫描，不漏峰值 */
+                break;
+            }
+        }
 
         if (atomic_load_explicit(&g_reporter.running, memory_order_acquire))
             scan_and_report();

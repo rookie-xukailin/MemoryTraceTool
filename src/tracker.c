@@ -25,6 +25,7 @@
 #define _GNU_SOURCE
 #include "mtt_internal.h"
 #include "reporter.h"
+#include "time_series.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +37,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
 #include <stdatomic.h>
 
 /* ======================================================================== *
@@ -291,11 +293,42 @@ void mtt_capture_stack(mtt_entry_t *entry)
 /**
  * 决定当前分配是否应被记录。
  *
- * @param s  全局状态指针（调用者已确保非 NULL）
- * @return   1=应记录, 0=跳过
+ * 支持两种采样模式（优先级从高到低）：
+ *   1. 大分配豁免：size >= MTT_BIG_ALLOC_THRESHOLD（1MB）总是追踪
+ *   2. 字节统计采样（sample_rate > 0）：按 2^sample_rate 字节平均步长概率采样
+ *   3. 固定计数采样（sample_period > 0）：每 N 次 alloc 记录 1 次（旧模式）
+ *   4. 全量追踪（两者均为 0）
+ *
+ * 字节统计采样使用累加器方式：每次 alloc 时将 size 累加到 sample_bytes_accum，
+ * 当累加值超过 2^sample_rate 时，重置累加器并记录本次分配。
+ * 这种方式确保大分配有更高概率被采样，小分配聚合后采样。
+ *
+ * @param s     全局状态指针（调用者已确保非 NULL）
+ * @param size  本次分配的字节数
+ * @return      1=应记录, 0=跳过
  */
-int mtt_should_track(mtt_state_t *s)
+int mtt_should_track(mtt_state_t *s, size_t size)
 {
+    /* 大分配总是追踪 */
+    if (size >= MTT_BIG_ALLOC_THRESHOLD)
+        return 1;
+
+    /* 字节统计采样模式 */
+    size_t rate = atomic_load_explicit(&s->sample_rate, memory_order_relaxed);
+    if (rate > 0) {
+        size_t step = (size_t)1 << rate; /* 2^sample_rate */
+        size_t old_accum = atomic_fetch_add_explicit(&s->sample_bytes_accum, size,
+                                                      memory_order_relaxed);
+        if (old_accum + size >= step) {
+            /* 达到采样阈值：重置累加器（减去 step）+ 记录本次 */
+            atomic_fetch_sub_explicit(&s->sample_bytes_accum, step, memory_order_relaxed);
+            return 1;
+        }
+        atomic_fetch_add_explicit(&s->skipped_sampled, 1, memory_order_relaxed);
+        return 0;
+    }
+
+    /* 固定计数采样模式（旧模式，保持兼容） */
     unsigned period = atomic_load_explicit(&s->sample_period, memory_order_relaxed);
     if (period == 0)
         return 1; /* 全量追踪 */
@@ -510,6 +543,7 @@ void mtt_ensure_init(void)
     /* ---- 阶段1: 读取环境变量（无需持锁） ---- */
     int      want_disabled = 0;
     unsigned want_sample   = MTT_SAMPLE_DEFAULT;
+    size_t   want_srate    = MTT_SAMPLE_RATE_DEFAULT; /* 默认使用字节统计采样 */
 
     {
         const char *env_disable = getenv("MTT_DISABLE");
@@ -519,8 +553,18 @@ void mtt_ensure_init(void)
         const char *env_sample = getenv("MTT_SAMPLE");
         if (env_sample != NULL) {
             int sp = atoi(env_sample);
-            if (sp >= 0 && sp <= MTT_SAMPLE_MAX_PERIOD)
+            if (sp >= 0 && sp <= MTT_SAMPLE_MAX_PERIOD) {
                 want_sample = (unsigned)sp;
+                want_srate = 0; /* 旧模式采样时禁用字节采样 */
+            }
+        }
+
+        /* 字节统计采样率（MTT_SAMPLE_RATE=N → 平均 2^N 字节采样一次） */
+        const char *env_srate = getenv("MTT_SAMPLE_RATE");
+        if (env_srate != NULL) {
+            int sr = atoi(env_srate);
+            if (sr >= 0 && sr <= MTT_SAMPLE_RATE_MAX)
+                want_srate = (size_t)sr;
         }
     }
 
@@ -573,10 +617,13 @@ void mtt_ensure_init(void)
     atomic_store_explicit(&s->total_bytes,     0, memory_order_relaxed);
     atomic_store_explicit(&s->skipped_sampled, 0, memory_order_relaxed);
     atomic_store_explicit(&s->skipped_overcap, 0, memory_order_relaxed);
-    atomic_store_explicit(&s->sample_period,   want_sample, memory_order_relaxed);
-    atomic_store_explicit(&s->sample_counter,  0, memory_order_relaxed);
-    atomic_store_explicit(&s->entry_count,     0, memory_order_relaxed);
-    atomic_store_explicit(&s->disabled,        want_disabled, memory_order_relaxed);
+    atomic_store_explicit(&s->sample_period,      want_sample, memory_order_relaxed);
+    atomic_store_explicit(&s->sample_counter,     0, memory_order_relaxed);
+    atomic_store_explicit(&s->sample_rate,        want_srate, memory_order_relaxed);
+    atomic_store_explicit(&s->sample_bytes_accum, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->entry_count,        0, memory_order_relaxed);
+    atomic_store_explicit(&s->disabled,           want_disabled, memory_order_relaxed);
+    atomic_store_explicit(&s->peak_updated,       0, memory_order_relaxed);
 
     /* 读取进程名 */
     get_process_name(s->proc_name, sizeof(s->proc_name));
@@ -588,6 +635,9 @@ void mtt_ensure_init(void)
 
     /* 启动周期报告线程（锁外，避免 pthread_create 内部 malloc → 递归） */
     mtt_reporter_start();
+
+    /* 初始化时序数据采集（reporter 线程启动后） */
+    mtt_ts_init();
 }
 
 /* ======================================================================== *
@@ -622,7 +672,7 @@ void* mtt_malloc(size_t size)
     if (ptr == NULL) return NULL;
 
     /* 采样与容量检查 */
-    if (!mtt_should_track(s) || mtt_is_over_capacity(s))
+    if (!mtt_should_track(s, size) || mtt_is_over_capacity(s))
         return ptr; /* 放行但不追踪 */
 
     /* 创建追踪记录（raw_malloc 内部分配，不触发 hook） */
@@ -653,6 +703,8 @@ void* mtt_malloc(size_t size)
                 memory_order_relaxed, memory_order_relaxed))
             break;
     }
+    /* 通知 reporter 线程：峰值已更新（借鉴 jemalloc prof_gdump） */
+    atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
 
     mtt_entry_add(s, e);
     mtt_stripe_unlock(s, ptr);
@@ -796,6 +848,7 @@ void* mtt_realloc(void *ptr, size_t size)
                                     memory_order_relaxed, memory_order_relaxed))
                                 break;
                         }
+                        atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
                         mtt_entry_add(s, new_e);
                     } else {
                         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
@@ -861,6 +914,7 @@ void* mtt_realloc(void *ptr, size_t size)
                 memory_order_relaxed, memory_order_relaxed))
             break;
     }
+    atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
 
     mtt_entry_add(s, new_e);
     mtt_stripe_unlock(s, new_ptr);

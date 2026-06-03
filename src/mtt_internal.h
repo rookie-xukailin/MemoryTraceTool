@@ -63,6 +63,22 @@
 /* 采样配置 */
 #define MTT_SAMPLE_DEFAULT      0       /* 默认全量追踪，>0 时每 N 次记录 1 次 */
 #define MTT_SAMPLE_MAX_PERIOD   1024    /* 最大采样周期 */
+#define MTT_SAMPLE_RATE_DEFAULT 19      /* 默认字节采样率（2^19 = 512KB 平均步长） */
+#define MTT_SAMPLE_RATE_MAX     30      /* 最大采样率（2^30 = 1GB） */
+#define MTT_BIG_ALLOC_THRESHOLD (1024 * 1024)  /* 大分配阈值（1MB），大分配总是追踪 */
+
+/* 时序数据采集 */
+#define MTT_TS_MAX_POINTS       3600    /* 环形缓冲区容量（1 小时 @ 1Hz） */
+#define MTT_TS_INTERVAL_SEC     1       /* 采集间隔（秒） */
+
+/* HTTP 服务器 */
+#define MTT_HTTP_DEFAULT_PORT   0       /* 默认禁用 HTTP 服务器 */
+#define MTT_HTTP_BACKLOG        8       /* listen backlog */
+#define MTT_HTTP_BUF_SIZE       8192    /* HTTP 请求缓冲区大小 */
+#define MTT_HTTP_MAX_PATH       256     /* URL 路径最大长度 */
+
+/* SIGUSR1 信号触发即时报告 */
+#define MTT_SIGNAL_REPORT       SIGUSR1 /* 触发即时报告的信号 */
 
 /* Bootstrap 分配器缓冲区大小（dlsym 阶段兜底） */
 #define MTT_BOOTSTRAP_BUF_SIZE  65536
@@ -158,9 +174,12 @@ typedef struct {
     _Atomic size_t      total_bytes;                /* 累计分配字节总数 */
     _Atomic uint64_t    entry_count;                /* 当前哈希表条目数（64-bit 防回绕） */
     _Atomic unsigned    sample_period;              /* 采样周期：0=全量, N>0=每N次记录1次 */
-    _Atomic uint64_t    sample_counter;             /* 采样计数器（64-bit 防回绕） */
+    _Atomic uint64_t    sample_counter;
+    _Atomic size_t      sample_rate;
+    _Atomic size_t      sample_bytes_accum;             /* 采样计数器（64-bit 防回绕） */
     _Atomic size_t      skipped_sampled;            /* 因采样跳过的分配次数 */
-    _Atomic size_t      skipped_overcap;            /* 因超容量上限跳过的记录次数 */
+    _Atomic size_t      skipped_overcap;
+    _Atomic int         peak_updated;            /* 因超容量上限跳过的记录次数 */
 
     /* 进程信息 */
     char                proc_name[256];             /* 进程名（来自 /proc/self/exe） */
@@ -231,7 +250,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size);
 void         mtt_entry_add(mtt_state_t *s, mtt_entry_t *e);
 mtt_entry_t* mtt_entry_find(mtt_state_t *s, const void *ptr);
 void         mtt_entry_remove(mtt_state_t *s, const void *ptr);
-int          mtt_should_track(mtt_state_t *s);
+int          mtt_should_track(mtt_state_t *s, size_t size);
 int          mtt_is_over_capacity(mtt_state_t *s);
 void         mtt_capture_stack(mtt_entry_t *entry);
 
@@ -240,5 +259,11 @@ void mtt_reporter_start(void);
 
 /* stack_cache.c */
 uint64_t mtt_stack_hash_compute(void **frames, int frame_count);
+
+/* time_series.c */
+void mtt_ts_init(void);
+
+/* signal handling (tracker.c) */
+void mtt_signal_thread_start(void);
 
 #endif /* MTT_INTERNAL_H */

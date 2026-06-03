@@ -118,7 +118,7 @@ void* malloc(size_t size)
     }
 
     /* 采样与容量检查（不满足条件则放行不追踪） */
-    if (!mtt_should_track(s) || mtt_is_over_capacity(s)) {
+    if (!mtt_should_track(s, size) || mtt_is_over_capacity(s)) {
         g_in_hook = saved_hook;
         return ptr;
     }

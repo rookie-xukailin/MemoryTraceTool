@@ -8,9 +8,11 @@ INC_PUBLIC = -Iinclude -Isrc
 SRC_DIR    = src
 BUILD_DIR  = build
 
-# 共享库目标文件（4 个模块）
+# 共享库目标文件（6 个模块）
 LIB_OBJS = $(BUILD_DIR)/hooks.o $(BUILD_DIR)/tracker.o \
-           $(BUILD_DIR)/stack_cache.o $(BUILD_DIR)/reporter.o
+           $(BUILD_DIR)/stack_cache.o $(BUILD_DIR)/reporter.o \
+           $(BUILD_DIR)/time_series.o $(BUILD_DIR)/flamegraph.o
+# 未来 Phase 2 添加: $(BUILD_DIR)/http_server.o
 
 SHARED_LIB = $(BUILD_DIR)/libmemorytracetool.so
 
@@ -33,13 +35,19 @@ $(SHARED_LIB): $(LIB_OBJS) | $(BUILD_DIR)
 $(BUILD_DIR)/hooks.o: $(SRC_DIR)/hooks.c $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
-$(BUILD_DIR)/tracker.o: $(SRC_DIR)/tracker.c $(SRC_DIR)/mtt_internal.h $(SRC_DIR)/reporter.h | $(BUILD_DIR)
+$(BUILD_DIR)/tracker.o: $(SRC_DIR)/tracker.c $(SRC_DIR)/mtt_internal.h $(SRC_DIR)/reporter.h $(SRC_DIR)/time_series.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
 $(BUILD_DIR)/stack_cache.o: $(SRC_DIR)/stack_cache.c $(SRC_DIR)/stack_cache.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
-$(BUILD_DIR)/reporter.o: $(SRC_DIR)/reporter.c $(SRC_DIR)/reporter.h $(SRC_DIR)/stack_cache.h $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
+$(BUILD_DIR)/reporter.o: $(SRC_DIR)/reporter.c $(SRC_DIR)/reporter.h $(SRC_DIR)/stack_cache.h $(SRC_DIR)/mtt_internal.h $(SRC_DIR)/time_series.h $(SRC_DIR)/flamegraph.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
+
+$(BUILD_DIR)/time_series.o: $(SRC_DIR)/time_series.c $(SRC_DIR)/time_series.h $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
+
+$(BUILD_DIR)/flamegraph.o: $(SRC_DIR)/flamegraph.c $(SRC_DIR)/flamegraph.h $(SRC_DIR)/mtt_internal.h $(SRC_DIR)/reporter.h $(SRC_DIR)/stack_cache.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
 # =====================================================
