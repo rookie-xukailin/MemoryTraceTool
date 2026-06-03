@@ -10,7 +10,9 @@
 #ifndef MTT_REPORTER_H
 #define MTT_REPORTER_H
 
+#define _GNU_SOURCE
 #include "mtt_internal.h"
+#include "time_series.h"
 
 /* ---- 泄漏去重记录 ---- */
 
@@ -32,7 +34,7 @@ typedef struct {
     pthread_mutex_t  lock;
 } mtt_leak_table_t;
 
-/** 报告器全局状态（单例，仅 reporter 线程 + atexit 处理器访问） */
+/** 报告器全局状态（单例，仅 reporter 线程 + atexit 处理器 + HTTP 线程访问） */
 typedef struct {
     pthread_t        thread;
     _Atomic int      running;                    /* 原子标志：1=运行中, 0=停止请求 */
@@ -41,6 +43,14 @@ typedef struct {
     time_t           session_start;
     char             log_path[512];              /* 正式日志文件路径 */
     char             tmp_path[512];              /* 临时文件路径（write+rename 原子写入） */
+
+    /* HTTP 泄漏缓存：reporter 线程写入，HTTP 线程读取 */
+    mtt_leak_site_t **cached_sites;              /* 排序后的泄漏站点指针数组（raw_malloc） */
+    size_t            cached_site_count;         /* 缓存站点数 */
+    void            **cached_pairs;              /* site_stack_pair_t 数组（给 flamegraph 用） */
+    mtt_ts_point_t   *cached_ts_data;            /* 时序数据副本 */
+    uint32_t          cached_ts_count;           /* 时序数据点数 */
+    pthread_mutex_t   cache_lock;                /* 保护缓存读写 */
 } mtt_reporter_t;
 
 /* ---- API ---- */
@@ -62,5 +72,12 @@ void mtt_reporter_start(void);
  * 由 mtt_atexit_report() 调用。
  */
 void mtt_reporter_stop(void);
+
+/**
+ * 获取报告器单例指针（供 HTTP 服务器读取缓存数据）。
+ *
+ * @return 报告器全局状态指针（永不为 NULL）
+ */
+mtt_reporter_t* mtt_reporter_get(void);
 
 #endif /* MTT_REPORTER_H */

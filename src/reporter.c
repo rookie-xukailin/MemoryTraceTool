@@ -28,9 +28,15 @@
 
 /* ---- 报告器全局状态（单例，仅 reporter 线程访问） ---- */
 
-static mtt_reporter_t g_reporter = {0};
+mtt_reporter_t g_reporter = {0};
 static atomic_int      g_reporter_started = 0;
 static int             g_atexit_registered = 0; /* 防止重复注册 atexit */
+
+/** 获取报告器单例（供 HTTP 服务器等外部模块访问） */
+mtt_reporter_t* mtt_reporter_get(void)
+{
+    return &g_reporter;
+}
 
 /* ---- 快照条目（逐锁拷贝，避免持锁期间访问链表） ---- */
 
@@ -535,6 +541,61 @@ static void scan_and_report_locked(void)
                              (void**)pairs);
     }
 
+    /* ---- 阶段 7: 更新 HTTP 缓存 ---- */
+    {
+        pthread_mutex_lock(&g_reporter.cache_lock);
+
+        /* 释放旧的缓存数据 */
+        if (g_reporter.cached_sites != NULL && raw_free != NULL) {
+            raw_free(g_reporter.cached_sites);
+            g_reporter.cached_sites = NULL;
+        }
+        if (g_reporter.cached_pairs != NULL && raw_free != NULL) {
+            raw_free(g_reporter.cached_pairs);
+            g_reporter.cached_pairs = NULL;
+        }
+
+        /* 深拷贝 sorted 数组 */
+        if (sorted != NULL && site_count > 0) {
+            size_t sorted_bytes = site_count * sizeof(mtt_leak_site_t*);
+            g_reporter.cached_sites = (mtt_leak_site_t**)raw_malloc(sorted_bytes);
+            if (g_reporter.cached_sites != NULL) {
+                memcpy(g_reporter.cached_sites, sorted, sorted_bytes);
+                g_reporter.cached_site_count = site_count;
+            }
+        } else {
+            g_reporter.cached_site_count = 0;
+        }
+
+        /* 深拷贝 pairs 数组 */
+        if (pairs != NULL && site_count > 0) {
+            size_t pairs_bytes = site_count * sizeof(void*);
+            g_reporter.cached_pairs = (void**)raw_malloc(pairs_bytes);
+            if (g_reporter.cached_pairs != NULL) {
+                memcpy(g_reporter.cached_pairs, pairs, pairs_bytes);
+            }
+        }
+
+        /* 复制时序数据（最多 360 点） */
+        if (mtt_ts_is_ready()) {
+            mtt_ts_point_t ts_buf[360] = {{0}};
+            uint32_t ts_count = 0;
+            if (mtt_ts_get_range(0, ts_buf, 360, &ts_count) == 0 && ts_count > 0) {
+                if (g_reporter.cached_ts_data != NULL && raw_free != NULL)
+                    raw_free(g_reporter.cached_ts_data);
+                g_reporter.cached_ts_data = (mtt_ts_point_t*)raw_malloc(
+                    ts_count * sizeof(mtt_ts_point_t));
+                if (g_reporter.cached_ts_data != NULL) {
+                    memcpy(g_reporter.cached_ts_data, ts_buf,
+                           ts_count * sizeof(mtt_ts_point_t));
+                    g_reporter.cached_ts_count = ts_count;
+                }
+            }
+        }
+
+        pthread_mutex_unlock(&g_reporter.cache_lock);
+    }
+
 cleanup:
     /* 释放快照数组（raw_free 非 NULL 检查，防御性编程） */
     if (snaps != NULL && raw_free != NULL) raw_free(snaps);
@@ -662,8 +723,9 @@ void mtt_reporter_start(void)
 
     mtt_state_t *s = mtt_state_get();
 
-    /* 初始化 scan 互斥锁（{0} 静态初始化在 Linux NPTL 上有效，显式 init 确保可移植） */
+    /* 初始化互斥锁 */
     pthread_mutex_init(&g_reporter.scan_mutex, NULL);
+    pthread_mutex_init(&g_reporter.cache_lock, NULL);
 
     atomic_store_explicit(&g_reporter.running, 1, memory_order_release);
     g_reporter.session_start = time(NULL);

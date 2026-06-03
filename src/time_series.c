@@ -16,6 +16,12 @@
 static mtt_time_series_t g_time_series;
 static int g_ts_initialized = 0;
 
+/** 检查是否已初始化（供 reporter 安全访问） */
+int mtt_ts_is_ready(void)
+{
+    return g_ts_initialized;
+}
+
 /* ======================================================================== *
  *                       公共 API                                            *
  * ======================================================================== */

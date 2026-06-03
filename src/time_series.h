@@ -66,4 +66,11 @@ void mtt_ts_record_point(void);
 int mtt_ts_get_range(uint32_t start_idx, mtt_ts_point_t *out,
                      uint32_t max_out, uint32_t *out_count);
 
+/**
+ * 检查时序数据模块是否已初始化。
+ *
+ * @return 1=已初始化, 0=未初始化
+ */
+int mtt_ts_is_ready(void);
+
 #endif /* MTT_TIME_SERIES_H */

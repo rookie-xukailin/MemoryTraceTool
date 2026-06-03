@@ -26,6 +26,7 @@
 #include "mtt_internal.h"
 #include "reporter.h"
 #include "time_series.h"
+#include "http_server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -638,6 +639,20 @@ void mtt_ensure_init(void)
 
     /* 初始化时序数据采集（reporter 线程启动后） */
     mtt_ts_init();
+
+    /* 启动 HTTP 服务器（从环境变量读取端口，0=禁用） */
+    {
+        uint16_t http_port = MTT_HTTP_DEFAULT_PORT;
+        const char *env_port = getenv("MTT_HTTP_PORT");
+        if (env_port != NULL) {
+            int p = atoi(env_port);
+            if (p > 0 && p <= 65535)
+                http_port = (uint16_t)p;
+            else if (p == 0)
+                http_port = 0;
+        }
+        mtt_http_server_start(http_port);
+    }
 }
 
 /* ======================================================================== *
