@@ -426,7 +426,7 @@ static void handle_api_data(int client_fd)
         "\r\n";
     write(client_fd, header, strlen(header));
 
-    char buf[8192] = {0};
+    static char buf[8192]; /* 静态分配：避免 ARM 嵌入式栈溢出（默认栈 8KB） */
     int len;
 
     len = snprintf(buf, sizeof(buf),
@@ -488,7 +488,7 @@ static void handle_api_data(int client_fd)
 static void json_write_leak_site_stdout(mtt_leak_site_t *site,
                                          mtt_stack_entry_t *se, int fd)
 {
-    char buf[4096] = {0};
+    static char buf[4096]; /* 静态分配：避免 ARM 栈溢出 */
     int off = snprintf(buf, sizeof(buf),
         "{\"hash\":\"0x%llx\",\"count\":%zu,\"per_leak_size\":%zu,"
         "\"total_size\":%zu,\"first_seen\":%ld,\"last_seen\":%ld,\"stack\":[",
@@ -626,8 +626,8 @@ static void* http_thread_fn(void *arg)
      * 但本模块中所有分配都使用标准 malloc（因为此线程不是 hook 路径）。
      * 注意：不要在此线程中调用 hook 版本的 malloc。 */
 
-    char req_buf[MTT_HTTP_BUF_SIZE] = {0};
-    char path[MTT_HTTP_MAX_PATH] = {0};
+    static char req_buf[MTT_HTTP_BUF_SIZE]; /* 静态分配：避免 ARM 栈溢出 */
+    static char path[MTT_HTTP_MAX_PATH];
 
     while (atomic_load_explicit(&g_http_server.running, memory_order_acquire)) {
         fd_set rfds;
