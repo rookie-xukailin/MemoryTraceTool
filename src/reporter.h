@@ -72,6 +72,7 @@ void mtt_reporter_start(void);
  * 由 mtt_atexit_report() 调用。
  */
 void mtt_reporter_stop(void);
+void mtt_reporter_signal_scan(void);
 
 /**
  * 获取报告器单例指针（供 HTTP 服务器读取缓存数据）。

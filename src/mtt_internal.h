@@ -80,6 +80,11 @@
 /* SIGUSR1 信号触发即时报告 */
 #define MTT_SIGNAL_REPORT       SIGUSR1 /* 触发即时报告的信号 */
 
+/* 泄漏判定相关常量 */
+#define MTT_LEAK_THRESHOLD_DEFAULT 300  /* 默认泄漏阈值（秒）：存活超过此值→probable leak */
+#define MTT_SKIP_STARTUP_DEFAULT    0   /* 默认不跳过启动阶段 */
+#define MTT_TEMP_ALLOC_THRESHOLD_MS 100 /* 临时分配阈值（毫秒级，用 alloc_seq 近似） */
+
 /* Bootstrap 分配器缓冲区大小（dlsym 阶段兜底） */
 #define MTT_BOOTSTRAP_BUF_SIZE  65536
 
@@ -174,12 +179,17 @@ typedef struct {
     _Atomic size_t      total_bytes;                /* 累计分配字节总数 */
     _Atomic uint64_t    entry_count;                /* 当前哈希表条目数（64-bit 防回绕） */
     _Atomic unsigned    sample_period;              /* 采样周期：0=全量, N>0=每N次记录1次 */
-    _Atomic uint64_t    sample_counter;
-    _Atomic size_t      sample_rate;
-    _Atomic size_t      sample_bytes_accum;             /* 采样计数器（64-bit 防回绕） */
+    _Atomic uint64_t    sample_counter;             /* 采样计数器（64-bit 防回绕） */
+    _Atomic size_t      sample_rate;                /* 字节采样率：0=旧模式, >0=log2步长 */
+    _Atomic size_t      sample_bytes_accum;         /* 字节采样累加器（按分配大小累加） */
     _Atomic size_t      skipped_sampled;            /* 因采样跳过的分配次数 */
-    _Atomic size_t      skipped_overcap;
-    _Atomic int         peak_updated;            /* 因超容量上限跳过的记录次数 */
+    _Atomic size_t      skipped_overcap;            /* 因超容量上限跳过的记录次数 */
+    _Atomic int         peak_updated;               /* peak_bytes 刚更新时为1（reporter 秒级检查） */
+    _Atomic time_t      leak_threshold_sec;          /* 泄漏阈值（秒）：存活超过此值→probable leak */
+    _Atomic time_t      startup_until;              /* 启动阶段结束时间：此时刻之前不追踪 */
+    _Atomic size_t      temp_alloc_count;           /* 临时分配计数（短生命周期） */
+    _Atomic size_t      expired_alloc_count;        /* 过期但未释放的分配计数 */
+    _Atomic size_t      free_expired_count;         /* 过期后被释放的计数（late-free） */
 
     /* 进程信息 */
     char                proc_name[256];             /* 进程名（来自 /proc/self/exe） */
@@ -252,6 +262,7 @@ mtt_entry_t* mtt_entry_find(mtt_state_t *s, const void *ptr);
 void         mtt_entry_remove(mtt_state_t *s, const void *ptr);
 int          mtt_should_track(mtt_state_t *s, size_t size);
 int          mtt_is_over_capacity(mtt_state_t *s);
+int          mtt_is_startup_phase(mtt_state_t *s);
 void         mtt_capture_stack(mtt_entry_t *entry);
 
 /* reporter.c */

@@ -211,6 +211,9 @@ void free(void *ptr)
         else
             atomic_store_explicit(&s->current_bytes, 0, memory_order_relaxed);
         atomic_fetch_add_explicit(&s->free_count, 1, memory_order_relaxed);
+        /* 临时分配检测：寿命<1秒→大概率非泄漏（借鉴 heaptrack 临时分配检测） */
+        if (time(NULL) - e->timestamp <= 1)
+            atomic_fetch_add_explicit(&s->temp_alloc_count, 1, memory_order_relaxed);
         mtt_entry_remove(s, ptr);
     }
     mtt_stripe_unlock(s, ptr);

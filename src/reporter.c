@@ -454,14 +454,20 @@ static void scan_and_report_locked(void)
             size_t allocs     = atomic_load_explicit(&st->alloc_count, memory_order_relaxed);
             size_t frees      = atomic_load_explicit(&st->free_count, memory_order_relaxed);
 
+            size_t temp_allocs = atomic_load_explicit(&st->temp_alloc_count, memory_order_relaxed);
+            size_t expired    = atomic_load_explicit(&st->expired_alloc_count, memory_order_relaxed);
+            size_t free_expired = atomic_load_explicit(&st->free_expired_count, memory_order_relaxed);
+
             fprintf(fp,
                 "Total unfreed: %s  |  Peak: %s\n"
                 "Allocations: %zu  |  Frees: %zu\n"
+                "Temp allocs (<1s): %zu  |  Expired: %zu  |  Late-free: %zu\n"
                 "Skipped (sample): %zu  |  Skipped (overflow): %zu\n"
                 "\n",
                 fmt_bytes(cur_bytes, size_buf, sizeof(size_buf)),
                 fmt_bytes(peak_bytes, peak_buf, sizeof(peak_buf)),
                 allocs, frees,
+                temp_allocs, expired, free_expired,
                 atomic_load_explicit(&st->skipped_sampled, memory_order_relaxed),
                 atomic_load_explicit(&st->skipped_overcap, memory_order_relaxed));
         }
@@ -779,4 +785,21 @@ void mtt_reporter_stop(void)
     atomic_store_explicit(&g_reporter.running, 0, memory_order_release);
     /* 不 join：线程是 detached，会在下一次检查 running 时自行退出。
      * atexit 上下文中 pthread_join 可能导致死锁。 */
+}
+
+/**
+ * 信号触发的即时扫描（由 mtt_signal_thread_start 的信号线程调用）。
+ *
+ * 与 reporter 线程和 atexit 处理器共享 scan_mutex 以确保串行化。
+ * kill -USR1 <pid> 即可触发，无需等待 60s 报告间隔。
+ */
+void mtt_reporter_signal_scan(void)
+{
+    if (!atomic_load_explicit(&g_reporter.running, memory_order_acquire))
+        return;
+
+    /* 持锁扫描（与 reporter 线程和 atexit 串行化） */
+    pthread_mutex_lock(&g_reporter.scan_mutex);
+    scan_and_report_locked();
+    pthread_mutex_unlock(&g_reporter.scan_mutex);
 }

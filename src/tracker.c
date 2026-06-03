@@ -344,6 +344,24 @@ int mtt_should_track(mtt_state_t *s, size_t size)
 }
 
 /**
+ * 检查当前是否处于启动阶段（应跳过追踪）。
+ *
+ * 当 MTT_SKIP_STARTUP_SEC > 0 时，在指定时间内不追踪分配，
+ * 避免初始化阶段的大量一次性分配污染泄漏报告。
+ *
+ * @param s  全局状态指针
+ * @return   1=启动阶段中（跳过追踪）, 0=正常追踪
+ */
+int mtt_is_startup_phase(mtt_state_t *s)
+{
+    if (s == NULL) return 0;
+    time_t until = atomic_load_explicit(&s->startup_until, memory_order_relaxed);
+    if (until > 0 && time(NULL) < until)
+        return 1;
+    return 0;
+}
+
+/**
  * 检查哈希表是否已达容量上限。
  *
  * @param s  全局状态指针（调用者已确保非 NULL）
@@ -545,6 +563,8 @@ void mtt_ensure_init(void)
     int      want_disabled = 0;
     unsigned want_sample   = MTT_SAMPLE_DEFAULT;
     size_t   want_srate    = MTT_SAMPLE_RATE_DEFAULT; /* 默认使用字节统计采样 */
+    time_t   want_leak_threshold = MTT_LEAK_THRESHOLD_DEFAULT;
+    time_t   want_skip_startup   = MTT_SKIP_STARTUP_DEFAULT;
 
     {
         const char *env_disable = getenv("MTT_DISABLE");
@@ -566,6 +586,22 @@ void mtt_ensure_init(void)
             int sr = atoi(env_srate);
             if (sr >= 0 && sr <= MTT_SAMPLE_RATE_MAX)
                 want_srate = (size_t)sr;
+        }
+
+        /* 泄漏判定阈值（MTT_LEAK_THRESHOLD_SEC=N，存活超过 N 秒→probable leak） */
+        const char *env_thresh = getenv("MTT_LEAK_THRESHOLD_SEC");
+        if (env_thresh != NULL) {
+            int lt = atoi(env_thresh);
+            if (lt >= 0)
+                want_leak_threshold = (time_t)lt;
+        }
+
+        /* 跳过启动阶段（MTT_SKIP_STARTUP_SEC=N，进程启动 N 秒后再开始追踪） */
+        const char *env_skip = getenv("MTT_SKIP_STARTUP_SEC");
+        if (env_skip != NULL) {
+            int ss = atoi(env_skip);
+            if (ss >= 0)
+                want_skip_startup = (time_t)ss;
         }
     }
 
@@ -625,6 +661,16 @@ void mtt_ensure_init(void)
     atomic_store_explicit(&s->entry_count,        0, memory_order_relaxed);
     atomic_store_explicit(&s->disabled,           want_disabled, memory_order_relaxed);
     atomic_store_explicit(&s->peak_updated,       0, memory_order_relaxed);
+    atomic_store_explicit(&s->leak_threshold_sec, want_leak_threshold, memory_order_relaxed);
+    atomic_store_explicit(&s->temp_alloc_count,   0, memory_order_relaxed);
+    atomic_store_explicit(&s->expired_alloc_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->free_expired_count,  0, memory_order_relaxed);
+
+    /* 设置启动阶段结束时间（0=不跳过） */
+    if (want_skip_startup > 0)
+        atomic_store_explicit(&s->startup_until, time(NULL) + want_skip_startup, memory_order_relaxed);
+    else
+        atomic_store_explicit(&s->startup_until, 0, memory_order_relaxed);
 
     /* 读取进程名 */
     get_process_name(s->proc_name, sizeof(s->proc_name));
@@ -653,6 +699,76 @@ void mtt_ensure_init(void)
         }
         mtt_http_server_start(http_port);
     }
+
+    /* 启动信号处理线程（SIGUSR1 触发即时报告） */
+    mtt_signal_thread_start();
+}
+
+/* ======================================================================== *
+ *                 信号处理线程（SIGUSR1 触发即时报告）                         *
+ * ======================================================================== */
+
+/** 信号线程运行标志 */
+static _Atomic int g_signal_thread_running = 0;
+
+/** 信号处理线程主函数。使用 sigwait() 阻塞等待 SIGUSR1，收到后触发即时扫描。 */
+static void* mtt_signal_thread_fn(void *arg)
+{
+    (void)arg;
+    pthread_detach(pthread_self());
+
+    sigset_t sigset;
+    sigemptyset(&sigset);
+    sigaddset(&sigset, MTT_SIGNAL_REPORT);
+
+    while (atomic_load_explicit(&g_signal_thread_running, memory_order_acquire)) {
+        int sig;
+        if (sigwait(&sigset, &sig) == 0 && sig == MTT_SIGNAL_REPORT) {
+            /* 收到 SIGUSR1：记录时序点 + 触发即时扫描 */
+            mtt_ts_record_point();
+            /* 通过 reporter 接口触发扫描（需要 reporter 配合） */
+            extern void mtt_reporter_signal_scan(void);
+            mtt_reporter_signal_scan();
+        }
+    }
+    return NULL;
+}
+
+/**
+ * 启动信号处理线程。
+ *
+ * 在子线程中阻塞等待 SIGUSR1，收到后立即触发 scan_and_report()。
+ * 在 mtt_ensure_init() 末尾调用，reporter 线程启动之后。
+ */
+void mtt_signal_thread_start(void)
+{
+    /* 防止重复启动 */
+    int expected = 0;
+    static atomic_int started = 0;
+    if (!atomic_compare_exchange_strong(&started, &expected, 1))
+        return;
+
+    /* 在主线程中阻塞 SIGUSR1（子线程将通过 sigwait 接收） */
+    sigset_t block_set;
+    sigemptyset(&block_set);
+    sigaddset(&block_set, MTT_SIGNAL_REPORT);
+    pthread_sigmask(SIG_BLOCK, &block_set, NULL);
+
+    atomic_store_explicit(&g_signal_thread_running, 1, memory_order_release);
+
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, mtt_signal_thread_fn, NULL) != 0) {
+        atomic_store_explicit(&g_signal_thread_running, 0, memory_order_release);
+        return;
+    }
+
+    /* 诊断输出 */
+    char diag[96] = {0};
+    int len = snprintf(diag, sizeof(diag),
+        "[MTT] Signal thread ready (kill -USR1 %d for instant report)\n",
+        (int)getpid());
+    if (len > 0 && len < (int)sizeof(diag))
+        write(STDERR_FILENO, diag, (size_t)len);
 }
 
 /* ======================================================================== *
@@ -680,6 +796,10 @@ void* mtt_malloc(size_t size)
     if (s == NULL) return raw_malloc(size);
 
     if (atomic_load_explicit(&s->disabled, memory_order_acquire))
+        return raw_malloc(size);
+
+    /* 启动阶段：跳过追踪（减少初始化分配噪声） */
+    if (mtt_is_startup_phase(s))
         return raw_malloc(size);
 
     /* 先分配用户内存 */
