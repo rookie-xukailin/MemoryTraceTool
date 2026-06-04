@@ -550,7 +550,32 @@ static void handle_api_data(int client_fd)
 {
     mtt_reporter_t *rep = mtt_reporter_get();
 
-    /* 读取 reporter 缓存（持缓存锁） */
+    /* Phase 1: 从时序数据环形缓冲区读取数据（使用 g_time_series.lock，
+     * 必须在 cache_lock 之前完成，避免 cache_lock -> g_time_series.lock 的
+     * ABBA 死锁：reporter 线程在 scan_and_report_locked Stage 0 中以
+     * g_time_series.lock -> cache_lock 顺序加锁，若 HTTP 线程以相反顺序
+     * 加锁会导致经典循环等待死锁。 */
+    mtt_ts_point_t *fallback_pts = NULL;
+    uint32_t       fallback_count = 0;
+    const mtt_ts_point_t *src_pts = NULL;
+    uint32_t       src_count = 0;
+
+    if (mtt_ts_is_ready()) {
+        fallback_pts = (mtt_ts_point_t*)raw_malloc(
+            360 * sizeof(mtt_ts_point_t));
+        if (fallback_pts != NULL) {
+            memset(fallback_pts, 0, 360 * sizeof(mtt_ts_point_t));
+            if (mtt_ts_get_range(0, fallback_pts, 360, &fallback_count) == 0
+                && fallback_count > 0) {
+                src_pts   = fallback_pts;
+                src_count = fallback_count;
+            }
+        }
+    }
+
+    /* Phase 2: 读取 reporter 缓存（持缓存锁）。
+     * 注意：cache_lock 在此处获取，时序数据已在 Phase 1 中完成读取，
+     * 不会在持锁期间再次尝试获取 g_time_series.lock。 */
     pthread_mutex_lock(&rep->cache_lock);
 
     /* 读取统计值 */
@@ -588,36 +613,12 @@ static void handle_api_data(int client_fd)
         cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc);
     write(client_fd, buf, (size_t)len);
 
-    /* 时序数据（最近最多 360 点）。
-     * 优先使用 reporter 线程缓存的副本，若缓存为空（HTTP 服务器在 reporter 首次扫描
-     * 完成前就已收到请求），则直接从时序数据环形缓冲区读取作为兜底，确保 time_series
-     * 不会返回空数组。兜底读取使用 raw_malloc（堆分配），避免在 ARM 嵌入式系统
-     * 默认 8KB 线程栈上放置大数组导致栈溢出。 */
-    write(client_fd, ",\"time_series\":[", 16); /* 精确长度：,"time_series":[ = 16字节 */
+    /* 时序数据 — 数据已在 Phase 1（cache_lock 前）从环形缓冲区读取完成，
+     * 此处仅序列化 src_pts/src_count 中的数据点到 JSON 输出。
+     * 优先使用环缓冲实时数据（cached 只在 60s 扫描时更新，太慢）。
+     * 注意：不再在 cache_lock 内调用 mtt_ts_get_range（避免 ABBA 死锁）。 */
+    write(client_fd, ",\"time_series\":[", 16);
     {
-        int ts_have_cache = (rep->cached_ts_data != NULL && rep->cached_ts_count > 0);
-        mtt_ts_point_t *fallback_pts = NULL;
-        uint32_t       fallback_count = 0;
-        const mtt_ts_point_t *src_pts = NULL;
-        uint32_t       src_count = 0;
-
-        /* 优先使用环缓冲实时数据（cached 只在 60s 扫描时更新，太慢） */
-        if (mtt_ts_is_ready()) {
-            /* 缓存为空时从环形缓冲区直接读取（兜底方案）。
-             * 360 * sizeof(mtt_ts_point_t) ≈ 17KB（64-bit），使用堆分配
-             * 避免栈上大数组在 ARM 嵌入式系统上溢出。 */
-            fallback_pts = (mtt_ts_point_t*)raw_malloc(
-                360 * sizeof(mtt_ts_point_t));
-            if (fallback_pts != NULL) {
-                memset(fallback_pts, 0, 360 * sizeof(mtt_ts_point_t));
-                if (mtt_ts_get_range(0, fallback_pts, 360, &fallback_count) == 0
-                    && fallback_count > 0) {
-                    src_pts   = fallback_pts;
-                    src_count = fallback_count;
-                }
-            }
-        }
-
         if (src_pts != NULL && src_count > 0) {
             int wrote_first = 0;
             for (uint32_t i = 0; i < src_count; i++) {
@@ -637,8 +638,6 @@ static void handle_api_data(int client_fd)
                 write(client_fd, buf, (size_t)len);
             }
         }
-
-        if (fallback_pts != NULL && raw_free != NULL) raw_free(fallback_pts);
     }
     write(client_fd, "]", 1);
 
@@ -669,6 +668,11 @@ static void handle_api_data(int client_fd)
     write(client_fd, "]}", 2);
 
     pthread_mutex_unlock(&rep->cache_lock);
+
+    /* Phase 3: 清理 Phase 1 中分配的回退缓冲区。
+     * 必须在 cache_lock 释放后执行，避免持锁时间过长。 */
+    if (fallback_pts != NULL && raw_free != NULL)
+        raw_free(fallback_pts);
 }
 
 /** 写入单个泄漏站点 JSON 到 client fd */
