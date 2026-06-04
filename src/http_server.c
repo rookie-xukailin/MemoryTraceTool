@@ -405,7 +405,7 @@ static void handle_api_data(int client_fd)
      * 完成前就已收到请求），则直接从时序数据环形缓冲区读取作为兜底，确保 time_series
      * 不会返回空数组。兜底读取使用 raw_malloc（堆分配），避免在 ARM 嵌入式系统
      * 默认 8KB 线程栈上放置大数组导致栈溢出。 */
-    write(client_fd, ",\"time_series\":[", 18);
+    write(client_fd, ",\"time_series\":[", 16); /* 精确长度：,"time_series":[ = 16字节 */
     {
         int ts_have_cache = (rep->cached_ts_data != NULL && rep->cached_ts_count > 0);
         mtt_ts_point_t *fallback_pts = NULL;
@@ -413,10 +413,8 @@ static void handle_api_data(int client_fd)
         const mtt_ts_point_t *src_pts = NULL;
         uint32_t       src_count = 0;
 
-        if (ts_have_cache) {
-            src_pts   = rep->cached_ts_data;
-            src_count = rep->cached_ts_count;
-        } else if (mtt_ts_is_ready()) {
+        /* 优先使用环缓冲实时数据（cached 只在 60s 扫描时更新，太慢） */
+        if (mtt_ts_is_ready()) {
             /* 缓存为空时从环形缓冲区直接读取（兜底方案）。
              * 360 * sizeof(mtt_ts_point_t) ≈ 17KB（64-bit），使用堆分配
              * 避免栈上大数组在 ARM 嵌入式系统上溢出。 */
@@ -506,9 +504,9 @@ static void json_write_leak_site_stdout(mtt_leak_site_t *site,
                 || strstr(sym, "capture_stack") != NULL
                 || strstr(sym, "backtrace") != NULL)
                 continue;
-            off = snprintf(buf, sizeof(buf), "%s\"", first ? "" : ",");
+            off = snprintf(buf, sizeof(buf), "%s", first ? "" : ",");
             write(fd, buf, (size_t)off);
-            /* escape the symbol */
+            /* 写入 JSON 字符串引用 */
             write(fd, "\"", 1);
             for (const char *p = sym; *p != '\0'; p++) {
                 if (*p == '"' || *p == '\\') write(fd, "\\", 1);
