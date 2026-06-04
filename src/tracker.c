@@ -570,9 +570,12 @@ static void get_process_name(char *buf, size_t size)
 #ifdef __linux__
     {
         char comm[16] = {0};
-        /* 使用 raw syscall 号 15 = PR_GET_NAME（避免引入 <sys/prctl.h> 头文件依赖） */
+        /* 使用 raw syscall 号 15 = PR_GET_NAME（避免引入 <sys/prctl.h> 头文件依赖）。
+         * 注意：prctl 实参类型为 unsigned long，在 ARM64/x86_64 上 sizeof(int) != sizeof(unsigned long)，
+         * 若直接传 0（int）到 variadic 参数中，va_arg(ap, unsigned long) 可能读取未定义字节。
+         * 传递 0UL 确保类型宽度匹配，在 ARM32/ARM64 上均安全。 */
         extern int prctl(int, ...);
-        if (prctl(15, comm, 0, 0, 0) == 0 && comm[0] != '\0') {
+        if (prctl(15, (unsigned long)comm, 0UL, 0UL, 0UL) == 0 && comm[0] != '\0') {
             size_t n = strlen(comm);
             if (n >= size) n = size - 1;
             memcpy(buf, comm, n);

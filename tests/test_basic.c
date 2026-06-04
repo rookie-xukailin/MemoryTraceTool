@@ -401,11 +401,15 @@ static void test_current_bytes_decreases(void)
     PASS();
 }
 
-/** 测试 21: peak_bytes 跟踪 */
+/** 测试 21: peak_bytes 跟踪。
+ *  注意：不能使用 before=mtt_get_peak_usage() 做比较基准，
+ *  因为前置测试（如 test_malloc_large 的 4MB 分配）可能已将 peak 设到远高于
+ *  current_bytes 的值，后续小分配（3*4096）不会推动 peak 超过已建立的全局高水位。
+ *  改用 current_bytes 基线 + 语义不变量来验证 peak 跟踪的正确性。 */
 static void test_peak_bytes(void)
 {
     TEST("peak_bytes tracking");
-    size_t before = mtt_get_peak_usage();
+    size_t before = mtt_get_current_usage();
 
     void *p1 = mtt_malloc(4096);
     void *p2 = mtt_malloc(4096);
@@ -414,8 +418,11 @@ static void test_peak_bytes(void)
     ASSERT_PTR_NOT_NULL(p2, "p2 failed");
     ASSERT_PTR_NOT_NULL(p3, "p3 failed");
 
+    /* 语义不变量：peak 应该 >= 当前 current_bytes */
+    size_t cur  = mtt_get_current_usage();
     size_t peak = mtt_get_peak_usage();
-    ASSERT_GE(peak, before + 3 * 4096, "peak_bytes should be >= before+12KB");
+    ASSERT_GE(peak, cur, "peak_bytes should always be >= current_bytes");
+    ASSERT_GE(cur, before + 3 * 4096, "current_bytes should increase by at least 12KB");
 
     mtt_free(p1);
     mtt_free(p2);
