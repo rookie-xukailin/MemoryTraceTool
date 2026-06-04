@@ -980,14 +980,11 @@ void* mtt_realloc(void *ptr, size_t size)
         return new_ptr;
     }
 
-    /* 先利用 raw_realloc 完成真正的内存重分配。
-     * raw_realloc 内部会正确处理 size 变更、数据保留和旧指针释放，
-     * 避免手动 memcpy 带来的越界读取风险。 */
+    /* 先利用 raw_realloc 完成真正的内存重分配。 */
     if (raw_realloc != NULL) {
-        /* 分配前从追踪表中读取旧大小（用于更新统计） */
+        /* 锁内查找旧条目（用于后续统计更新） */
         mtt_stripe_lock(s, ptr);
         mtt_entry_t *old_e = mtt_entry_find(s, ptr);
-        size_t old_size = (old_e != NULL) ? old_e->size : 0;
         mtt_stripe_unlock(s, ptr);
 
         void *new_ptr = raw_realloc(ptr, size);

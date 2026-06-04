@@ -323,51 +323,6 @@ static const char g_dashboard_html[] =
  *                       JSON 序列化辅助函数                                  *
  * ======================================================================== */
 
-/** esc 字符串用于 JSON（仅处理双引号和反斜杠，简单但安全） */
-static void json_escape(FILE *fp, const char *str)
-{
-    if (fp == NULL || str == NULL) return;
-    for (const char *p = str; *p != '\0'; p++) {
-        if (*p == '"' || *p == '\\') fputc('\\', fp);
-        fputc(*p, fp);
-    }
-}
-
-/** 写入单个泄漏站点 JSON 数据（不含外层大括号） */
-static void json_write_leak_site(FILE *fp, mtt_leak_site_t *site,
-                                  mtt_stack_entry_t *se, int index)
-{
-    if (fp == NULL || site == NULL) return;
-
-    fprintf(fp, "{\"hash\":\"0x%llx\",\"count\":%zu,\"per_leak_size\":%zu,"
-            "\"total_size\":%zu,\"first_seen\":%ld,\"last_seen\":%ld",
-            (unsigned long long)site->stack_hash, site->count,
-            site->per_leak_size, site->total_size,
-            (long)site->first_seen, (long)site->last_seen);
-
-    /* 写入已解析的栈帧 */
-    fprintf(fp, ",\"stack\":[");
-    if (se != NULL && se->is_resolved) {
-        int first = 1;
-        for (int j = 0; j < se->frame_count; j++) {
-            const char *sym = se->resolved[j];
-            /* 过滤内部帧 */
-            if (sym == NULL || sym[0] == '\0'
-                || strstr(sym, "libmemorytracetool") != NULL
-                || strstr(sym, "mtt_") == sym
-                || strstr(sym, "capture_stack") != NULL
-                || strstr(sym, "backtrace") != NULL)
-                continue;
-            if (!first) fputc(',', fp);
-            first = 0;
-            fputc('"', fp);
-            json_escape(fp, sym);
-            fputc('"', fp);
-        }
-    }
-    fprintf(fp, "]}");
-}
-
 /* ======================================================================== *
  *                        HTTP 请求处理器                                     *
  * ======================================================================== */
@@ -390,6 +345,10 @@ static void handle_root(int client_fd)
     if (write(client_fd, header, strlen(header)) < 0) return;
     write(client_fd, g_dashboard_html, strlen(g_dashboard_html));
 }
+
+/* 前向声明：写入单个泄漏站点 JSON 到 client fd */
+static void json_write_leak_site_stdout(mtt_leak_site_t *site,
+                                         mtt_stack_entry_t *se, int fd);
 
 /**
  * 处理 GET /api/data — 返回综合 JSON 数据。
