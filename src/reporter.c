@@ -543,8 +543,8 @@ static void scan_and_report_locked(void)
         if (st != NULL && st->proc_name_ready && st->proc_name[0] != '\0')
             proc_name = st->proc_name;
 
-        char log_path[512] = {0};
-        char tmp_path[512] = {0};
+        char log_path[768] = {0};
+        char tmp_path[768] = {0};
         snprintf(log_path, sizeof(log_path), "%s/%d_%s.log",
                  log_dir, (int)getpid(), proc_name);
         snprintf(tmp_path, sizeof(tmp_path), "%s/%d_%s.log.tmp",

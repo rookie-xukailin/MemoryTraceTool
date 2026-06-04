@@ -52,7 +52,7 @@
 
 /* ---- 全局栈缓存单例 ---- */
 
-static mtt_stack_cache_t g_stack_cache = {{{0}}, 0, PTHREAD_MUTEX_INITIALIZER};
+static mtt_stack_cache_t g_stack_cache = {0};
 
 mtt_stack_cache_t* mtt_stack_cache_get(void)
 {

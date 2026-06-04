@@ -48,8 +48,8 @@ typedef struct {
     pthread_mutex_t  scan_mutex;                 /* 串行化 scan_and_report（reporter 线程 vs atexit） */
     mtt_leak_table_t leak_table;
     time_t           session_start;
-    char             log_path[512];              /* 正式日志文件路径 */
-    char             tmp_path[512];              /* 临时文件路径（write+rename 原子写入） */
+    char             log_path[768];              /* 正式日志文件路径（256+1+10+1+256+4=528，留余量到 768） */
+    char             tmp_path[768];              /* 临时文件路径（write+rename 原子写入） */
 
     /* HTTP 泄漏缓存：reporter 线程写入，HTTP 线程读取 */
     mtt_leak_site_t **cached_sites;              /* 排序后的泄漏站点指针数组（raw_malloc） */
