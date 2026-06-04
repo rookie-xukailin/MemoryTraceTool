@@ -144,6 +144,8 @@ static const char g_dashboard_html[] =
 "function drawChart() {\n"
 "  if (!data || !data.time_series || data.time_series.length === 0) return;\n"
 "  var W = chartCanvas.width, H = chartCanvas.height;\n"
+"  /* 单数据点时 x 坐标固定为图表中央，避免除以 (ts.length-1)=0 产生 NaN */\n"
+"  var singlePoint = data.time_series.length === 1;\n"
 "  ctx.clearRect(0, 0, W, H);\n"
 "  var pad = {top: 30, right: 30, bottom: 50, left: 80};\n"
 "  var pw = W - pad.left - pad.right;\n"
@@ -157,7 +159,7 @@ static const char g_dashboard_html[] =
 "  }\n"
 "  if (maxBytes === 0) maxBytes = 1;\n"
 "\n"
-"  function x(i) { return pad.left + (i / (ts.length - 1)) * pw; }\n"
+"  function x(i) { return singlePoint ? pad.left + pw / 2 : pad.left + (i / (ts.length - 1)) * pw; }\n"
 "  function y(v) { return pad.top + ph - (v / maxBytes) * ph; }\n"
 "\n"
 "  /* 网格 */\n"
@@ -389,30 +391,64 @@ static void handle_api_data(int client_fd)
     int len;
 
     len = snprintf(buf, sizeof(buf),
-        "{\"pid\":%d,\"proc_name\":\"%s\",\"session_start\":%ld,\"last_scan\":%ld,"
+        "{\"pid\":%d,\"proc_name\":\"%s\",\"session_start\":%lld,\"last_scan\":%lld,"
         "\"stats\":{\"current_bytes\":%zu,\"peak_bytes\":%zu,\"alloc_count\":%zu,"
         "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu}",
         (int)getpid(), proc_name,
-        (long)rep->session_start,
-        (long)time(NULL),
+        (long long)rep->session_start,
+        (long long)time(NULL),
         cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc);
     write(client_fd, buf, (size_t)len);
 
-    /* 时序数据（最近最多 360 点） */
+    /* 时序数据（最近最多 360 点）。
+     * 优先使用 reporter 线程缓存的副本，若缓存为空（HTTP 服务器在 reporter 首次扫描
+     * 完成前就已收到请求），则直接从时序数据环形缓冲区读取作为兜底，确保 time_series
+     * 不会返回空数组。兜底读取使用 raw_malloc（堆分配），避免在 ARM 嵌入式系统
+     * 默认 8KB 线程栈上放置大数组导致栈溢出。 */
     write(client_fd, ",\"time_series\":[", 18);
-    if (rep->cached_ts_data != NULL && rep->cached_ts_count > 0) {
-        int wrote_first = 0;
-        for (uint32_t i = 0; i < rep->cached_ts_count; i++) {
-            mtt_ts_point_t *pt = &rep->cached_ts_data[i];
-            if (pt->timestamp == 0) continue;
-            if (wrote_first) write(client_fd, ",", 1);
-            wrote_first = 1;
-            len = snprintf(buf, sizeof(buf),
-                "{\"ts\":%ld,\"cur\":%zu,\"peak\":%zu,\"allocs\":%zu,\"frees\":%zu,\"entries\":%zu}",
-                (long)pt->timestamp, pt->current_bytes, pt->peak_bytes,
-                pt->alloc_count, pt->free_count, pt->entry_count);
-            write(client_fd, buf, (size_t)len);
+    {
+        int ts_have_cache = (rep->cached_ts_data != NULL && rep->cached_ts_count > 0);
+        mtt_ts_point_t *fallback_pts = NULL;
+        uint32_t       fallback_count = 0;
+        const mtt_ts_point_t *src_pts = NULL;
+        uint32_t       src_count = 0;
+
+        if (ts_have_cache) {
+            src_pts   = rep->cached_ts_data;
+            src_count = rep->cached_ts_count;
+        } else if (mtt_ts_is_ready()) {
+            /* 缓存为空时从环形缓冲区直接读取（兜底方案）。
+             * 360 * sizeof(mtt_ts_point_t) ≈ 17KB（64-bit），使用堆分配
+             * 避免栈上大数组在 ARM 嵌入式系统上溢出。 */
+            fallback_pts = (mtt_ts_point_t*)raw_malloc(
+                360 * sizeof(mtt_ts_point_t));
+            if (fallback_pts != NULL) {
+                memset(fallback_pts, 0, 360 * sizeof(mtt_ts_point_t));
+                if (mtt_ts_get_range(0, fallback_pts, 360, &fallback_count) == 0
+                    && fallback_count > 0) {
+                    src_pts   = fallback_pts;
+                    src_count = fallback_count;
+                }
+            }
         }
+
+        if (src_pts != NULL && src_count > 0) {
+            int wrote_first = 0;
+            for (uint32_t i = 0; i < src_count; i++) {
+                if (src_pts[i].timestamp == 0) continue;
+                if (wrote_first) write(client_fd, ",", 1);
+                wrote_first = 1;
+                len = snprintf(buf, sizeof(buf),
+                    "{\"ts\":%lld,\"cur\":%zu,\"peak\":%zu,\"allocs\":%zu,\"frees\":%zu,\"entries\":%zu}",
+                    (long long)src_pts[i].timestamp,
+                    src_pts[i].current_bytes, src_pts[i].peak_bytes,
+                    src_pts[i].alloc_count, src_pts[i].free_count,
+                    src_pts[i].entry_count);
+                write(client_fd, buf, (size_t)len);
+            }
+        }
+
+        if (fallback_pts != NULL) raw_free(fallback_pts);
     }
     write(client_fd, "]", 1);
 
@@ -421,8 +457,12 @@ static void handle_api_data(int client_fd)
     if (rep->cached_sites != NULL && rep->cached_site_count > 0) {
         size_t show_count = rep->cached_site_count;
         if (show_count > 50) show_count = 50;
+        int wrote_first = 0;
         for (size_t i = 0; i < show_count; i++) {
-            if (i > 0) write(client_fd, ",", 1);
+            /* 跳过分配失败的 NULL 条目（防御性编程） */
+            if (rep->cached_sites[i] == NULL) continue;
+            if (wrote_first) write(client_fd, ",", 1);
+            wrote_first = 1;
             mtt_stack_entry_t *se = NULL;
             if (rep->cached_pairs != NULL) {
                 site_stack_pair_t *pp = (site_stack_pair_t*)rep->cached_pairs;
@@ -449,11 +489,11 @@ static void json_write_leak_site_stdout(mtt_leak_site_t *site,
     int off = snprintf(buf, sizeof(buf),
         "{\"hash\":\"0x%llx\",\"count\":%zu,\"per_leak_size\":%zu,"
         "\"total_size\":%zu,\"diff_size\":%zu,\"is_expired\":%d,"
-        "\"first_seen\":%ld,\"last_seen\":%ld,\"stack\":[",
+        "\"first_seen\":%lld,\"last_seen\":%lld,\"stack\":[",
         (unsigned long long)site->stack_hash, site->count,
         site->per_leak_size, site->total_size,
         site->diff_size, site->is_expired,
-        (long)site->first_seen, (long)site->last_seen);
+        (long long)site->first_seen, (long long)site->last_seen);
     write(fd, buf, (size_t)off);
 
     if (se != NULL && se->is_resolved) {
@@ -500,8 +540,11 @@ static void handle_api_leaks(int client_fd)
     pthread_mutex_lock(&rep->cache_lock);
 
     if (rep->cached_sites != NULL && rep->cached_site_count > 0) {
+        int wrote_first = 0;
         for (size_t i = 0; i < rep->cached_site_count; i++) {
-            if (i > 0) write(client_fd, ",", 1);
+            if (rep->cached_sites[i] == NULL) continue;
+            if (wrote_first) write(client_fd, ",", 1);
+            wrote_first = 1;
             mtt_stack_entry_t *se = NULL;
             if (rep->cached_pairs != NULL) {
                 site_stack_pair_t *pp = (site_stack_pair_t*)rep->cached_pairs;

@@ -74,15 +74,15 @@ demo: $(SHARED_LIB) examples/demo.c | $(BUILD_DIR)
 
 # LD_PRELOAD 模式示例（标准 malloc/free，运行时注入）
 demo_preload: $(SHARED_LIB) examples/demo_preload.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_preload examples/demo_preload.c
+	$(CC) $(DEMO_CFLAGS) $(DEMO_LDFLAGS) -o $(BUILD_DIR)/demo_preload examples/demo_preload.c
 
 # 长期运行示例（LD_PRELOAD 模式，持续分配+泄漏）
 demo_long_running: $(SHARED_LIB) examples/demo_long_running.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_long_running examples/demo_long_running.c -lpthread
+	$(CC) $(DEMO_CFLAGS) $(DEMO_LDFLAGS) -o $(BUILD_DIR)/demo_long_running examples/demo_long_running.c -lpthread
 
 # 可控泄漏示例（20 分钟 ~50MB，配合 Web 仪表盘观察）
 demo_controlled_leak: $(SHARED_LIB) examples/demo_controlled_leak.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_controlled_leak examples/demo_controlled_leak.c -lpthread
+	$(CC) $(DEMO_CFLAGS) $(DEMO_LDFLAGS) -o $(BUILD_DIR)/demo_controlled_leak examples/demo_controlled_leak.c -lpthread
 
 # =====================================================
 #  运行示例

@@ -14,12 +14,12 @@
 
 /** 全局时序数据环形缓冲区（单例） */
 static mtt_time_series_t g_time_series;
-static int g_ts_initialized = 0;
+static atomic_int g_ts_initialized = 0;
 
-/** 检查是否已初始化（供 reporter 安全访问） */
+/** 检查是否已初始化（供 reporter/HTTP 线程跨线程安全访问） */
 int mtt_ts_is_ready(void)
 {
-    return g_ts_initialized;
+    return atomic_load_explicit(&g_ts_initialized, memory_order_acquire);
 }
 
 /* ======================================================================== *
@@ -34,13 +34,28 @@ int mtt_ts_is_ready(void)
  */
 void mtt_ts_init(void)
 {
-    if (g_ts_initialized) return;
-    g_ts_initialized = 1;
+    /* 双重检查：使用 atomic 防止多线程重复初始化 */
+    if (atomic_load_explicit(&g_ts_initialized, memory_order_acquire))
+        return;
+
+    /* 持锁确保仅一个线程执行初始化（与 mtt_ensure_init 的 init_lock 配合，
+     * 但此处增加独立防护以应对未来可能的并行调用路径） */
+    static pthread_mutex_t ts_init_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&ts_init_lock);
+
+    if (atomic_load_explicit(&g_ts_initialized, memory_order_relaxed)) {
+        pthread_mutex_unlock(&ts_init_lock);
+        return;
+    }
 
     memset(&g_time_series, 0, sizeof(g_time_series));
     atomic_store_explicit(&g_time_series.head, 0, memory_order_relaxed);
     atomic_store_explicit(&g_time_series.count, 0, memory_order_relaxed);
     pthread_mutex_init(&g_time_series.lock, NULL);
+
+    /* release 屏障：确保所有初始化写入对 mtt_ts_is_ready() 的读者可见 */
+    atomic_store_explicit(&g_ts_initialized, 1, memory_order_release);
+    pthread_mutex_unlock(&ts_init_lock);
 }
 
 /**

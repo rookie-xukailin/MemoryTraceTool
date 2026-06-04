@@ -487,6 +487,11 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
     mtt_entry_t *e = (mtt_entry_t*)raw_malloc(sizeof(mtt_entry_t));
     if (e == NULL) return NULL;
 
+    /* 先清零整个结构体，防止 raw_malloc 返回未初始化内存导致
+     * 字段（尤其是 timestamp/first_seen）在后续快照→泄漏站点→缓存复制
+     * 链路中泄漏垃圾值到 JSON 输出（如 first_seen=-2464099233197811593）。 */
+    memset(e, 0, sizeof(*e));
+
     e->ptr           = ptr;
     e->size          = size;
     e->alloc_num     = 0;

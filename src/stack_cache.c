@@ -272,6 +272,8 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
         lib_name = fname;
 
         if (info.dli_sname != NULL) {
+            /* dladdr 成功解析符号名（需要 -rdynamic 链接选项）。
+             * 偏移 = 返回地址 - 函数入口地址 → 函数内偏移 */
             size_t nlen = strlen(info.dli_sname);
             if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
             memcpy(func_name, info.dli_sname, nlen);
@@ -279,11 +281,18 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
             func_off = (char*)addr - (char*)info.dli_saddr;
             if (func_off < 0) func_off = 0;
         } else {
-            /* dli_sname 为 NULL：尝试 backtrace_symbols 提取函数名。
-             * 在不使用 -rdynamic 编译时，backtrace_symbols 返回格式为
-             * "binary(+0xOFFSET) [0xADDR]" — 函数名为空，但偏移仍在。
-             * 需同时处理函数名为空和不为空两种情况。 */
+            /* dli_sname 为 NULL：缺少 -rdynamic 导致符号未导出到 .dynsym 表。
+             * 偏移使用 dli_fbase（dladdr 成功就有），确保与 addr2line -e 兼容。
+             * 注意：必须在 backtrace_symbols 之前计算偏移，避免其覆盖 dli_fbase 结果。 */
+            if (info.dli_fbase != NULL) {
+                func_off = (char*)addr - (char*)info.dli_fbase;
+                if (func_off < 0) func_off = 0;
+            }
 #if MTT_HAS_BACKTRACE
+            /* 回退到 backtrace_symbols() 仅用于尝试提取函数名。
+             * 格式取决于是否启用 -rdynamic：
+             *   有 -rdynamic: "binary(func+0xOFFSET) [0xADDR]"
+             *   无 -rdynamic: "binary(+0xOFFSET) [0xADDR]" — 函数名为空 */
             char **syms = backtrace_symbols(&addr, 1);
             if (syms != NULL && syms[0] != NULL) {
                 char *paren = strchr(syms[0], '(');
@@ -291,15 +300,19 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
                 char *rparen = (paren != NULL) ? strchr(paren, ')') : NULL;
                 if (paren != NULL && plus != NULL && rparen != NULL
                     && plus > paren && plus < rparen) {
-                    /* 尝试提取函数名（可能为空字符串） */
+                    /* 尝试提取函数名（可能为空字符串，取决于 -rdynamic） */
                     size_t nlen = (size_t)(plus - paren - 1);
                     if (nlen > 0) {
                         if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
                         memcpy(func_name, paren + 1, nlen);
                         func_name[nlen] = '\0';
                     }
-                    /* 无论函数名是否为空，都提取偏移（相对于 binary 加载地址，
-                     * 可用于 addr2line -e binary 0xOFFSET） */
+                    /* 从 backtrace_symbols 提取偏移。
+                     * backtrace_symbols 读取完整符号表（.symtab + .dynsym），
+                     * 当找到函数名时其偏移为 function-relative（如 main+0x460），
+                     * 当函数名为空时偏移为 file-relative（兼容 addr2line）。
+                     * 优先于 dli_fbase 偏移，解决无 -rdynamic 时出现
+                     * "??+0x17e6" 而非 "main+0x460" 的问题。 */
                     func_off = (ptrdiff_t)strtoul(plus + 1, NULL, 16);
                 } else if (paren != NULL && rparen != NULL && rparen > paren + 1) {
                     /* 无 '+' 号但有函数名：格式 "binary(func)" */
@@ -313,16 +326,13 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
                 free(syms);
             }
 #endif
-            if (func_name[0] == '\0')
+            if (func_name[0] == '\0') {
+                /* 无 -rdynamic 时无法解析函数名 */
                 snprintf(func_name, sizeof(func_name), "??");
-            /* 若 backtrace_symbols 未提供偏移，回退到 dli_fbase 相对偏移 */
-            if (func_off == 0) {
-                func_off = (char*)addr - (char*)info.dli_fbase;
-                if (func_off < 0) func_off = 0;
             }
         }
     } else {
-        /* dladdr 完全失败：从 backtrace_symbols 解析 */
+        /* dladdr 完全失败（静态链接或地址无效）：从 backtrace_symbols 解析 */
 #if MTT_HAS_BACKTRACE
         char **syms = backtrace_symbols(&addr, 1);
         if (syms != NULL && syms[0] != NULL) {
@@ -342,7 +352,7 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
                 if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
                 memcpy(func_name, paren + 1, nlen);
                 func_name[nlen] = '\0';
-                /* 无偏移，保持 func_off=0 */
+                /* 无偏移，保持 func_off = 0 */
             }
             free(syms);
         }

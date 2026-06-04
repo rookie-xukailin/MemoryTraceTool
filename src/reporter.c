@@ -236,6 +236,37 @@ static void scan_and_report_locked(void)
     uint64_t entry_total_orig = atomic_load_explicit(&s->entry_count, memory_order_relaxed);
     uint64_t entry_total = entry_total_orig;
 
+    /* ---- 阶段 0: 时序数据缓存更新（独立于扫描，始终执行） ----
+     * 必须在快照分配之前更新，即使后续快照分配失败跳过扫描，
+     * HTTP 仪表盘仍能获取最新的时序数据用于图表渲染。
+     * 若移除此前置更新，skip_scan 路径会跳过 Stage 7 的缓存更新，
+     * 导致 /api/data 返回 time_series:[]。 */
+    if (mtt_ts_is_ready() && raw_malloc != NULL) {
+        mtt_ts_point_t *ts_buf = (mtt_ts_point_t*)raw_malloc(
+            360 * sizeof(mtt_ts_point_t));
+        if (ts_buf != NULL) {
+            memset(ts_buf, 0, 360 * sizeof(mtt_ts_point_t));
+            uint32_t ts_count = 0;
+            if (mtt_ts_get_range(0, ts_buf, 360, &ts_count) == 0 && ts_count > 0) {
+                mtt_ts_point_t *new_data = (mtt_ts_point_t*)raw_malloc(
+                    ts_count * sizeof(mtt_ts_point_t));
+                if (new_data != NULL) {
+                    memcpy(new_data, ts_buf,
+                           ts_count * sizeof(mtt_ts_point_t));
+                    pthread_mutex_lock(&g_reporter.cache_lock);
+                    /* 新数据就绪后才释放旧数据，避免中间态 */
+                    if (g_reporter.cached_ts_data != NULL && raw_free != NULL)
+                        raw_free(g_reporter.cached_ts_data);
+                    g_reporter.cached_ts_data = new_data;
+                    g_reporter.cached_ts_count = ts_count;
+                    pthread_mutex_unlock(&g_reporter.cache_lock);
+                }
+                /* 若 new_data 分配失败，保留旧 cached_ts_data 不变 */
+            }
+            raw_free(ts_buf);
+        }
+    }
+
     /* ---- 阶段 1: 逐锁快照活跃条目 ---- */
     mtt_alloc_snap_t *snaps = NULL;
     size_t snap_count = 0;
@@ -285,7 +316,10 @@ static void scan_and_report_locked(void)
     }
 
     /* ---- 阶段 2: 去重 —— 按栈 hash 分组到泄漏站点表 ---- */
-    mtt_leak_table_t leak_table;
+    /* leak_table 大小约 16KB（64-bit）或 8KB（32-bit），不放在栈上：
+     * ARM32 默认线程栈仅 8KB（Android bionic），直接溢出破坏相邻局部变量
+     * (sorted / site_count / snaps)，导致 first_seen 垃圾值 + time_series 为空 */
+    static mtt_leak_table_t leak_table;
     memset(&leak_table, 0, sizeof(leak_table));
 
     for (size_t i = 0; i < snap_count; i++) {
@@ -689,29 +723,54 @@ static void scan_and_report_locked(void)
             g_reporter.cached_site_count = 0;
         }
 
-        /* 深拷贝 pairs 结构体数组 */
+        /* 深拷贝 pairs 结构体数组。
+         * 注意：pairs[i].site 指向 sorted[i]（原始 leak_table 节点），
+         * cleanup 阶段会释放原始节点，导致 cached_pairs 中的 site 指针悬空。
+         * 必须在深拷贝 cached_sites 之后，将 pairs 的 site 指针修正为
+         * 指向深拷贝后的 cached_sites[i]，否则 HTTP 线程通过指针比较
+         * 查找 stack_entry 时永远无法匹配（指针不同），栈帧始终为空。 */
         if (pairs != NULL && site_count > 0) {
             size_t pairs_bytes = site_count * sizeof(site_stack_pair_t);
             g_reporter.cached_pairs = raw_malloc(pairs_bytes);
             if (g_reporter.cached_pairs != NULL) {
                 memcpy(g_reporter.cached_pairs, pairs, pairs_bytes);
+                /* 修正 site 指针：指向深拷贝后的 cached_sites 而非即将释放的原始节点 */
+                if (g_reporter.cached_sites != NULL) {
+                    site_stack_pair_t *pp = (site_stack_pair_t*)g_reporter.cached_pairs;
+                    for (size_t i = 0; i < site_count; i++) {
+                        pp[i].site = g_reporter.cached_sites[i];
+                    }
+                }
             }
         }
 
-        /* 复制时序数据（最多 360 点） */
-        if (mtt_ts_is_ready()) {
-            mtt_ts_point_t ts_buf[360] = {{0}};
-            uint32_t ts_count = 0;
-            if (mtt_ts_get_range(0, ts_buf, 360, &ts_count) == 0 && ts_count > 0) {
-                if (g_reporter.cached_ts_data != NULL && raw_free != NULL)
-                    raw_free(g_reporter.cached_ts_data);
-                g_reporter.cached_ts_data = (mtt_ts_point_t*)raw_malloc(
-                    ts_count * sizeof(mtt_ts_point_t));
-                if (g_reporter.cached_ts_data != NULL) {
-                    memcpy(g_reporter.cached_ts_data, ts_buf,
-                           ts_count * sizeof(mtt_ts_point_t));
-                    g_reporter.cached_ts_count = ts_count;
+        /* 复制时序数据（最多 360 点）。
+         * 使用堆分配（非栈上 VLA）以避免 ARM 嵌入式系统默认栈过小导致溢出。
+         * 360 * sizeof(mtt_ts_point_t) ≈ 17KB（64-bit）或 8.5KB（32-bit），
+         * 可能超出默认 pthread 栈大小（嵌入式系统通常仅 8KB）。
+         * 栈溢出会静默破坏相邻栈帧中的局部变量（如 sorted、site_count 等），
+         * 导致 first_seen 等字段被写入随机数据。 */
+        if (mtt_ts_is_ready() && raw_malloc != NULL) {
+            mtt_ts_point_t *ts_buf = (mtt_ts_point_t*)raw_malloc(
+                360 * sizeof(mtt_ts_point_t));
+            if (ts_buf != NULL) {
+                memset(ts_buf, 0, 360 * sizeof(mtt_ts_point_t));
+                uint32_t ts_count = 0;
+                if (mtt_ts_get_range(0, ts_buf, 360, &ts_count) == 0 && ts_count > 0) {
+                    mtt_ts_point_t *new_data = (mtt_ts_point_t*)raw_malloc(
+                        ts_count * sizeof(mtt_ts_point_t));
+                    if (new_data != NULL) {
+                        memcpy(new_data, ts_buf,
+                               ts_count * sizeof(mtt_ts_point_t));
+                        /* 新数据就绪后才释放旧数据，避免中间态 */
+                        if (g_reporter.cached_ts_data != NULL && raw_free != NULL)
+                            raw_free(g_reporter.cached_ts_data);
+                        g_reporter.cached_ts_data = new_data;
+                        g_reporter.cached_ts_count = ts_count;
+                    }
+                    /* 若 new_data 分配失败，保留旧 cached_ts_data 不变 */
                 }
+                raw_free(ts_buf);
             }
         }
 
