@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -513,12 +514,50 @@ static const char g_dashboard_html[] =
  *                       JSON 序列化辅助函数                                  *
  * ======================================================================== */
 
+/**
+ * 写入 JSON 安全字符串到 fd。
+ *
+ * 对双引号、反斜杠和控制字符进行转义（\b \f \n \r \t \\ \"），
+ * 确保输出为合法 JSON 字符串。每个字符逐字节写入以简化错误处理。
+ *
+ * @param fd  目标文件描述符
+ * @param s   C 字符串（null-terminated）
+ */
+static void write_json_string(int fd, const char *s)
+{
+    if (s == NULL) {
+        write(fd, "\"\"", 2);
+        return;
+    }
+    write(fd, "\"", 1);
+    for (const char *p = s; *p != '\0'; p++) {
+        switch (*p) {
+        case '"':  write(fd, "\\\"", 2); break;
+        case '\\': write(fd, "\\\\", 2); break;
+        case '\b': write(fd, "\\b",  2); break;
+        case '\f': write(fd, "\\f",  2); break;
+        case '\n': write(fd, "\\n",  2); break;
+        case '\r': write(fd, "\\r",  2); break;
+        case '\t': write(fd, "\\t",  2); break;
+        default:
+            /* 0x00-0x1F 范围内的其他控制字符用 \\u00XX 编码，
+             * 可打印字符直接输出。 */
+            if ((unsigned char)*p < 0x20) {
+                char esc[8];
+                int n = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned char)*p);
+                if (n > 0) write(fd, esc, (size_t)n);
+            } else {
+                write(fd, p, 1);
+            }
+            break;
+        }
+    }
+    write(fd, "\"", 1);
+}
+
 /* ======================================================================== *
  *                        HTTP 请求处理器                                     *
  * ======================================================================== */
-
-/** reporter 外部单例引用（定义在 reporter.c） */
-extern void* g_reporter_mtt_reporter_t;
 
 /**
  * 处理 GET / — 返回仪表盘 HTML。
@@ -603,11 +642,16 @@ static void handle_api_data(int client_fd)
     static char buf[8192]; /* 静态分配：避免 ARM 嵌入式栈溢出（默认栈 8KB） */
     int len;
 
+    /* 先写 JSON 前导部分（proc_name 之后由 write_json_string 写入） */
     len = snprintf(buf, sizeof(buf),
-        "{\"pid\":%d,\"proc_name\":\"%s\",\"session_start\":%lld,\"last_scan\":%lld,"
+        "{\"pid\":%d,\"proc_name\":",
+        (int)getpid());
+    write(client_fd, buf, (size_t)len);
+    write_json_string(client_fd, proc_name);
+    len = snprintf(buf, sizeof(buf),
+        ",\"session_start\":%lld,\"last_scan\":%lld,"
         "\"stats\":{\"current_bytes\":%zu,\"peak_bytes\":%zu,\"alloc_count\":%zu,"
         "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu}",
-        (int)getpid(), proc_name,
         (long long)rep->session_start,
         (long long)time(NULL),
         cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc);
@@ -702,15 +746,8 @@ static void json_write_leak_site_stdout(mtt_leak_site_t *site,
                 || strstr(sym, "capture_stack") != NULL
                 || strstr(sym, "backtrace") != NULL)
                 continue;
-            off = snprintf(buf, sizeof(buf), "%s", first ? "" : ",");
-            write(fd, buf, (size_t)off);
-            /* 写入 JSON 字符串引用 */
-            write(fd, "\"", 1);
-            for (const char *p = sym; *p != '\0'; p++) {
-                if (*p == '"' || *p == '\\') write(fd, "\\", 1);
-                write(fd, p, 1);
-            }
-            write(fd, "\"", 1);
+            if (!first) write(fd, ",", 1);
+            write_json_string(fd, sym);
             first = 0;
         }
     }
@@ -817,6 +854,11 @@ static void* http_thread_fn(void *arg)
 {
     (void)arg;
     pthread_detach(pthread_self());
+
+    /* 忽略 SIGPIPE：客户端断开连接时 write() 返回 EPIPE 而不终止进程。
+     * 若使用 SIG_DFL（默认），浏览器关闭标签页或刷新页面时，
+     * 正在执行的 write() 会触发 SIGPIPE 导致整个进程终止。 */
+    signal(SIGPIPE, SIG_IGN);
 
     /* HTTP 线程中的 raw_malloc 调用不受 g_in_hook 保护，
      * 但本模块中所有分配都使用标准 malloc（因为此线程不是 hook 路径）。
