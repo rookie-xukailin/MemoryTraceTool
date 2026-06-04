@@ -72,7 +72,10 @@ void mtt_flamegraph_write(const char *log_dir, const char *proc_name,
 
         /* 收集非内部帧的函数名（过滤掉内部帧和库名部分） */
         /* 格式: "func+0xOFFSET (libname)" → 提取 "func+0xOFFSET" */
-        char frames[MTT_STACK_DEPTH][MTT_SYMBOL_MAX];
+        /* static 分配：MTT_STACK_DEPTH(16) * MTT_SYMBOL_MAX(256) = 4096 字节，
+         * 在 ARM32 嵌入式系统 8KB 默认线程栈上会溢出。存到 .bss 段安全。
+         * 本函数仅在 reporter 线程中调用（scan_mutex 保护），无并发风险。 */
+        static char frames[MTT_STACK_DEPTH][MTT_SYMBOL_MAX];
         int frame_count = 0;
 
         for (int j = 0; j < se->frame_count && frame_count < MTT_STACK_DEPTH; j++) {
