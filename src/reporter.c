@@ -650,8 +650,13 @@ static void scan_and_report_locked(void)
     {
         pthread_mutex_lock(&g_reporter.cache_lock);
 
-        /* 释放旧的缓存数据 */
+        /* 释放旧的缓存数据（包括深拷贝的 leak site 结构体） */
         if (g_reporter.cached_sites != NULL && raw_free != NULL) {
+            /* 先释放每个深拷贝的 leak site 结构体指针 */
+            for (size_t i = 0; i < g_reporter.cached_site_count; i++) {
+                if (g_reporter.cached_sites[i] != NULL)
+                    raw_free(g_reporter.cached_sites[i]);
+            }
             raw_free(g_reporter.cached_sites);
             g_reporter.cached_sites = NULL;
         }
@@ -660,12 +665,24 @@ static void scan_and_report_locked(void)
             g_reporter.cached_pairs = NULL;
         }
 
-        /* 深拷贝 sorted 数组 */
+        /* 深拷贝 sorted 数组 — 必须深拷贝每个 leak site 结构体，
+         * 因为 cleanup 阶段会释放 leak_table 中的原始 struct，
+         * 若仅拷贝指针会导致 HTTP 线程读取已释放内存（use-after-free）。 */
         if (sorted != NULL && site_count > 0) {
             size_t sorted_bytes = site_count * sizeof(mtt_leak_site_t*);
             g_reporter.cached_sites = (mtt_leak_site_t**)raw_malloc(sorted_bytes);
             if (g_reporter.cached_sites != NULL) {
-                memcpy(g_reporter.cached_sites, sorted, sorted_bytes);
+                for (size_t i = 0; i < site_count; i++) {
+                    mtt_leak_site_t *copy = (mtt_leak_site_t*)raw_malloc(
+                        sizeof(mtt_leak_site_t));
+                    if (copy != NULL) {
+                        memcpy(copy, sorted[i], sizeof(mtt_leak_site_t));
+                        copy->next = NULL; /* 不复刻链表指针（外泄） */
+                        g_reporter.cached_sites[i] = copy;
+                    } else {
+                        g_reporter.cached_sites[i] = NULL;
+                    }
+                }
                 g_reporter.cached_site_count = site_count;
             }
         } else {
@@ -755,6 +772,9 @@ static void* reporter_thread_fn(void *arg)
 
     /* 等 1 秒让业务代码启动并产生分配，然后做首次扫描 */
     sleep(1);
+    /* 记录第一个时序数据点 — 必须在首次 scan_and_report 之前，
+     * 否则首次扫描的缓存中 time_series 将为空数组。 */
+    mtt_ts_record_point();
     scan_and_report();
 
     while (atomic_load_explicit(&g_reporter.running, memory_order_acquire)) {

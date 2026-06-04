@@ -279,15 +279,33 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
             func_off = (char*)addr - (char*)info.dli_saddr;
             if (func_off < 0) func_off = 0;
         } else {
-            /* dli_sname 为 NULL：尝试 backtrace_symbols 提取函数名 */
+            /* dli_sname 为 NULL：尝试 backtrace_symbols 提取函数名。
+             * 在不使用 -rdynamic 编译时，backtrace_symbols 返回格式为
+             * "binary(+0xOFFSET) [0xADDR]" — 函数名为空，但偏移仍在。
+             * 需同时处理函数名为空和不为空两种情况。 */
 #if MTT_HAS_BACKTRACE
             char **syms = backtrace_symbols(&addr, 1);
             if (syms != NULL && syms[0] != NULL) {
                 char *paren = strchr(syms[0], '(');
                 char *plus  = (paren != NULL) ? strchr(paren, '+') : NULL;
-                if (paren != NULL && plus != NULL && plus > paren) {
+                char *rparen = (paren != NULL) ? strchr(paren, ')') : NULL;
+                if (paren != NULL && plus != NULL && rparen != NULL
+                    && plus > paren && plus < rparen) {
+                    /* 尝试提取函数名（可能为空字符串） */
                     size_t nlen = (size_t)(plus - paren - 1);
-                    if (nlen > 0 && nlen < sizeof(func_name)) {
+                    if (nlen > 0) {
+                        if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
+                        memcpy(func_name, paren + 1, nlen);
+                        func_name[nlen] = '\0';
+                    }
+                    /* 无论函数名是否为空，都提取偏移（相对于 binary 加载地址，
+                     * 可用于 addr2line -e binary 0xOFFSET） */
+                    func_off = (ptrdiff_t)strtoul(plus + 1, NULL, 16);
+                } else if (paren != NULL && rparen != NULL && rparen > paren + 1) {
+                    /* 无 '+' 号但有函数名：格式 "binary(func)" */
+                    size_t nlen = (size_t)(rparen - paren - 1);
+                    if (nlen > 0) {
+                        if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
                         memcpy(func_name, paren + 1, nlen);
                         func_name[nlen] = '\0';
                     }
@@ -297,8 +315,11 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
 #endif
             if (func_name[0] == '\0')
                 snprintf(func_name, sizeof(func_name), "??");
-            func_off = (char*)addr - (char*)info.dli_fbase;
-            if (func_off < 0) func_off = 0;
+            /* 若 backtrace_symbols 未提供偏移，回退到 dli_fbase 相对偏移 */
+            if (func_off == 0) {
+                func_off = (char*)addr - (char*)info.dli_fbase;
+                if (func_off < 0) func_off = 0;
+            }
         }
     } else {
         /* dladdr 完全失败：从 backtrace_symbols 解析 */
