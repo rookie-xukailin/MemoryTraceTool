@@ -234,8 +234,7 @@ void* calloc(size_t count, size_t size)
 {
     first_call_diag("calloc", &g_first_calloc_diag);
 
-    /* 递归保护 */
-    int saved_hook = g_in_hook;
+    /* 递归保护：已在 hook 中则直接透传 raw_malloc */
     if (g_in_hook) {
         mtt_resolve_raw_allocators();
         if (raw_malloc == NULL) return NULL;
@@ -245,20 +244,19 @@ void* calloc(size_t count, size_t size)
         if (p != NULL) memset(p, 0, total);
         return p;
     }
-    g_in_hook = 1;
 
     /* 整数溢出检查 */
-    if (count > 0 && size > SIZE_MAX / count) {
-        g_in_hook = saved_hook;
+    if (count > 0 && size > SIZE_MAX / count)
         return NULL;
-    }
     size_t total = count * size;
 
-    /* 通过本文件的 malloc() 分配（会再次进入 hook，但 g_in_hook=1 时透传） */
+    /* 通过本文件的 malloc() 分配并追踪。
+     * 注意：不在此处设置 g_in_hook，让 malloc() 内部自行管理
+     * 其 save/restore。之前 g_in_hook=1 导致 malloc() 透传到 raw_malloc
+     * 而不创建追踪记录，calloc 分配的内存完全不被追踪。 */
     void *ptr = malloc(total);
     if (ptr != NULL) memset(ptr, 0, total);
 
-    g_in_hook = saved_hook;
     return ptr;
 }
 
