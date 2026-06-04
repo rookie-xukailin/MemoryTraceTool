@@ -206,26 +206,38 @@ void mtt_resolve_raw_allocators(void)
     if (real_calloc  != NULL) raw_calloc  = real_calloc;
     if (real_realloc != NULL) raw_realloc = real_realloc;
 
-    /* RTLD_NEXT 失败时遍历 libc 候选库列表（dlopen/ptrace 注入路径） */
-    if (raw_malloc == NULL || raw_free == NULL ||
-        raw_calloc == NULL || raw_realloc == NULL) {
+    /* RTLD_NEXT 失败时遍历 libc 候选库列表（dlopen/ptrace 注入路径）。
+     * 通过检查 raw_* 是否仍为 bootstrap 函数来判断 RTLD_NEXT 是否成功，
+     * 而非检查 NULL（bootstrap 预填充使 raw_* 始终非 NULL，
+     * 原 NULL 检查条件始终为 false，导致 fallback 为死代码）。 */
+    if (raw_malloc == bootstrap_malloc || raw_free == bootstrap_free ||
+        raw_calloc == bootstrap_calloc || raw_realloc == bootstrap_realloc) {
         for (int i = 0; libc_candidates[i] != NULL; i++) {
             void *libc_handle = dlopen(libc_candidates[i], RTLD_LAZY);
             if (libc_handle == NULL) continue;
 
-            if (raw_malloc  == NULL)
-                raw_malloc  = (raw_malloc_fn)dlsym(libc_handle, "malloc");
-            if (raw_free    == NULL)
-                raw_free    = (raw_free_fn)dlsym(libc_handle, "free");
-            if (raw_calloc  == NULL)
-                raw_calloc  = (raw_calloc_fn)dlsym(libc_handle, "calloc");
-            if (raw_realloc == NULL)
-                raw_realloc = (raw_realloc_fn)dlsym(libc_handle, "realloc");
+            /* 对每个 dlsym 返回值判空后再赋值，防止覆盖已有的 bootstrap 值 */
+            if (raw_malloc == bootstrap_malloc) {
+                raw_malloc_fn fn = (raw_malloc_fn)dlsym(libc_handle, "malloc");
+                if (fn != NULL) raw_malloc = fn;
+            }
+            if (raw_free == bootstrap_free) {
+                raw_free_fn fn = (raw_free_fn)dlsym(libc_handle, "free");
+                if (fn != NULL) raw_free = fn;
+            }
+            if (raw_calloc == bootstrap_calloc) {
+                raw_calloc_fn fn = (raw_calloc_fn)dlsym(libc_handle, "calloc");
+                if (fn != NULL) raw_calloc = fn;
+            }
+            if (raw_realloc == bootstrap_realloc) {
+                raw_realloc_fn fn = (raw_realloc_fn)dlsym(libc_handle, "realloc");
+                if (fn != NULL) raw_realloc = fn;
+            }
 
             /* 不 dlclose：避免 raw_* 悬空。
              * 仅在全部解析完成后才跳出，否则继续尝试下一个候选库。 */
-            if (raw_malloc != NULL && raw_free != NULL &&
-                raw_calloc != NULL && raw_realloc != NULL)
+            if (raw_malloc != bootstrap_malloc && raw_free != bootstrap_free &&
+                raw_calloc != bootstrap_calloc && raw_realloc != bootstrap_realloc)
                 break;
         }
     }

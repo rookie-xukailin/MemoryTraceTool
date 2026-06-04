@@ -353,6 +353,9 @@ static void scan_and_report_locked(void)
 
         if (site != NULL) {
             /* 命中已有站点：累加 */
+            /* 防御：若 first_seen 因历史原因未设置（值为 0），回填为当前快照时间或扫描时间 */
+            if (site->first_seen == 0)
+                site->first_seen = (sn->timestamp > 0) ? sn->timestamp : now;
             site->count++;
             site->total_size += sn->size;
             if (sn->timestamp > site->last_seen)
@@ -371,7 +374,8 @@ static void scan_and_report_locked(void)
 
             memset(new_site, 0, sizeof(*new_site));
             new_site->stack_hash    = hash;
-            new_site->first_seen    = sn->timestamp;
+            /* 防御：若快照时间戳异常（0），回退为当前扫描时间 */
+            new_site->first_seen    = (sn->timestamp > 0) ? sn->timestamp : now;
             new_site->last_seen     = sn->timestamp;
             new_site->count         = 1;
             new_site->per_leak_size = sn->size;

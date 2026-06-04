@@ -95,7 +95,7 @@ int main(void)
 
     printf("=== MemoryTraceTool Controlled Leak Demo ===\n");
     printf("PID:        %d\n", (int)getpid());
-    printf("Duration:   %d min (%d sec)\n", DEMO_DURATION_SEC / 60, DEMO_DURATION_SEC);
+    printf("Duration:   indefinite (runs until SIGINT/SIGTERM)\n");
     printf("Leak limit: %s\n", fmt_size(LEAK_LIMIT_BYTES, size_buf));
     printf("Leak range: %s ~ %s per allocation\n",
            fmt_size(LEAK_MIN_BYTES, size_buf),
@@ -117,13 +117,6 @@ int main(void)
     while (g_running) {
         time_t now = time(NULL);
         time_t elapsed = now - start;
-
-        /* 超过演示时长则退出 */
-        if (elapsed >= DEMO_DURATION_SEC) {
-            printf("\nDemo duration reached (%d min). Exiting.\n",
-                   DEMO_DURATION_SEC / 60);
-            break;
-        }
 
         /* 检查是否达到泄漏上限 */
         if (g_total_leaked >= LEAK_LIMIT_BYTES && !g_stop_leaking) {

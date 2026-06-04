@@ -19,7 +19,7 @@ LIB_OBJS = $(BUILD_DIR)/hooks.o $(BUILD_DIR)/tracker.o \
 
 SHARED_LIB = $(BUILD_DIR)/libmemorytracetool.so
 
-.PHONY: all clean demo demo_preload demo_long_running test
+.PHONY: all clean demo demo_preload demo_long_running test test_stability test_all
 
 all: $(SHARED_LIB)
 	@rm -f $(BUILD_DIR)/*.o
@@ -108,6 +108,16 @@ test: $(SHARED_LIB) tests/test_basic.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/test_basic tests/test_basic.c \
 		-L$(BUILD_DIR) -lmemorytracetool $(LDFLAGS)
 	LD_LIBRARY_PATH=$(BUILD_DIR) $(BUILD_DIR)/test_basic
+
+test_stability: $(SHARED_LIB) tests/test_stability.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/test_stability tests/test_stability.c \
+		-L$(BUILD_DIR) -lmemorytracetool $(LDFLAGS)
+	LD_LIBRARY_PATH=$(BUILD_DIR) $(BUILD_DIR)/test_stability
+
+test_all: test test_stability
+	@echo "Both C tests completed. Run frontend tests separately:"
+	@echo "  python3 tests/test_frontend_json.py"
+	@echo "  python3 tests/test_frontend_html.py"
 
 # =====================================================
 #  清理

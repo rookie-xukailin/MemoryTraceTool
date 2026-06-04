@@ -638,7 +638,7 @@ static void handle_api_data(int client_fd)
             }
         }
 
-        if (fallback_pts != NULL) raw_free(fallback_pts);
+        if (fallback_pts != NULL && raw_free != NULL) raw_free(fallback_pts);
     }
     write(client_fd, "]", 1);
 
