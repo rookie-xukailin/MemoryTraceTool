@@ -77,6 +77,10 @@ demo_preload: $(SHARED_LIB) examples/demo_preload.c | $(BUILD_DIR)
 demo_long_running: $(SHARED_LIB) examples/demo_long_running.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $(BUILD_DIR)/demo_long_running examples/demo_long_running.c -lpthread
 
+# 可控泄漏示例（20 分钟 ~50MB，配合 Web 仪表盘观察）
+demo_controlled_leak: $(SHARED_LIB) examples/demo_controlled_leak.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $(BUILD_DIR)/demo_controlled_leak examples/demo_controlled_leak.c -lpthread
+
 # =====================================================
 #  运行示例
 # =====================================================
@@ -89,6 +93,9 @@ run_demo_preload: demo_preload
 
 run_demo_long_running: demo_long_running
 	LD_PRELOAD=$(SHARED_LIB) $(BUILD_DIR)/demo_long_running
+
+run_demo_controlled_leak: demo_controlled_leak
+	LD_PRELOAD=$(SHARED_LIB) $(BUILD_DIR)/demo_controlled_leak
 
 # =====================================================
 #  测试
