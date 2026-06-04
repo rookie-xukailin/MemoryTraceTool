@@ -491,9 +491,11 @@ static void json_write_leak_site_stdout(mtt_leak_site_t *site,
     static char buf[4096]; /* 静态分配：避免 ARM 栈溢出 */
     int off = snprintf(buf, sizeof(buf),
         "{\"hash\":\"0x%llx\",\"count\":%zu,\"per_leak_size\":%zu,"
-        "\"total_size\":%zu,\"first_seen\":%ld,\"last_seen\":%ld,\"stack\":[",
+        "\"total_size\":%zu,\"diff_size\":%zu,\"is_expired\":%d,"
+        "\"first_seen\":%ld,\"last_seen\":%ld,\"stack\":[",
         (unsigned long long)site->stack_hash, site->count,
         site->per_leak_size, site->total_size,
+        site->diff_size, site->is_expired,
         (long)site->first_seen, (long)site->last_seen);
     write(fd, buf, (size_t)off);
 

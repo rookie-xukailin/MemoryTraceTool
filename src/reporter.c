@@ -162,6 +162,21 @@ static int is_internal_frame(const char *symbol)
     if (strstr(symbol, "capture_stack") != NULL) return 1;
     if (strstr(symbol, "backtrace") != NULL) return 1;
     if (strstr(symbol, "__libc_start") != NULL) return 0;   /* libc 入口可以显示 */
+
+    /* 检查库黑名单（借鉴 libleak LEAK_LIB_BLACKLIST） */
+    mtt_state_t *st = mtt_state_get();
+    if (st != NULL && st->lib_blacklist_ready && st->lib_blacklist[0] != '\0') {
+        char blist[512] = {0};
+        memcpy(blist, st->lib_blacklist, sizeof(blist) - 1);
+        char *token = strtok(blist, ",");
+        while (token != NULL) {
+            while (*token == ' ' || *token == '\t') token++;
+            if (token[0] != '\0' && strstr(symbol, token) != NULL)
+                return 1;
+            token = strtok(NULL, ",");
+        }
+    }
+
     return 0;
 }
 
@@ -293,6 +308,12 @@ static void scan_and_report_locked(void)
             site->total_size += sn->size;
             if (sn->timestamp > site->last_seen)
                 site->last_seen = sn->timestamp;
+            /* 存活时间判定（借鉴 libleak LEAK_EXPIRE） */
+            if (!site->is_expired) {
+                time_t threshold = atomic_load_explicit(&s->leak_threshold_sec, memory_order_relaxed);
+                if (threshold > 0 && (now - sn->timestamp) > (long)threshold)
+                    site->is_expired = 1;
+            }
         } else if (leak_table.count < MTT_LEAK_DEDUP_SIZE) {
             /* 新建站点 */
             mtt_leak_site_t *new_site = (mtt_leak_site_t*)raw_malloc(
@@ -306,6 +327,12 @@ static void scan_and_report_locked(void)
             new_site->count         = 1;
             new_site->per_leak_size = sn->size;
             new_site->total_size    = sn->size;
+            new_site->diff_size     = 0;
+            /* 存活时间判定 */
+            {
+                time_t threshold = atomic_load_explicit(&s->leak_threshold_sec, memory_order_relaxed);
+                new_site->is_expired = (threshold > 0 && (now - sn->timestamp) > (long)threshold) ? 1 : 0;
+            }
 
             /* 插入链表头部 */
             new_site->next = leak_table.entries[bucket];
@@ -355,6 +382,33 @@ static void scan_and_report_locked(void)
             /* 按 total_size 降序排列 */
             qsort(sorted, idx, sizeof(mtt_leak_site_t*), cmp_leak_by_size);
             site_count = idx;
+        }
+    }
+
+    /* ---- 阶段 4.5: 差值计算（借鉴 jemalloc --base） ---- */
+    if (sorted != NULL && site_count > 0) {
+        for (size_t i = 0; i < site_count; i++) {
+            size_t prev_total = 0;
+            for (size_t j = 0; j < g_reporter.prev_diff_count; j++) {
+                if (g_reporter.prev_diff_hashes[j] == sorted[i]->stack_hash) {
+                    prev_total = g_reporter.prev_diff_sizes[j];
+                    break;
+                }
+            }
+            sorted[i]->diff_size = (sorted[i]->total_size > prev_total)
+                ? (sorted[i]->total_size - prev_total) : 0;
+        }
+    }
+
+    /* ---- 阶段 4.6: 统计过期/未过期计数 + 更新全局计数器 ---- */
+    {
+        size_t expired_count = 0;
+        for (size_t i = 0; i < site_count; i++) {
+            if (sorted != NULL && sorted[i]->is_expired)
+                expired_count++;
+        }
+        if (st != NULL) {
+            atomic_store_explicit(&st->expired_alloc_count, expired_count, memory_order_relaxed);
         }
     }
 
@@ -493,12 +547,24 @@ static void scan_and_report_locked(void)
                     "--- Leak #%zu ---\n"
                     "Count:        %zu\n"
                     "Per-leak:     %s\n"
-                    "Total:        %s\n"
-                    "Frequency:    ",
+                    "Total:        %s\n",
                     i + 1,
                     site->count,
                     fmt_bytes(site->per_leak_size, size_buf, sizeof(size_buf)),
                     fmt_bytes(site->total_size, total_buf, sizeof(total_buf)));
+
+                /* 差值显示（借鉴 jemalloc --base） */
+                if (site->diff_size > 0) {
+                    char diff_buf[32] = {0};
+                    fprintf(fp, "Growth:       +%s (since last scan)\n",
+                            fmt_bytes(site->diff_size, diff_buf, sizeof(diff_buf)));
+                }
+
+                /* 存活时间判定（借鉴 libleak LEAK_EXPIRE） */
+                fprintf(fp, "Confidence:   %s\n",
+                        site->is_expired ? "probable leak" : "possible leak");
+
+                fprintf(fp, "Frequency:    ");
                 fmt_frequency(frequency, freq_buf, sizeof(freq_buf));
                 fprintf(fp, "%s\n", freq_buf);
 
@@ -546,6 +612,30 @@ static void scan_and_report_locked(void)
         mtt_flamegraph_write(log_dir, proc_name, sorted, site_count,
                              (void**)pairs);
     }
+
+    /* ---- 阶段 6.5: 保存本次结果用于下次扫描差值计算（借鉴 jemalloc --base） ---- */
+    if (raw_free != NULL) {
+        if (g_reporter.prev_diff_hashes) raw_free(g_reporter.prev_diff_hashes);
+        if (g_reporter.prev_diff_sizes) raw_free(g_reporter.prev_diff_sizes);
+    }
+    g_reporter.prev_diff_hashes = NULL;
+    g_reporter.prev_diff_sizes = NULL;
+    g_reporter.prev_diff_count = 0;
+
+    if (sorted != NULL && site_count > 0 && raw_malloc != NULL) {
+        g_reporter.prev_diff_hashes = (uint64_t*)raw_malloc(
+            site_count * sizeof(uint64_t));
+        g_reporter.prev_diff_sizes = (size_t*)raw_malloc(
+            site_count * sizeof(size_t));
+        if (g_reporter.prev_diff_hashes != NULL && g_reporter.prev_diff_sizes != NULL) {
+            for (size_t i = 0; i < site_count; i++) {
+                g_reporter.prev_diff_hashes[i] = sorted[i]->stack_hash;
+                g_reporter.prev_diff_sizes[i] = sorted[i]->total_size;
+            }
+            g_reporter.prev_diff_count = site_count;
+        }
+    }
+    g_reporter.prev_scan_time = now;
 
     /* ---- 阶段 7: 更新 HTTP 缓存 ---- */
     {

@@ -191,6 +191,10 @@ typedef struct {
     _Atomic size_t      expired_alloc_count;        /* 过期但未释放的分配计数 */
     _Atomic size_t      free_expired_count;         /* 过期后被释放的计数（late-free） */
 
+    /* 库黑名单（借鉴 libleak LEAK_LIB_BLACKLIST） */
+    char                lib_blacklist[512];          /* 逗号分隔的 .so 名列表 */
+    int                 lib_blacklist_ready;          /* 黑名单是否已解析 */
+
     /* 进程信息 */
     char                proc_name[256];             /* 进程名（来自 /proc/self/exe） */
     int                 proc_name_ready;            /* 进程名是否已读取（0=未, 1=已） */
@@ -263,6 +267,7 @@ void         mtt_entry_remove(mtt_state_t *s, const void *ptr);
 int          mtt_should_track(mtt_state_t *s, size_t size);
 int          mtt_is_over_capacity(mtt_state_t *s);
 int          mtt_is_startup_phase(mtt_state_t *s);
+int          mtt_is_blacklisted(mtt_state_t *s, const char *symbol);
 void         mtt_capture_stack(mtt_entry_t *entry);
 
 /* reporter.c */

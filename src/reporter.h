@@ -24,6 +24,8 @@ typedef struct mtt_leak_site {
     size_t    count;           /* 当前未释放的分配次数 */
     size_t    per_leak_size;   /* 单次泄漏大小（字节） */
     size_t    total_size;      /* 累计泄漏大小（count × per_leak_size） */
+    size_t    diff_size;       /* 与上次扫描的总大小差值（借鉴 jemalloc --base） */
+    int       is_expired;      /* 是否存活超过阈值（1=probable leak, 0=possible leak） */
     struct mtt_leak_site *next; /* 哈希碰撞链表 */
 } mtt_leak_site_t;
 
@@ -51,6 +53,12 @@ typedef struct {
     mtt_ts_point_t   *cached_ts_data;            /* 时序数据副本 */
     uint32_t          cached_ts_count;           /* 时序数据点数 */
     pthread_mutex_t   cache_lock;                /* 保护缓存读写 */
+
+    /* 差值报告：上次扫描结果（借鉴 jemalloc --base） */
+    uint64_t         *prev_diff_hashes;          /* 上次站点 hash 数组 */
+    size_t           *prev_diff_sizes;           /* 上次站点 total_size 数组 */
+    size_t            prev_diff_count;           /* 上次站点数量 */
+    time_t            prev_scan_time;            /* 上次扫描时间 */
 } mtt_reporter_t;
 
 /* ---- API ---- */

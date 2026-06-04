@@ -344,6 +344,35 @@ int mtt_should_track(mtt_state_t *s, size_t size)
 }
 
 /**
+ * 检查调用栈帧中是否包含黑名单库（借鉴 libleak LEAK_LIB_BLACKLIST）。
+ *
+ * 遍历黑名单列表中逗号分隔的 .so 名称，
+ * 逐一检查是否出现在符号字符串中（子串匹配）。
+ *
+ * @param s       全局状态指针
+ * @param symbol  已解析的符号字符串，如 "func+0x1a4 (libblacklisted.so)"
+ * @return        1=在黑名单中（应跳过）, 0=不在黑名单中
+ */
+int mtt_is_blacklisted(mtt_state_t *s, const char *symbol)
+{
+    if (s == NULL || symbol == NULL || !s->lib_blacklist_ready) return 0;
+    if (s->lib_blacklist[0] == '\0') return 0;
+
+    /* 遍历逗号分隔的黑名单列表，检查符号中是否包含目标库名 */
+    char buf[512] = {0};
+    memcpy(buf, s->lib_blacklist, sizeof(buf) - 1);
+    char *token = strtok(buf, ",");
+    while (token != NULL) {
+        /* 跳过前导空白 */
+        while (*token == ' ' || *token == '\t') token++;
+        if (token[0] != '\0' && strstr(symbol, token) != NULL)
+            return 1;
+        token = strtok(NULL, ",");
+    }
+    return 0;
+}
+
+/**
  * 检查当前是否处于启动阶段（应跳过追踪）。
  *
  * 当 MTT_SKIP_STARTUP_SEC > 0 时，在指定时间内不追踪分配，
@@ -602,6 +631,19 @@ void mtt_ensure_init(void)
             int ss = atoi(env_skip);
             if (ss >= 0)
                 want_skip_startup = (time_t)ss;
+        }
+
+        /* 库黑名单（MTT_LIB_BLACKLIST=libfoo.so,libbar.so — 借鉴 libleak） */
+        const char *env_blacklist = getenv("MTT_LIB_BLACKLIST");
+        if (env_blacklist != NULL && env_blacklist[0] != '\0') {
+            size_t blen = strlen(env_blacklist);
+            if (blen >= sizeof(s->lib_blacklist)) blen = sizeof(s->lib_blacklist) - 1;
+            memcpy(s->lib_blacklist, env_blacklist, blen);
+            s->lib_blacklist[blen] = '\0';
+            s->lib_blacklist_ready = 1;
+        } else {
+            s->lib_blacklist[0] = '\0';
+            s->lib_blacklist_ready = 0;
         }
     }
 

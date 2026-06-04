@@ -214,6 +214,12 @@ void free(void *ptr)
         /* 临时分配检测：寿命<1秒→大概率非泄漏（借鉴 heaptrack 临时分配检测） */
         if (time(NULL) - e->timestamp <= 1)
             atomic_fetch_add_explicit(&s->temp_alloc_count, 1, memory_order_relaxed);
+        /* 延迟释放追踪：若释放时已超泄漏阈值→曾是"可疑泄漏"但后来释放了（借鉴 libleak late-free） */
+        {
+            time_t threshold = atomic_load_explicit(&s->leak_threshold_sec, memory_order_relaxed);
+            if (threshold > 0 && (time(NULL) - e->timestamp) > threshold)
+                atomic_fetch_add_explicit(&s->free_expired_count, 1, memory_order_relaxed);
+        }
         mtt_entry_remove(s, ptr);
     }
     mtt_stripe_unlock(s, ptr);
