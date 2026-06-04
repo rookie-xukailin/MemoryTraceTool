@@ -564,15 +564,20 @@ static void write_json_string(int fd, const char *s)
  */
 static void handle_root(int client_fd)
 {
-    const char *header =
+    size_t body_len = strlen(g_dashboard_html);
+
+    char header[256];
+    int hdr_len = snprintf(header, sizeof(header),
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %zu\r\n"
         "Cache-Control: no-cache\r\n"
         "Connection: close\r\n"
-        "\r\n";
+        "\r\n", body_len);
 
-    if (write(client_fd, header, strlen(header)) < 0) return;
-    write(client_fd, g_dashboard_html, strlen(g_dashboard_html));
+    if (hdr_len < 0 || (size_t)hdr_len >= sizeof(header)) return;
+    if (write(client_fd, header, (size_t)hdr_len) < 0) return;
+    write(client_fd, g_dashboard_html, body_len);
 }
 
 /* 前向声明：写入单个泄漏站点 JSON 到 client fd */
@@ -648,12 +653,17 @@ static void handle_api_data(int client_fd)
         (int)getpid());
     write(client_fd, buf, (size_t)len);
     write_json_string(client_fd, proc_name);
+    /* 使用 reporter 记录的上次扫描时间（而非当前 time(NULL)），
+     * 确保前端显示的 "上次扫描" 与实际报告扫描时刻一致。 */
+    time_t last_scan = rep->prev_scan_time;
+    if (last_scan == 0) last_scan = rep->session_start;
+
     len = snprintf(buf, sizeof(buf),
         ",\"session_start\":%lld,\"last_scan\":%lld,"
         "\"stats\":{\"current_bytes\":%zu,\"peak_bytes\":%zu,\"alloc_count\":%zu,"
         "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu}",
         (long long)rep->session_start,
-        (long long)time(NULL),
+        (long long)last_scan,
         cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc);
     write(client_fd, buf, (size_t)len);
 
@@ -761,6 +771,10 @@ static void handle_api_leaks(int client_fd)
 {
     mtt_reporter_t *rep = mtt_reporter_get();
 
+    pthread_mutex_lock(&rep->cache_lock);
+
+    /* 响应头和 JSON 前导在持锁后写入，与 handle_api_data 模式一致，
+     * 避免先发送头部后阻塞在锁上导致客户端看到悬挂的 partial response。 */
     const char *header =
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: application/json; charset=utf-8\r\n"
@@ -769,8 +783,6 @@ static void handle_api_leaks(int client_fd)
         "\r\n";
     write(client_fd, header, strlen(header));
     write(client_fd, "{\"leaks\":[", 10);
-
-    pthread_mutex_lock(&rep->cache_lock);
 
     if (rep->cached_sites != NULL && rep->cached_site_count > 0) {
         int wrote_first = 0;
@@ -805,7 +817,7 @@ static void handle_404(int client_fd)
     char header[256] = {0};
     snprintf(header, sizeof(header),
         "HTTP/1.0 404 Not Found\r\n"
-        "Content-Type: application/json\r\n"
+        "Content-Type: application/json; charset=utf-8\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "\r\n", strlen(body));
