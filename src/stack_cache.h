@@ -33,7 +33,11 @@ typedef struct {
 
 /* ---- API ---- */
 
-/** 获取全局栈缓存单例 */
+/**
+ * 获取全局栈缓存单例。
+ *
+ * @return 全局栈缓存指针（永不为 NULL）
+ */
 mtt_stack_cache_t* mtt_stack_cache_get(void);
 
 /**
