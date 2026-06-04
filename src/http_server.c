@@ -425,12 +425,10 @@ static void handle_api_data(int client_fd)
             if (i > 0) write(client_fd, ",", 1);
             mtt_stack_entry_t *se = NULL;
             if (rep->cached_pairs != NULL) {
-                void **pp = rep->cached_pairs;
+                site_stack_pair_t *pp = (site_stack_pair_t*)rep->cached_pairs;
                 for (size_t j = 0; j < rep->cached_site_count; j++) {
-                    if (pp[j] == NULL) continue;
-                    mtt_leak_site_t *ps = *(mtt_leak_site_t**)pp[j];
-                    if (ps == rep->cached_sites[i]) {
-                        se = *((mtt_stack_entry_t**)((char*)pp[j] + sizeof(void*)));
+                    if (pp[j].site == rep->cached_sites[i]) {
+                        se = pp[j].stack_entry;
                         break;
                     }
                 }
@@ -506,12 +504,10 @@ static void handle_api_leaks(int client_fd)
             if (i > 0) write(client_fd, ",", 1);
             mtt_stack_entry_t *se = NULL;
             if (rep->cached_pairs != NULL) {
-                void **pp = rep->cached_pairs;
+                site_stack_pair_t *pp = (site_stack_pair_t*)rep->cached_pairs;
                 for (size_t j = 0; j < rep->cached_site_count; j++) {
-                    if (pp[j] == NULL) continue;
-                    mtt_leak_site_t *ps = *(mtt_leak_site_t**)pp[j];
-                    if (ps == rep->cached_sites[i]) {
-                        se = *((mtt_stack_entry_t**)((char*)pp[j] + sizeof(void*)));
+                    if (pp[j].site == rep->cached_sites[i]) {
+                        se = pp[j].stack_entry;
                         break;
                     }
                 }

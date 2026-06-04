@@ -29,6 +29,12 @@ typedef struct mtt_leak_site {
     struct mtt_leak_site *next; /* 哈希碰撞链表 */
 } mtt_leak_site_t;
 
+/** 泄漏站点 → 栈缓存的配对记录（报告输出用） */
+typedef struct {
+    mtt_leak_site_t  *site;               /* 泄漏站点指针 */
+    struct mtt_stack_entry *stack_entry;  /* 已解析的栈缓存条目 */
+} site_stack_pair_t;
+
 /** 泄漏去重表（开放哈希，数组+链表） */
 typedef struct {
     mtt_leak_site_t *entries[MTT_LEAK_DEDUP_SIZE];
@@ -49,7 +55,7 @@ typedef struct {
     /* HTTP 泄漏缓存：reporter 线程写入，HTTP 线程读取 */
     mtt_leak_site_t **cached_sites;              /* 排序后的泄漏站点指针数组（raw_malloc） */
     size_t            cached_site_count;         /* 缓存站点数 */
-    void            **cached_pairs;              /* site_stack_pair_t 数组（给 flamegraph 用） */
+    void             *cached_pairs;              /* site_stack_pair_t 结构体数组 */
     mtt_ts_point_t   *cached_ts_data;            /* 时序数据副本 */
     uint32_t          cached_ts_count;           /* 时序数据点数 */
     pthread_mutex_t   cache_lock;                /* 保护缓存读写 */

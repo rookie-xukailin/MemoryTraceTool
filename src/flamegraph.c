@@ -21,12 +21,6 @@
 #include <unistd.h>
 #include <errno.h>
 
-/* 前向声明：site_stack_pair_t 定义在 reporter.c 中 */
-typedef struct {
-    mtt_leak_site_t  *site;
-    mtt_stack_entry_t *stack_entry;
-} site_stack_pair_t;
-
 /**
  * 将泄漏站点列表写入 collapsed stacks 格式文件。
  *
@@ -42,11 +36,14 @@ typedef struct {
  */
 void mtt_flamegraph_write(const char *log_dir, const char *proc_name,
                           mtt_leak_site_t **sites, size_t count,
-                          void **pairs)
+                          void *pairs)
 {
     if (log_dir == NULL || proc_name == NULL || sites == NULL || pairs == NULL)
         return;
     if (count == 0) return;
+
+    /* pairs 实际是 site_stack_pair_t 结构体数组，按结构体步长索引 */
+    #define PAIR_AT(idx) ((site_stack_pair_t*)(pairs) + (idx))
 
     /* 构建 .folded 文件路径 */
     char fg_path[512] = {0};
@@ -67,7 +64,7 @@ void mtt_flamegraph_write(const char *log_dir, const char *proc_name,
     for (size_t i = 0; i < count; i++) {
         if (sites[i] == NULL || sites[i]->count == 0) continue;
 
-        site_stack_pair_t *pair = (site_stack_pair_t*)pairs[i];
+        site_stack_pair_t *pair = PAIR_AT(i);
         if (pair == NULL) continue;
 
         mtt_stack_entry_t *se = pair->stack_entry;

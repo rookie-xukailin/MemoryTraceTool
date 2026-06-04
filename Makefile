@@ -2,6 +2,9 @@ CROSS_COMPILE ?=
 CC       = $(CROSS_COMPILE)gcc
 CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
 LDFLAGS  = -lpthread -ldl -latomic
+# 可执行文件使用 -no-pie（PIE + LD_PRELOAD 在部分平台会导致 backtrace() 崩溃）
+DEMO_CFLAGS = -Wall -Wextra -g -O1 -no-pie -fno-stack-protector
+DEMO_LDFLAGS = -Wl,-rdynamic
 
 INC_SHARED = -Isrc
 INC_PUBLIC = -Iinclude -Isrc
@@ -66,20 +69,20 @@ $(BUILD_DIR):
 
 # 宏模式示例（显式链接库，调用 mtt_malloc/mtt_free）
 demo: $(SHARED_LIB) examples/demo.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/demo examples/demo.c \
+	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/demo examples/demo.c \
 		-L$(BUILD_DIR) -lmemorytracetool $(LDFLAGS)
 
 # LD_PRELOAD 模式示例（标准 malloc/free，运行时注入）
 demo_preload: $(SHARED_LIB) examples/demo_preload.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $(BUILD_DIR)/demo_preload examples/demo_preload.c
+	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_preload examples/demo_preload.c
 
 # 长期运行示例（LD_PRELOAD 模式，持续分配+泄漏）
 demo_long_running: $(SHARED_LIB) examples/demo_long_running.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $(BUILD_DIR)/demo_long_running examples/demo_long_running.c -lpthread
+	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_long_running examples/demo_long_running.c -lpthread
 
 # 可控泄漏示例（20 分钟 ~50MB，配合 Web 仪表盘观察）
 demo_controlled_leak: $(SHARED_LIB) examples/demo_controlled_leak.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $(BUILD_DIR)/demo_controlled_leak examples/demo_controlled_leak.c -lpthread
+	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_controlled_leak examples/demo_controlled_leak.c -lpthread
 
 # =====================================================
 #  运行示例

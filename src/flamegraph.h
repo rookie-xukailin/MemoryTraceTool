@@ -27,6 +27,6 @@
  */
 void mtt_flamegraph_write(const char *log_dir, const char *proc_name,
                           mtt_leak_site_t **sites, size_t count,
-                          void **pairs);
+                          void *pairs);
 
 #endif /* MTT_FLAMEGRAPH_H */

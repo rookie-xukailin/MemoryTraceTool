@@ -30,7 +30,22 @@
 
 mtt_reporter_t g_reporter = {0};
 static atomic_int      g_reporter_started = 0;
-/* atexit 不安全：reporter 线程在 running=0 后自行做最终扫描 */
+static int             g_atexit_registered = 0;
+static int             g_atexit_done      = 0;
+
+static void mtt_atexit_handler(void)
+{
+    if (g_atexit_done) return;
+    g_atexit_done = 1;
+
+    extern _Atomic int g_signal_thread_running;
+    atomic_store_explicit(&g_signal_thread_running, 0, memory_order_release);
+    atomic_store_explicit(&g_reporter.running, 0, memory_order_release);
+
+    /* 短暂等待 reporter 完成最终扫描（1s睡眠间隔 + 扫描耗时） */
+    struct timespec ts = {2, 0};
+    nanosleep(&ts, NULL);
+}
 
 /** 获取报告器单例（供 HTTP 服务器等外部模块访问） */
 mtt_reporter_t* mtt_reporter_get(void)
@@ -413,12 +428,6 @@ static void scan_and_report_locked(void)
     }
 
     /* ---- 阶段 5: 收集符号缓存（用于写入报告） ---- */
-    /* 重新构建 site→stack_entry 映射 */
-    typedef struct {
-        mtt_leak_site_t  *site;
-        mtt_stack_entry_t *stack_entry;
-    } site_stack_pair_t;
-
     site_stack_pair_t *pairs = NULL;
     if (sorted != NULL && site_count > 0) {
         pairs = (site_stack_pair_t*)raw_malloc(
@@ -610,7 +619,7 @@ static void scan_and_report_locked(void)
 
         /* 同时输出 collapsed stacks 文件（兼容 flamegraph.pl） */
         mtt_flamegraph_write(log_dir, proc_name, sorted, site_count,
-                             (void**)pairs);
+                             (void*)pairs);
     }
 
     /* ---- 阶段 6.5: 保存本次结果用于下次扫描差值计算（借鉴 jemalloc --base） ---- */
@@ -663,10 +672,10 @@ static void scan_and_report_locked(void)
             g_reporter.cached_site_count = 0;
         }
 
-        /* 深拷贝 pairs 数组 */
+        /* 深拷贝 pairs 结构体数组 */
         if (pairs != NULL && site_count > 0) {
-            size_t pairs_bytes = site_count * sizeof(void*);
-            g_reporter.cached_pairs = (void**)raw_malloc(pairs_bytes);
+            size_t pairs_bytes = site_count * sizeof(site_stack_pair_t);
+            g_reporter.cached_pairs = raw_malloc(pairs_bytes);
             if (g_reporter.cached_pairs != NULL) {
                 memcpy(g_reporter.cached_pairs, pairs, pairs_bytes);
             }
@@ -744,7 +753,8 @@ static void* reporter_thread_fn(void *arg)
     int saved_hook = g_in_hook;
     g_in_hook = 1;
 
-    /* 首次立即扫描：用户不需要等 60 秒才看到第一批数据 */
+    /* 等 1 秒让业务代码启动并产生分配，然后做首次扫描 */
+    sleep(1);
     scan_and_report();
 
     while (atomic_load_explicit(&g_reporter.running, memory_order_acquire)) {
@@ -841,7 +851,11 @@ void mtt_reporter_start(void)
         return;
     }
 
-    /* reporter 线程在 running=0 后自行执行最终扫描，无需 atexit */
+    /* 注册 atexit：仅设标志让 reporter 线程做扫描，不直接调用 scan_and_report */
+    if (!g_atexit_registered) {
+        atexit(mtt_atexit_handler);
+        g_atexit_registered = 1;
+    }
 
     /* 首次诊断输出（使用 write 避免 malloc） */
     char diag[256] = {0};
