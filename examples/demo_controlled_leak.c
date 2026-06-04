@@ -32,9 +32,6 @@
 #define PAUSE_MIN_SEC     1
 #define PAUSE_MAX_SEC     30
 
-/** 演示总时长（秒），到时间后进程退出 */
-#define DEMO_DURATION_SEC (20 * 60)               /* 20 分钟 */
-
 /** 状态打印间隔（秒） */
 #define STATUS_INTERVAL   10
 

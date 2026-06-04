@@ -64,7 +64,7 @@ LD_PRELOAD=/tmp/libmemorytracetool.so ./my_daemon
 |------|--------|------|
 | MTT_DISABLE | 0 | 设为 1 完全禁用追踪 |
 | MTT_SAMPLE | 0 | 旧模式：每 N 次 alloc 记录 1 次 |
-| MTT_SAMPLE_RATE | 19 | 字节采样率：2^N 字节平均采样一次 |
+| MTT_SAMPLE_RATE | 0 | 字节采样率：2^N 字节平均采样一次（0=全量追踪） |
 | MTT_HTTP_PORT | 0 | Web 仪表盘端口（0=禁用） |
 | MTT_LEAK_THRESHOLD_SEC | 300 | 存活超过此秒数→probable leak |
 | MTT_SKIP_STARTUP_SEC | 0 | 启动后跳过 N 秒不追踪 |
