@@ -331,7 +331,7 @@ def test_leak_is_expired_semantics(data):
     check("leak is_expired is always 0 or 1", all_ok)
 
 def test_json_total_size_coherence(data):
-    """total_size should be approximately count * per_leak_size."""
+    """total_size should be at least per_leak_size and > 0 for each leak site."""
     if data is None:
         return
     leaks = data.get("leaks")
@@ -343,14 +343,15 @@ def test_json_total_size_coherence(data):
         count = leak.get("count", 0)
         per = leak.get("per_leak_size", 0)
         total = leak.get("total_size", 0)
-        expected = count * per
-        # total_size should be reasonable; allow small diffs from rounding
-        if total < expected:
+        # per_leak_size 是同一调用栈下首次分配的大小，后续同栈分配
+        # 可能有不同大小，因此 total >= count * per 不是有效的不变量。
+        # 正确的不变量：只要有分配次数，总大小必须 >= 首次分配大小。
+        if count > 0 and (total < per or total == 0):
             all_ok = False
             break
 
-    check("leak total_size >= count * per_leak_size", all_ok,
-          detail="total_size should be at least count * per_leak_size")
+    check("leak total_size >= per_leak_size for all sites", all_ok,
+          detail="total_size should be >= first allocation size")
 
 def test_time_series_recent_timestamps(data):
     """Time series timestamps should be recent (within last hour)."""

@@ -83,7 +83,8 @@ static void sigint_handler(int sig)
 
 int main(void)
 {
-    char size_buf[32] = {0};
+    char size_buf1[32] = {0};
+    char size_buf2[32] = {0};
     time_t start = time(NULL);
     g_start_time = start;
 
@@ -93,10 +94,10 @@ int main(void)
     printf("=== MemoryTraceTool Controlled Leak Demo ===\n");
     printf("PID:        %d\n", (int)getpid());
     printf("Duration:   indefinite (runs until SIGINT/SIGTERM)\n");
-    printf("Leak limit: %s\n", fmt_size(LEAK_LIMIT_BYTES, size_buf));
+    printf("Leak limit: %s\n", fmt_size(LEAK_LIMIT_BYTES, size_buf1));
     printf("Leak range: %s ~ %s per allocation\n",
-           fmt_size(LEAK_MIN_BYTES, size_buf),
-           fmt_size(LEAK_MAX_BYTES, (size_buf + 64)));
+           fmt_size(LEAK_MIN_BYTES, size_buf1),
+           fmt_size(LEAK_MAX_BYTES, size_buf2));
     printf("Sleep range: %d ~ %d sec between leaks\n", PAUSE_MIN_SEC, PAUSE_MAX_SEC);
     printf("\nStart leaking... Press Ctrl+C to stop.\n\n");
 
@@ -120,7 +121,7 @@ int main(void)
             g_stop_leaking = 1;
             printf("\n*** Leak limit (%s) reached! Stopping leaks, "
                    "process continues to run. ***\n",
-                   fmt_size(LEAK_LIMIT_BYTES, size_buf));
+                   fmt_size(LEAK_LIMIT_BYTES, size_buf1));
             printf("Keep the process alive to observe the leak report.\n\n");
         }
 
@@ -158,7 +159,7 @@ int main(void)
                 int pct = (int)((g_total_leaked * 100) / LEAK_LIMIT_BYTES);
                 printf("[%5lds] leaks: %6zu | total: %9s | %3d%% | %s\n",
                        (long)elapsed, g_leak_count,
-                       fmt_size(g_total_leaked, size_buf),
+                       fmt_size(g_total_leaked, size_buf1),
                        pct,
                        g_stop_leaking ? "STOPPED" : "leaking");
                 fflush(stdout);
@@ -176,7 +177,7 @@ int main(void)
         printf("Ran for:     %ld sec (~%.1f min)\n",
                (long)(end - start), (double)(end - start) / 60.0);
         printf("Total leaks: %zu allocations\n", g_leak_count);
-        printf("Total bytes: %s\n", fmt_size(g_total_leaked, size_buf));
+        printf("Total bytes: %s\n", fmt_size(g_total_leaked, size_buf1));
         printf("Status:      %s\n", g_stop_leaking ? "Reached limit" : "Interrupted");
 
         /* 短暂等待 reporter 线程完成最后一次扫描 */

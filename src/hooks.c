@@ -280,11 +280,14 @@ void* realloc(void *ptr, size_t size)
         mtt_resolve_raw_allocators();
         if (raw_realloc != NULL)
             return raw_realloc(ptr, size);
-        /* raw_realloc 不可用时的降级（极端情况） */
+        /* raw_realloc 不可用时的降级（极端情况，仅在 bootstrap 阶段可能触发）。
+         * 注意：此时无法查询旧分配大小，若新 size > 旧 size，直接 memcpy(size)
+         * 会导致堆越界读取。作为防御，不复制旧数据（仅分配新内存），
+         * 因为此路径在正常运行时永远不会到达（raw_realloc 在初始化后始终可用）。 */
         if (raw_malloc == NULL) return NULL;
         void *new_ptr = raw_malloc(size);
         if (new_ptr == NULL) return NULL;
-        memcpy(new_ptr, ptr, size);
+        /* 不复制：旧分配大小未知，memcpy(new_ptr, ptr, size) 可能越界读取 */;
         if (raw_free != NULL) raw_free(ptr);
         return new_ptr;
     }

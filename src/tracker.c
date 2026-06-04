@@ -1002,12 +1002,12 @@ void* mtt_realloc(void *ptr, size_t size)
         /* 降级路径：使用 raw_realloc（若可用），否则模拟 */
         if (raw_realloc != NULL)
             return raw_realloc(ptr, size);
-        /* raw_realloc 不可用：malloc+memcpy+free 模拟。
-         * 注意：无旧大小信息，若 size > 原始大小则 memcpy 越界读取。
-         * 此路径仅在初始化失败时走到，正常情况 raw_realloc 始终可用。 */
+        /* raw_realloc 不可用：malloc + free 模拟（无复制，旧大小未知无法安全 memcpy）。
+         * 注意：无法查询旧分配大小，若 size > 原始大小则 memcpy 越界读取。
+         * 此路径仅在初始化失败时走到，正常情况 raw_realloc 始终可用。
+         * 不复制旧数据，避免潜在堆越界读取（防御性编程）。 */
         void *new_ptr = raw_malloc(size);
         if (new_ptr == NULL) return NULL;
-        memcpy(new_ptr, ptr, size);
         raw_free(ptr);
         return new_ptr;
     }
