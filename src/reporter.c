@@ -15,6 +15,7 @@
 #include "stack_cache.h"
 #include "time_series.h"
 #include "flamegraph.h"
+#include "http_server.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,9 +43,48 @@ static void mtt_atexit_handler(void)
     atomic_store_explicit(&g_signal_thread_running, 0, memory_order_release);
     atomic_store_explicit(&g_reporter.running, 0, memory_order_release);
 
+    /* 停止 HTTP 服务器（关闭 listen_fd，让 HTTP 线程在下一次 select 超时后退出） */
+    mtt_http_server_stop();
+
     /* 短暂等待 reporter 完成最终扫描（1s睡眠间隔 + 扫描耗时） */
     struct timespec ts = {2, 0};
     nanosleep(&ts, NULL);
+
+    /* 清理 reporter 堆分配的缓存数据。
+     * reporter 线程在检测到 running=0 后会执行最后一次 scan_and_report，
+     * 完成后线程退出。此处等待 2 秒后清理是安全的最佳努力时机，
+     * reporter 线程的末尾扫描通常在 <0.1 秒内完成。 */
+    if (raw_free != NULL) {
+        pthread_mutex_lock(&g_reporter.cache_lock);
+
+        if (g_reporter.cached_sites != NULL) {
+            for (size_t i = 0; i < g_reporter.cached_site_count; i++) {
+                if (g_reporter.cached_sites[i] != NULL)
+                    raw_free(g_reporter.cached_sites[i]);
+            }
+            raw_free(g_reporter.cached_sites);
+            g_reporter.cached_sites = NULL;
+        }
+        if (g_reporter.cached_pairs != NULL) {
+            raw_free(g_reporter.cached_pairs);
+            g_reporter.cached_pairs = NULL;
+        }
+        if (g_reporter.cached_ts_data != NULL) {
+            raw_free(g_reporter.cached_ts_data);
+            g_reporter.cached_ts_data = NULL;
+        }
+        g_reporter.cached_site_count = 0;
+        g_reporter.cached_ts_count = 0;
+
+        pthread_mutex_unlock(&g_reporter.cache_lock);
+
+        /* 清理上一次扫描差值数据（在 cache_lock 外，因为 reporter 不再更新） */
+        if (g_reporter.prev_diff_hashes) raw_free(g_reporter.prev_diff_hashes);
+        if (g_reporter.prev_diff_sizes) raw_free(g_reporter.prev_diff_sizes);
+        g_reporter.prev_diff_hashes = NULL;
+        g_reporter.prev_diff_sizes = NULL;
+        g_reporter.prev_diff_count = 0;
+    }
 }
 
 /** 获取报告器单例（供 HTTP 服务器等外部模块访问） */
