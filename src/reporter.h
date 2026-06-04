@@ -10,7 +10,6 @@
 #ifndef MTT_REPORTER_H
 #define MTT_REPORTER_H
 
-#define _GNU_SOURCE
 #include "mtt_internal.h"
 #include "time_series.h"
 

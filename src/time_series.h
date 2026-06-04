@@ -12,11 +12,8 @@
 
 #include "mtt_internal.h"
 
-/** 时序数据最大点数（1 小时 @ 1Hz） */
-#define MTT_TS_MAX_POINTS  3600
-
-/** 时序数据采集间隔（秒） */
-#define MTT_TS_INTERVAL_SEC 1
+/* MTT_TS_MAX_POINTS 和 MTT_TS_INTERVAL_SEC 已在 mtt_internal.h 中定义，
+ * 此头文件通过 #include "mtt_internal.h" 继承这些常量，无需重复定义。 */
 
 /** 单条时序数据点：记录某一时刻的内存快照 */
 typedef struct {
