@@ -314,7 +314,7 @@ void* realloc(void *ptr, size_t size)
             return NULL;
         }
         memcpy(new_ptr, ptr, size);
-        raw_free(ptr);
+        if (raw_free != NULL) raw_free(ptr);
         g_in_hook = saved_hook;
         return new_ptr;
     }

@@ -675,6 +675,8 @@ static void handle_api_data(int client_fd)
 static void json_write_leak_site_stdout(mtt_leak_site_t *site,
                                          mtt_stack_entry_t *se, int fd)
 {
+    if (site == NULL) return;
+
     static char buf[4096]; /* 静态分配：避免 ARM 栈溢出 */
     int off = snprintf(buf, sizeof(buf),
         "{\"hash\":\"0x%llx\",\"count\":%zu,\"per_leak_size\":%zu,"

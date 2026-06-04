@@ -43,6 +43,9 @@ static volatile int g_running = 1;      /* 工作线程运行标志 */
 static volatile int g_monitor_done = 0; /* 监控线程退出标志 */
 static pthread_mutex_t g_print_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* 前向声明：避免隐式声明警告（定义在 monitor_thread_fn 之后） */
+static const char* format_bytes(size_t b);
+
 /* ---- 断言 ---- */
 
 static int g_tests_run  = 0;

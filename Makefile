@@ -4,7 +4,7 @@ CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
 LDFLAGS  = -lpthread -ldl -latomic -lstdc++
 # 可执行文件使用 -no-pie（PIE + LD_PRELOAD 在部分平台会导致 backtrace() 崩溃）
 DEMO_CFLAGS = -Wall -Wextra -g -O1 -no-pie -fno-stack-protector
-DEMO_LDFLAGS = -Wl,-rdynamic
+DEMO_LDFLAGS = -rdynamic
 
 INC_SHARED = -Isrc
 INC_PUBLIC = -Iinclude -Isrc

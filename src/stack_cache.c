@@ -91,6 +91,8 @@ static uint64_t xxhash64_round(uint64_t acc, uint64_t input)
  */
 static uint64_t xxhash64_frames(void **frames, int frame_count, uint64_t seed)
 {
+    if (frames == NULL || frame_count <= 0) return 0;
+
     uint64_t h64 = 0;
     const uint8_t *p = (const uint8_t*)frames;
     size_t total_bytes = (size_t)frame_count * sizeof(void*);
