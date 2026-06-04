@@ -13,6 +13,21 @@
  * ARM32 Thumb 兼容：帧地址在捕获阶段（tracker.c:mtt_capture_stack）
  * 已清除 Thumb bit（LSB），本模块不再重复处理。若未来新增入口点
  * 未经过 mtt_capture_stack，需确保传入的地址 LSB 已清除。
+ *
+ * 未来改进方向（借鉴 heaptrack v1.5.0）：
+ *   - libunwind 替代 backtrace()：heaptrack 使用 libunwind（trace_libunwind.cpp）
+ *     替代 glibc backtrace()。libunwind 优势：
+ *     (a) 跨平台 — 支持 glibc/musl/bionic，ARM32/ARM64/x86_64 全部覆盖
+ *     (b) 异步 unwind — 不依赖 -rdynamic，可直接解析 .symtab/.dynsym
+ *     (c) DWARF/ARM EH 多格式支持 — 不需要 .eh_frame/.debug_frame
+ *     (d) 跨线程栈回溯 — heaptrack 注入模式下对目标进程的任意线程回溯
+ *     当前 MTT_HAS_BACKTRACE=0 时（musl/bionic）完全无栈回溯，迁移 libunwind
+ *     可彻底消除此限制，且无需用户添加 -rdynamic 链接选项。
+ *   - DwarfDieCache: heaptrack 通过 libdw 直接从 DWARF 调试信息中读取
+ *     源文件名和行号，远超 dladdr+backtrace_symbols 的精度（仅函数名+偏移）。
+ *   - 按地址缓存符号：heaptrack 的 SymbolCache 以帧地址为键，而非完整调用栈。
+ *     同一帧地址（如 libc 内部 malloc）可能出现在数千个不同调用栈中，
+ *     按地址缓存可消除跨栈的重复 dladdr() 开销。下文 ADDR_SYMBOL_CACHE 实现此优化。
  */
 
 #define _GNU_SOURCE
@@ -24,6 +39,15 @@
 #include <dlfcn.h>
 #if MTT_HAS_BACKTRACE
 #include <execinfo.h>
+#endif
+
+/* ---- C++ 符号反修饰（借鉴 heaptrack Demangler） ---- */
+/** 检测 __cxa_demangle 是否可用（需要链接 libstdc++ 或 libc++） */
+#if defined(__has_include) && __has_include(<cxxabi.h>)
+    #define MTT_HAS_CXXABI 1
+    #include <cxxabi.h>
+#else
+    #define MTT_HAS_CXXABI 0
 #endif
 
 /* ---- 全局栈缓存单例 ---- */
@@ -141,6 +165,157 @@ static uint64_t xxhash64_frames(void **frames, int frame_count, uint64_t seed)
 }
 
 /* ======================================================================== *
+ *        按地址缓存符号解析结果（借鉴 heaptrack SymbolCache 设计）                *
+ * ======================================================================== *
+ * heaptrack 的 SymbolCache 以帧地址为键进行符号缓存，而非以完整调用栈为键。
+ * 这避免了同一帧地址（如 libc 内部的 malloc 封装函数）在跨数千个不同调用栈
+ * 出现时重复调用 dladdr()。
+ *
+ * 设计：
+ *   - 512 个桶的开放哈希表，键为帧地址（void*），值为解析后的符号字符串
+ *   - 简单替换策略：桶满时覆盖最旧条目（非 LRU，追求零分配开销）
+ *   - 线程安全：仅由 reporter 后台线程访问，无竞争
+ *   - 零附加 malloc：符号字符串存储在 entry->cached_symbol 的静态数组中
+ */
+#define ADDR_CACHE_BUCKETS 512
+
+/** 单条地址符号缓存条目 */
+typedef struct {
+    void   *addr;                                /* 帧地址（键），NULL=空闲槽位 */
+    char    symbol[MTT_SYMBOL_MAX];              /* 解析后的符号字符串 */
+} addr_cache_entry_t;
+
+/** 按地址索引的符号解析结果缓存 */
+typedef struct {
+    addr_cache_entry_t entries[ADDR_CACHE_BUCKETS];
+} addr_symbol_cache_t;
+
+static addr_symbol_cache_t g_addr_cache = {{{0}}};
+
+/**
+ * 在地址符号缓存中查找已解析的符号。
+ *
+ * 使用乘法哈希映射地址到桶，桶内线性扫描最多 4 个槽位（有限探测）。
+ * 命中时直接复制结果到 out 缓冲区，避免重复调用 dladdr()。
+ *
+ * @param addr      帧地址
+ * @param out       输出缓冲区
+ * @param out_size  缓冲区大小
+ * @return          1=命中（已复制到 out），0=未命中
+ */
+static int addr_cache_lookup(void *addr, char *out, size_t out_size)
+{
+    if (addr == NULL || out == NULL || out_size == 0) return 0;
+
+    /* 乘法哈希：右移 3 位剔除对齐零位 */
+    uint64_t h = ((uint64_t)(uintptr_t)addr >> 3) * UINT64_C(11400714819323198485);
+    unsigned bucket = (unsigned)(h & (uint64_t)(ADDR_CACHE_BUCKETS - 1));
+
+    /* 线性探测最多 4 个槽位 */
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned idx = (bucket + i) & (ADDR_CACHE_BUCKETS - 1);
+        if (g_addr_cache.entries[idx].addr == addr) {
+            size_t n = strlen(g_addr_cache.entries[idx].symbol);
+            if (n >= out_size) n = out_size - 1;
+            memcpy(out, g_addr_cache.entries[idx].symbol, n);
+            out[n] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * 将解析后的符号插入地址缓存。
+ *
+ * 简单替换策略：若 hash 桶的前 4 个槽位中有空槽则填入，
+ * 否则覆盖桶内第一个槽位（最旧条目），避免链表分配开销。
+ *
+ * @param addr    帧地址
+ * @param symbol  已解析的符号字符串（会被复制）
+ */
+static void addr_cache_insert(void *addr, const char *symbol)
+{
+    if (addr == NULL || symbol == NULL) return;
+
+    uint64_t h = ((uint64_t)(uintptr_t)addr >> 3) * UINT64_C(11400714819323198485);
+    unsigned bucket = (unsigned)(h & (uint64_t)(ADDR_CACHE_BUCKETS - 1));
+
+    /* 查找空槽位 */
+    for (unsigned i = 0; i < 4; i++) {
+        unsigned idx = (bucket + i) & (ADDR_CACHE_BUCKETS - 1);
+        if (g_addr_cache.entries[idx].addr == NULL
+            || g_addr_cache.entries[idx].addr == addr) {
+            g_addr_cache.entries[idx].addr = addr;
+            size_t n = strlen(symbol);
+            if (n >= MTT_SYMBOL_MAX) n = MTT_SYMBOL_MAX - 1;
+            memcpy(g_addr_cache.entries[idx].symbol, symbol, n);
+            g_addr_cache.entries[idx].symbol[n] = '\0';
+            return;
+        }
+    }
+    /* 所有 4 个槽位都被占用且关键字不匹配：覆盖第一个槽位 */
+    size_t n = strlen(symbol);
+    if (n >= MTT_SYMBOL_MAX) n = MTT_SYMBOL_MAX - 1;
+    g_addr_cache.entries[bucket].addr = addr;
+    memcpy(g_addr_cache.entries[bucket].symbol, symbol, n);
+    g_addr_cache.entries[bucket].symbol[n] = '\0';
+}
+
+/* ======================================================================== *
+ *       C++ 符号反修饰（借鉴 heaptrack Demangler / __cxa_demangle）           *
+ * ======================================================================== */
+
+/**
+ * 对函数名进行 C++ 符号反修饰。
+ *
+ * 若函数名包含 C++ mangled name 特征（以 _Z 开头），
+ * 调用 __cxa_demangle 将其转换为人类可读形式，
+ * 如 "_ZN4MyClass6MethodEi" → "MyClass::Method(int)"。
+ *
+ * 注意：
+ *   - __cxa_demangle 内部会调用 malloc 分配缓冲区，需配对 free
+ *   - 若反修饰失败或名称不需反修饰（C 函数），返回原始名称
+ *   - 需要链接 libstdc++（-lstdc++）或 clang 的 libc++abi
+ *   - 借鉴 heaptrack interpret/demangler.h 的设计思路
+ *
+ * @param mangled   原始函数名（可能经过 C++ name mangling）
+ * @param buf       输出缓冲区（用于存储反修饰后的名称或原始名称的副本）
+ * @param buf_size  缓冲区大小
+ */
+static void demangle_symbol(const char *mangled, char *buf, size_t buf_size)
+{
+    if (mangled == NULL || buf == NULL || buf_size == 0) return;
+    buf[0] = '\0';
+
+#if MTT_HAS_CXXABI
+    /* 仅对 C++ mangled 名称进行反修饰（以 _Z 开头是 Itanium C++ ABI 的特征） */
+    if (mangled[0] == '_' && mangled[1] == 'Z') {
+        int status = 0;
+        char *demangled = abi::__cxa_demangle(mangled, NULL, NULL, &status);
+        if (status == 0 && demangled != NULL) {
+            size_t n = strlen(demangled);
+            if (n >= buf_size) n = buf_size - 1;
+            memcpy(buf, demangled, n);
+            buf[n] = '\0';
+            free(demangled);
+            return;
+        }
+        /* demangle 失败（status != 0 或 demangled == NULL）：fallthrough 到原始名称 */
+        if (demangled != NULL) free(demangled);
+    }
+#else
+    (void)mangled;
+#endif
+
+    /* 不需要反修饰或反修饰失败：复制原始名称 */
+    size_t n = strlen(mangled);
+    if (n >= buf_size) n = buf_size - 1;
+    memcpy(buf, mangled, n);
+    buf[n] = '\0';
+}
+
+/* ======================================================================== *
  *                         公共接口                                          *
  * ======================================================================== */
 
@@ -245,6 +420,8 @@ mtt_stack_entry_t* mtt_stack_cache_lookup(void **frames, int frame_count)
  *
  * 格式: "func_name+0xOFFSET (libname)"
  * 首选 dladdr() 解析，失败时回退到 backtrace_symbols()。
+ * C++ 符号自动反修饰（__cxa_demangle），如 _ZN3Foo3barEi → Foo::bar(int)。
+ * 解析结果缓存到按地址索引的 hash 表，消除跨栈重复 dladdr() 调用。
  *
  * 注意：addr 参数应已清除 Thumb bit（调用者负责确保）。
  * 在 ARM32 上，若 addr 保留了 Thumb bit，dladdr() 可能找不到符号。
@@ -257,6 +434,10 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
 {
     if (addr == NULL || out == NULL || out_size == 0) return;
     out[0] = '\0';
+
+    /* 快速路径：地址符号缓存命中（借鉴 heaptrack SymbolCache 设计） */
+    if (addr_cache_lookup(addr, out, out_size))
+        return;
 
     char func_name[256] = {0};
     const char *lib_name = "??";
@@ -361,7 +542,15 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
             snprintf(func_name, sizeof(func_name), "%p", addr);
     }
 
-    snprintf(out, out_size, "%s+%#tx (%s)", func_name, func_off, lib_name);
+    /* C++ 符号反修饰（借鉴 heaptrack Demangler） */
+    {
+        char demangled_name[256] = {0};
+        demangle_symbol(func_name, demangled_name, sizeof(demangled_name));
+        snprintf(out, out_size, "%s+%#tx (%s)", demangled_name, func_off, lib_name);
+    }
+
+    /* 缓存到按地址索引的符号缓存（后续同一帧地址命中缓存，跳过 dladdr） */
+    addr_cache_insert(addr, out);
 }
 
 /**

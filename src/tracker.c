@@ -253,6 +253,15 @@ static __thread int g_in_capture = 0;
  *
  * ARM32 Thumb 兼容：backtrace 返回的地址 bit 0 在 Thumb 模式下为 1，
  * 影响哈希计算和 dladdr 符号解析，此处统一清除。
+ *
+ * 未来改进方向（借鉴 heaptrack trace_libunwind.cpp）：
+ *   当前使用 glibc backtrace()（仅 glibc 可用），在 musl/bionic 上
+ *   退化（MTT_HAS_BACKTRACE=0 → stack_frames=0）。
+ *   迁移到 libunwind 可消除此限制：
+ *   - uw_init() + unw_backtrace() 接口与 backtrace() 接近，改动最小
+ *   - libunwind 内建 DWARF/ARM EH unwind 支持，无需 -rdynamic 或 unwind 表
+ *   - 支持异步跨线程回溯（heaptrack 注入模式的核心能力）
+ *   详见 stack_cache.c 头部注释中的 libunwind 改进说明。
  */
 void mtt_capture_stack(mtt_entry_t *entry)
 {
