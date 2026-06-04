@@ -6,3 +6,5 @@ lib/
 demo
 demo_preload
 test_basic
+# Exclude temp directories accidentally picked up by git add -A
+**/Temp/
