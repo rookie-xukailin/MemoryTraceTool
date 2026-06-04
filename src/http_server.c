@@ -946,6 +946,7 @@ void mtt_http_server_start(uint16_t port)
     if (pthread_create(&tid, NULL, http_thread_fn, NULL) != 0) {
         atomic_store_explicit(&g_http_server.running, 0, memory_order_release);
         close(listen_fd);
+        g_http_server.listen_fd = -1; /* 防止 mtt_http_server_stop() 重复 close */
         return;
     }
     g_http_server.thread = tid;
