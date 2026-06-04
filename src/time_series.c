@@ -125,8 +125,6 @@ int mtt_ts_get_range(uint32_t start_idx, mtt_ts_point_t *out,
         oldest = atomic_load_explicit(&g_time_series.head, memory_order_relaxed);
     }
 
-    uint32_t head = atomic_load_explicit(&g_time_series.head, memory_order_relaxed);
-
     /* 从 start_idx 开始读取 */
     uint32_t read_count = 0;
     for (uint32_t i = start_idx; i < valid_count && read_count < max_out; i++) {

@@ -322,10 +322,9 @@ void* realloc(void *ptr, size_t size)
     /* ---- 正常追踪路径：使用 raw_realloc ---- */
 
     if (raw_realloc != NULL) {
-        /* 分配前从追踪表读取旧大小（用于后续统计更新） */
+        /* 分配前从追踪表读取旧条目（用于后续统计更新） */
         mtt_stripe_lock(s, ptr);
         mtt_entry_t *old_e = mtt_entry_find(s, ptr);
-        size_t old_size = (old_e != NULL) ? old_e->size : 0;
         mtt_stripe_unlock(s, ptr);
 
         void *new_ptr = raw_realloc(ptr, size);

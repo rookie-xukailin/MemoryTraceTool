@@ -407,8 +407,8 @@ static void scan_and_report_locked(void)
             if (sorted != NULL && sorted[i]->is_expired)
                 expired_count++;
         }
-        if (st != NULL) {
-            atomic_store_explicit(&st->expired_alloc_count, expired_count, memory_order_relaxed);
+        if (s != NULL) {
+            atomic_store_explicit(&s->expired_alloc_count, expired_count, memory_order_relaxed);
         }
     }
 
