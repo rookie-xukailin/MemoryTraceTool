@@ -722,11 +722,11 @@ void mtt_ensure_init(void)
     atomic_store_explicit(&s->initialized, 1, memory_order_release);
     pthread_mutex_unlock(&init_lock);
 
+    /* 先初始化时序数据（必须在 reporter 线程启动前完成） */
+    mtt_ts_init();
+
     /* 启动周期报告线程（锁外，避免 pthread_create 内部 malloc → 递归） */
     mtt_reporter_start();
-
-    /* 初始化时序数据采集（reporter 线程启动后） */
-    mtt_ts_init();
 
     /* 启动 HTTP 服务器（从环境变量读取端口，0=禁用） */
     {
@@ -750,10 +750,10 @@ void mtt_ensure_init(void)
  *                 信号处理线程（SIGUSR1 触发即时报告）                         *
  * ======================================================================== */
 
-/** 信号线程运行标志 */
-static _Atomic int g_signal_thread_running = 0;
+/** 信号线程运行标志（非 static，atexit 处理器需要停止它） */
+_Atomic int g_signal_thread_running = 0;
 
-/** 信号处理线程主函数。使用 sigwait() 阻塞等待 SIGUSR1，收到后触发即时扫描。 */
+/** 信号处理线程主函数。使用 sigtimedwait() 每秒超时检查 running 标志。 */
 static void* mtt_signal_thread_fn(void *arg)
 {
     (void)arg;
@@ -764,14 +764,17 @@ static void* mtt_signal_thread_fn(void *arg)
     sigaddset(&sigset, MTT_SIGNAL_REPORT);
 
     while (atomic_load_explicit(&g_signal_thread_running, memory_order_acquire)) {
-        int sig;
-        if (sigwait(&sigset, &sig) == 0 && sig == MTT_SIGNAL_REPORT) {
+        /* sigtimedwait 超时 1 秒，定期检查 running 标志 */
+        struct timespec timeout = {1, 0};
+        siginfo_t info;
+        int ret = sigtimedwait(&sigset, &info, &timeout);
+        if (ret == MTT_SIGNAL_REPORT) {
             /* 收到 SIGUSR1：记录时序点 + 触发即时扫描 */
             mtt_ts_record_point();
-            /* 通过 reporter 接口触发扫描（需要 reporter 配合） */
             extern void mtt_reporter_signal_scan(void);
             mtt_reporter_signal_scan();
         }
+        /* 超时(EAGAIN)或其他错误：重新检查 running 标志，继续循环 */
     }
     return NULL;
 }

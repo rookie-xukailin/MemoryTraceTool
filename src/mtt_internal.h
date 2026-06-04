@@ -63,7 +63,7 @@
 /* 采样配置 */
 #define MTT_SAMPLE_DEFAULT      0       /* 默认全量追踪，>0 时每 N 次记录 1 次 */
 #define MTT_SAMPLE_MAX_PERIOD   1024    /* 最大采样周期 */
-#define MTT_SAMPLE_RATE_DEFAULT 19      /* 默认字节采样率（2^19 = 512KB 平均步长） */
+#define MTT_SAMPLE_RATE_DEFAULT 0       /* 默认不启用字节采样（全量追踪），>0 时启用 */
 #define MTT_SAMPLE_RATE_MAX     30      /* 最大采样率（2^30 = 1GB） */
 #define MTT_BIG_ALLOC_THRESHOLD (1024 * 1024)  /* 大分配阈值（1MB），大分配总是追踪 */
 

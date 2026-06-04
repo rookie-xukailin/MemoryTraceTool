@@ -30,7 +30,7 @@
 
 mtt_reporter_t g_reporter = {0};
 static atomic_int      g_reporter_started = 0;
-static int             g_atexit_registered = 0; /* 防止重复注册 atexit */
+/* atexit 不安全：reporter 线程在 running=0 后自行做最终扫描 */
 
 /** 获取报告器单例（供 HTTP 服务器等外部模块访问） */
 mtt_reporter_t* mtt_reporter_get(void)
@@ -787,16 +787,8 @@ static void* reporter_thread_fn(void *arg)
  * 先通知后台线程停止，再同步调用 scan_and_report() 输出最终报告。
  * atexit 在 main 返回/exit 调用后执行，此时主线程外的大部分线程已结束。
  */
-static void mtt_atexit_handler(void)
-{
-    /* 通知后台线程停止 */
-    atomic_store_explicit(&g_reporter.running, 0, memory_order_release);
-
-    /* 等待任何正在进行的扫描完成，然后执行最终扫描 */
-    pthread_mutex_lock(&g_reporter.scan_mutex);
-    scan_and_report_locked();
-    pthread_mutex_unlock(&g_reporter.scan_mutex);
-}
+/* atexit 不安全：libc 清理顺序不确定，不做同步扫描。
+ * reporter 线程在运行标志被清除后会自行执行最后一次扫描。 */
 
 /* ======================================================================== *
  *                     公共接口                                              *
@@ -849,11 +841,7 @@ void mtt_reporter_start(void)
         return;
     }
 
-    /* 线程创建成功后才注册 atexit（确保仅在线程存在时注册） */
-    if (!g_atexit_registered) {
-        atexit(mtt_atexit_handler);
-        g_atexit_registered = 1;
-    }
+    /* reporter 线程在 running=0 后自行执行最终扫描，无需 atexit */
 
     /* 首次诊断输出（使用 write 避免 malloc） */
     char diag[256] = {0};
