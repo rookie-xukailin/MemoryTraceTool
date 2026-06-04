@@ -35,14 +35,12 @@ LD_PRELOAD →
 
 | 文件 | 覆盖范围 | 用例数 |
 |------|---------|--------|
-| tests/test_basic.c | malloc/free/calloc/realloc 各种大小和边界 | 目标 30 |
-| tests/test_threads.c | 并发 alloc/free，哈希桶竞争，读写者 | 目标 8 |
-| tests/test_time_series.c | 环形缓冲区读写、环绕、并发 | 目标 5 |
-| tests/test_report_integration.c | 端到端报告生成、栈格式验证 | 目标 8 |
-| tests/test_leak_classification.c | 存活时间判定、临时分配检测 | 目标 5 |
-| tests/test_sampling.c | 字节统计采样正确性 | 目标 5 |
+| tests/test_basic.c | malloc/free/calloc/realloc 各种大小和边界 | 36 |
+| tests/test_stability.c | 60 秒并发 alloc/free 长稳测试 | 7 |
+| tests/test_frontend_json.py | /api/data JSON 结构和语义验证 | 20 |
+| tests/test_frontend_html.py | / 仪表盘 HTML/JS/CSS 结构验证 | 27 |
 
-运行：`make test`
+运行：`make test_all`（编译 + C 测试，Python 测试需先启动 HTTP 服务器）
 
 ## 部署流程
 

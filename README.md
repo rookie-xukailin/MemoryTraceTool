@@ -10,21 +10,22 @@
 # 1. 编译（在 MemoryTraceTool/ 目录下）
 make
 
-# 2. 启动 Web 看板（守护进程）
-./build/mttd 8080 &
+# 2. 编译示例程序 + 启动监控（HTTP 仪表盘内嵌在 lib 中）
+make demo_long_running
+MTT_HTTP_PORT=8080 LD_PRELOAD=./build/libmemorytracetool.so ./build/demo_long_running &
 
 # 3. 浏览器打开
 # http://localhost:8080
 ```
 
-复制上面三行命令到终端，浏览器打开看板页面，完成。
+复制上面命令到终端，浏览器打开看板页面，完成。HTTP 服务器内嵌在动态库中，无需单独的守护进程。
 
 ## 监控你的程序
 
 还是在 `MemoryTraceTool/` 目录下，用 `LD_PRELOAD` 启动你的程序（**不需要改一行代码**）：
 
 ```bash
-LD_PRELOAD=./lib/libmemorytracetool.so ./your_app
+LD_PRELOAD=./build/libmemorytracetool.so ./your_app
 ```
 
 程序运行时，泄漏数据会**实时推送到 Web 看板**。打开 `http://localhost:8080` 就能看到：
@@ -50,7 +51,7 @@ kill -USR1 <pid>
 
 ```bash
 # 在 MemoryTraceTool/ 目录下执行
-LD_PRELOAD=./lib/libmemorytracetool.so ./your_app
+LD_PRELOAD=./build/libmemorytracetool.so ./your_app
 ```
 
 调用栈可通过看板的一键 `addr2line` 解析还原应用层函数名。
@@ -67,21 +68,15 @@ LD_PRELOAD=./lib/libmemorytracetool.so ./your_app
 
 ```bash
 # 在 MemoryTraceTool/ 目录下执行
-gcc -Iinclude -o myapp myapp.c lib/libmemorytracetool.a -lpthread -ldl
+gcc -Iinclude -o myapp myapp.c build/libmemorytracetool.so -lpthread -ldl
 ```
 
 ## 运行时注入（高级）
 
 对于已经在跑的进程，无需重启，直接注入动态库：
 
-```bash
-# 在 MemoryTraceTool/ 目录下执行
-sudo setcap cap_sys_ptrace+ep ./build/mttd
-
-# 在 Web 看板页面输入 PID，点击 Inject 即可
-```
-
-> 注意：需要 `ptrace_scope=0` 或 root 权限。
+> 运行时注入能力计划中，当前版本请使用 LD_PRELOAD 模式。
+> 注入功能实现后，将支持：在 Web 看板输入 PID，一键注入监控。
 
 ## 交叉编译
 
@@ -100,7 +95,7 @@ make
 make CROSS_COMPILE=arm-linux-gnueabihf-
 ```
 
-设置 `CROSS_COMPILE` 后自动使用对应的交叉编译器，并跳过 ptrace 注入器（仅 x86_64 支持）。产物 `libmemorytracetool.so` 和 `mttd` 为对应架构的二进制。
+设置 `CROSS_COMPILE` 后自动使用对应的交叉编译器。产物 `libmemorytracetool.so` 为对应架构的二进制。
 
 如需自定义编译选项（如 sysroot）：
 
@@ -115,9 +110,20 @@ make CROSS_COMPILE=arm-linux-gnueabihf- \
 | 端点 | 说明 |
 |------|------|
 | `GET /` | Web 看板页面 |
-| `GET /api/data` | JSON 格式的泄漏数据 |
-| `GET /api/addr2line?bin=<path>&off=<hex>` | 解析函数名 |
-| `GET /api/injected` | 注入状态列表 |
+| `GET /api/data` | JSON 格式的综合泄漏数据（统计 + 时序 + 泄漏站点） |
+| `GET /api/leaks` | JSON 格式的完整泄漏站点列表（无统计/时序） |
+
+## 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MTT_DISABLE` | 0 | 设为 1 完全禁用追踪 |
+| `MTT_SAMPLE` | 0 | 旧模式：每 N 次 alloc 记录 1 次 |
+| `MTT_SAMPLE_RATE` | 0 | 字节采样率：2^N 字节平均采样一次（0=全量追踪） |
+| `MTT_HTTP_PORT` | 0 | Web 仪表盘端口（0=禁用） |
+| `MTT_LEAK_THRESHOLD_SEC` | 300 | 存活超过此秒数→probable leak |
+| `MTT_SKIP_STARTUP_SEC` | 0 | 启动后跳过 N 秒不追踪 |
+| `MTT_LIB_BLACKLIST` | 未设置 | 逗号分隔的库黑名单（如 `libc.so,libfoo.so`） |
 
 ## 测试
 
@@ -131,5 +137,4 @@ make test
 ```bash
 # 在 MemoryTraceTool/ 目录下执行
 make clean         # 清理构建产物
-make stop_daemon   # 停止守护进程
 ```
