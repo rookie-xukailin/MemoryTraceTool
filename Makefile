@@ -37,27 +37,6 @@ endif
 
 CROSS_COMPILE := $(TARGET_PREFIX)
 
-# ---- SYSROOT / 头文件路径 ----
-# SYSROOT: gcc --sysroot 参数（自动找到 usr/include 等）
-# SYSROOT_INC: 手动 -I 追加头文件搜索路径（--sysroot 不可用时的备选）
-ifneq ($(SYSROOT_INC),)
-  CFLAGS_SYSROOT = -I$(SYSROOT_INC)
-else ifneq ($(SYSROOT),)
-  CFLAGS_SYSROOT = --sysroot=$(SYSROOT)
-else ifneq ($(CROSS_COMPILE),)
-  # 自动检测: 从编译器路径推断 sysroot
-  _CC_DIR := $(dir $(CROSS_COMPILE))
-  _CC_PARENT := $(_CC_DIR)..
-  _AUTO_SYSROOT := $(_CC_PARENT)/$(notdir $(patsubst %-,%,$(CROSS_COMPILE)))/sysroot
-  ifneq ($(wildcard $(_AUTO_SYSROOT)),)
-    CFLAGS_SYSROOT = --sysroot=$(_AUTO_SYSROOT)
-  else
-    CFLAGS_SYSROOT =
-  endif
-else
-  CFLAGS_SYSROOT =
-endif
-
 # 非 x86 平台用 -no-pie
 ifeq ($(ARCH),x86)
   DEMO_EXTRA := -no-pie -fno-stack-protector
@@ -66,9 +45,9 @@ else
 endif
 
 CC       = $(CROSS_COMPILE)gcc
-CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer $(CFLAGS_SYSROOT)
-LDFLAGS  = -lpthread -ldl -latomic $(CFLAGS_SYSROOT)
-DEMO_CFLAGS = -Wall -Wextra -g -O1 $(DEMO_EXTRA) -rdynamic -funwind-tables -fno-omit-frame-pointer $(CFLAGS_SYSROOT)
+CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
+LDFLAGS  = -lpthread -ldl -latomic
+DEMO_CFLAGS = -Wall -Wextra -g -O1 $(DEMO_EXTRA) -rdynamic -funwind-tables -fno-omit-frame-pointer
 
 INC_SHARED = -Isrc
 INC_PUBLIC = -Iinclude -Isrc
