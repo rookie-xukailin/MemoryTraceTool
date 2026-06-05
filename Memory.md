@@ -37,8 +37,23 @@ LD_PRELOAD →
 |------|---------|--------|
 | tests/test_basic.c | malloc/free/calloc/realloc 各种大小和边界 | 36 |
 | tests/test_stability.c | 60 秒长稳 + 并发配对/同桶竞争/读写并发/竞态初始化/realloc压力/边界并发/current_bytes原子/峰值CAS/混合操作/线程搅动 | 17 |
-| tests/test_frontend_json.py | /api/data JSON 结构和语义验证 | 20 |
+| tests/test_frontend_json.py | /api/data JSON 结构和语义验证（含 rss_bytes 字段） | 20 |
 | tests/test_frontend_html.py | / 仪表盘 HTML/JS/CSS 结构验证 | 27 |
+| scripts/inject.sh | GDB 运行时注入脚本（无需重启守护进程） | — |
+
+## 里程碑
+
+| # | 提交 | 内容 |
+|---|------|------|
+| M1 | `7760a15` | 三大 Bug 修复：符号解析 `main+0x460` + use-after-free + 时序数据 |
+| M2 | `5d4091f` | ARM32 QEMU 12/12 PASS + x86_64 120s 长稳零崩溃 |
+| M3 | `a08e059` | HTTP JSON 合法化 + 时序数据实时读取 |
+| M4 | `e339d5a` | 借鉴 heaptrack 四大改进：符号缓存/C++反修饰/compact TS/仪表盘增强 |
+| M5 | `0f66af5` | ARM32 QEMU LD_PRELOAD+HTTP+栈回溯 全链路 PASS |
+| M6 | `73c8a3d` | 编译零警告：MTT_DIAG_WRITE 宏根治 48 个 warn_unused_result |
+| M7 | `e004c6a` | test_stability 7→17 用例：并发配对/同桶竞争/读写并发/竞态初始化/realloc 压力 |
+| M8 | `e7d14fe` | 产物分离：output/ 最终产物 + build/ 中间 .o |
+| M9 | `c0bb2c4` | 栈深度 16→32 + RSS 进程内存跟踪 + GDB 运行时注入 + ARM32 栈溢出修复 |
 
 运行：`make test_all`（编译 + C 测试，Python 测试需先启动 HTTP 服务器）
 

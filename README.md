@@ -2,6 +2,7 @@
 
 轻量级 C/C++ 内存泄漏检测工具，**零代码侵入**，单 `.so` 部署。
 通过 `LD_PRELOAD` 拦截 malloc/free，Web 仪表盘实时展示堆内存趋势和泄漏调用栈。
+专为 **ARM32/ARM64 嵌入式 BMC 守护进程**设计，栈深度 32 帧穿透闭源库追踪。
 
 ## 30 秒上手
 
@@ -25,7 +26,7 @@ make PLATFORM=arm64     # ARM64 (aarch64-linux-gnu)
 make PLATFORM=x86       # x86_64（等于默认）
 ```
 
-产物：`build/libmemorytracetool.so`
+产物在 `output/` 目录下（`.o` 中间文件自动清理于 `build/`）。
 
 ## 监控你的程序
 
@@ -34,9 +35,9 @@ LD_PRELOAD=./output/libmemorytracetool.so ./your_app
 ```
 
 程序运行时打开 `http://localhost:8080`，实时看到：
-- 堆内存趋势图（Canvas 大图，current_bytes 面积 + peak_bytes 虚线）
-- 泄漏站点排行（按 total_size 降序，可展开看完整调用栈）
-- 统计卡片（当前未释放 / 历史峰值 / 累计分配 / 累计释放 / 疑似泄漏）
+- 堆内存趋势图（Canvas 大图，current_bytes 面积 + peak_bytes 虚线 + RSS 进程内存）
+- 泄漏站点排行（按 total_size 降序，可展开看完整调用栈，32 帧深度）
+- 统计卡片（当前未释放 / 历史峰值 / 累计分配 / 累计释放 / 疑似泄漏 / RSS）
 - 每帧格式 `func+0xOFFSET (libname)`，直接用于 `addr2line` 定位源码行
 
 发送信号触发即时报告（不用等 60 秒扫描间隔）：
@@ -49,10 +50,10 @@ kill -USR1 <pid>
 
 ```
 LD_PRELOAD → hooks.c (malloc/free/calloc/realloc 拦截)
-  → tracker.c   (哈希表 4096 桶 + 64 分段锁 + 栈捕获 + 采样)
-  → stack_cache.c (xxHash64 + dladdr 符号解析 + 懒缓存)
-  → time_series.c (环形缓冲区 3600 点，1Hz 采集)
-  → reporter.c  (后台线程，60s 周期扫描 + atexit 最终扫描)
+  → tracker.c   (哈希表 4096 桶 + 64 分段锁 + 栈捕获 32 帧 + 采样)
+  → stack_cache.c (xxHash64 + dladdr 符号解析 + C++ 反修饰 + 懒缓存)
+  → time_series.c (环形缓冲区 3600 点 @ 1Hz + RSS 进程内存)
+  → reporter.c  (后台线程，60s 周期扫描 + SIGUSR1 即时报告)
   → flamegraph.c (collapsed stacks 输出，兼容 flamegraph.pl)
   → http_server.c (嵌入式 HTTP/1.0，仪表盘 HTML + JSON API)
 ```
@@ -64,7 +65,7 @@ LD_PRELOAD → hooks.c (malloc/free/calloc/realloc 拦截)
 | 端点 | 说明 |
 |------|------|
 | `GET /` | Web 仪表盘 HTML |
-| `GET /api/data` | JSON：统计摘要 + 时序数据 + top 50 泄漏站点（含栈回溯） |
+| `GET /api/data` | JSON：统计摘要（含 RSS）+ 时序数据（含 RSS）+ top 50 泄漏站点（含栈回溯） |
 | `GET /api/leaks` | JSON：完整泄漏站点列表 |
 
 ## 火焰图
@@ -101,26 +102,55 @@ flamegraph.pl /var/log/mtt/<pid>_<name>.folded > flame.svg
 | 信号触发即时报告（SIGUSR1） | heaptrack + gperftools |
 | 临时分配检测（<1s 释放计数） | heaptrack |
 | Collapsed stacks（兼容 flamegraph.pl） | heaptrack |
+| RSS 进程内存跟踪 | heaptrack |
 
 ## 测试
 
 ```bash
-make PLATFORM=arm32 test       # test_basic (36 用例)
-make PLATFORM=arm32 test_all   # test_basic + test_stability (18 cases)
+make PLATFORM=arm32 test             # test_basic (36 用例)
+make PLATFORM=arm32 test_stability   # test_stability (17 用例，含并发、竞态、边界)
+make PLATFORM=arm32 test_all         # test_basic + test_stability
 
 # 前端测试（需先启动 HTTP 服务器）
-python3 tests/test_frontend_json.py    # JSON 结构和语义验证 (20 项)
-python3 tests/test_frontend_html.py    # HTML/JS/CSS 结构验证 (27 项)
+python3 tests/test_frontend_json.py    # JSON 结构和语义验证
+python3 tests/test_frontend_html.py    # HTML/JS/CSS 结构验证
 ```
+
+## 关键指标
+
+| 指标 | 数值 |
+|------|------|
+| 栈回溯深度 | **32 帧**（闭源库穿透） |
+| 堆内存入口上限 | 65536 条目 |
+| 哈希桶 / 分段锁 | 4096 / 64 |
+| 时序容量 | 3600 点（1 小时 @ 1Hz） |
+| 内存占用（ARM32） | ~12MB 峰值 |
+| 后台线程数 | 3（reporter + HTTP + signal） |
+
+## 里程碑
+
+| # | 提交 | 内容 |
+|---|------|------|
+| M1 | `7760a15` | 三大 Bug 修复：符号解析 `main+0x460` + use-after-free + 时序数据 |
+| M2 | `5d4091f` | ARM32 QEMU 12/12 PASS + x86_64 120s 长稳零崩溃 |
+| M3 | `a08e059` | HTTP JSON 合法化 + 时序数据实时读取 |
+| M4 | `e339d5a` | 借鉴 heaptrack 四大改进：符号缓存/C++反修饰/compact TS/仪表盘增强 |
+| M5 | `0f66af5` | ARM32 QEMU LD_PRELOAD+HTTP+栈回溯 全链路 PASS |
+| M6 | `73c8a3d` | 编译零警告：MTT_DIAG_WRITE 宏根治 48 个 warn_unused_result |
+| M7 | `e004c6a` | test_stability 7→17 用例：并发配对/同桶竞争/读写并发/竞态初始化/realloc 压力 |
+| M8 | `e7d14fe` | 产物分离：output/ 最终产物 + build/ 中间 .o |
+| M9 | `c0bb2c4` | **栈深度 16→32** + RSS 进程内存跟踪 + GDB 运行时注入 + ARM32 栈溢出修复 |
 
 ## 验证状态
 
-| 里程碑 | ARM32 | ARM64 | x86_64 |
-|--------|-------|-------|--------|
-| 编译 | 通过 | 通过 | 通过 |
-| test_basic 36/36 | PASS | — | PASS |
+| 指标 | ARM32 | ARM64 | x86_64 |
+|------|-------|-------|--------|
+| 编译警告 | 0 | 0 | 0 |
+| test_basic | 36/36 PASS | — | 36/36 PASS |
+| test_stability | 17/17 PASS | — | 17/17 PASS |
 | LD_PRELOAD + HTTP | PASS | — | PASS |
 | 栈回溯（函数名+偏移） | PASS | — | PASS |
+| RSS 进程内存 | PASS | — | PASS |
 | 火焰图 collapsed stacks | PASS | — | PASS |
 
 ARM32 验证环境：QEMU user 模式 (`qemu-arm-static -L /usr/arm-linux-gnueabihf`)
@@ -173,7 +203,7 @@ addr2line -e /path/to/daemon.debug -f -C 0x460
 make PLATFORM=arm32
 
 # 2. 复制到设备
-scp build/libmemorytracetool.so root@<device>:/tmp/
+scp output/libmemorytracetool.so root@<device>:/tmp/
 
 # 3. 在设备上运行
 LD_PRELOAD=/tmp/libmemorytracetool.so MTT_HTTP_PORT=8080 ./your_daemon
@@ -186,9 +216,10 @@ LD_PRELOAD=/tmp/libmemorytracetool.so MTT_HTTP_PORT=8080 ./your_daemon
 - ARM32 需链接 `-latomic`（64-bit 原子操作依赖）
 - `/proc/self/exe` 不可用时进程名显示 "unknown"（回退到 `prctl(PR_GET_NAME)`）
 - `time_t` 在 ARM32 上为 4 字节（2038 年问题）
+- 运行时注入依赖 GDB（目标需有 gdb/gdbserver）
 
 ## 清理
 
 ```bash
-make clean
+make clean    # 清除 build/ + output/
 ```
