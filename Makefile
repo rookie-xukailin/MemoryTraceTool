@@ -1,27 +1,47 @@
 # MemoryTraceTool — 多平台编译
 #
 # 用法:
-#   make                    # 默认 x86_64 原生编译
-#   make PLATFORM=arm32     # ARM32 (arm-linux-gnueabihf)
-#   make PLATFORM=arm64     # ARM64 (aarch64-linux-gnu)
-#   make PLATFORM=x86       # x86_64 原生编译
-#   make PLATFORM=arm32 demo_controlled_leak test  # 编译+测试
+#   make ARCH=arm          # ARM32 (arm-linux-gnueabihf-)
+#   make ARCH=arm64        # ARM64 (aarch64-linux-gnu-)
+#   make ARCH=x86          # x86_64 原生编译（默认）
+#   make ARCH=arm CROSS_COMPILE=/home1/x30770/arm-gcc/bin/arm-linux-gnueabihf-  # 自定义编译器路径
 #
 # 目录约定:
 #   build/   — 编译中间产物 (.o)，make clean 清除
 #   output/  — 最终发布产物 (.so, demo, test 可执行文件)
 
-PLATFORM ?= x86
+# ---- 架构选择（优先级: CROSS_COMPILE > ARCH 预设） ----
 
-ifeq ($(PLATFORM),arm32)
-  CROSS_COMPILE := arm-linux-gnueabihf-
-  DEMO_EXTRA := -no-pie
-else ifeq ($(PLATFORM),arm64)
-  CROSS_COMPILE := aarch64-linux-gnu-
-  DEMO_EXTRA := -no-pie
+ARCH ?= x86
+
+ifeq ($(ARCH),arm)
+  TARGET_PREFIX ?= arm-linux-gnueabihf-
+else ifeq ($(ARCH),arm64)
+  TARGET_PREFIX ?= aarch64-linux-gnu-
 else
-  CROSS_COMPILE :=
+  TARGET_PREFIX ?=
+endif
+
+# CROSS_COMPILE 环境变量优先于 TARGET_PREFIX
+ifneq ($(CROSS_COMPILE),)
+  TARGET_PREFIX := $(CROSS_COMPILE)
+  # 自动检测 ARCH（从编译器前缀推测）
+  ifeq ($(ARCH),x86)
+    ifneq ($(findstring arm-linux-gnueabi,$(CROSS_COMPILE)),)
+      ARCH := arm
+    else ifneq ($(findstring aarch64-linux-gnu,$(CROSS_COMPILE)),)
+      ARCH := arm64
+    endif
+  endif
+endif
+
+CROSS_COMPILE := $(TARGET_PREFIX)
+
+# 非 x86 平台用 -no-pie
+ifeq ($(ARCH),x86)
   DEMO_EXTRA := -no-pie -fno-stack-protector
+else
+  DEMO_EXTRA := -no-pie
 endif
 
 CC       = $(CROSS_COMPILE)gcc
@@ -47,7 +67,7 @@ SHARED_LIB = $(OUTPUT_DIR)/libmemorytracetool.so
         run_demo_long_running run_demo_controlled_leak
 
 all: $(SHARED_LIB)
-	@echo "=== Platform: $(PLATFORM) ==="
+	@echo "=== ARCH: $(ARCH) ==="
 	@file $(SHARED_LIB)
 
 # =====================================================
@@ -127,9 +147,9 @@ run_demo_controlled_leak: demo_controlled_leak
 #  测试 → output/
 # =====================================================
 
-ifeq ($(PLATFORM),arm32)
+ifeq ($(ARCH),arm)
   TEST_RUNNER = qemu-arm-static -L /usr/arm-linux-gnueabihf
-else ifeq ($(PLATFORM),arm64)
+else ifeq ($(ARCH),arm64)
   TEST_RUNNER = qemu-aarch64-static -L /usr/aarch64-linux-gnu
 else
   TEST_RUNNER =
