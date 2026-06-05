@@ -463,17 +463,30 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
             func_name[nlen] = '\0';
             /* ARM32 Thumb: dli_saddr 的 LSB 可能为 1（Thumb 符号编码），
              * 但 addr 的 LSB 已由调用方清除。统一清除 LSB 后计算偏移，
-             * 避免 func+0x1 代替 func+0x0 的偏移偏差。 */
-            func_off = (char*)addr - (char*)MTT_FIX_THUMB_ADDR(info.dli_saddr);
-            if (func_off < 0) func_off = 0;
+             * 避免 func+0x1 代替 func+0x0 的偏移偏差。
+             * ARM32 QEMU 防御：dli_saddr 在极端情况下可能为 NULL
+             * （尽管 man page 保证 dli_sname != NULL ⇒ dli_saddr != NULL，
+             *  但 qemu-user 的 dladdr 实现可能违反此契约）。 */
+            if (info.dli_saddr != NULL) {
+                func_off = (char*)addr - (char*)MTT_FIX_THUMB_ADDR(info.dli_saddr);
+                if (func_off < 0) func_off = 0;
+            }
 
             /* ARM32 QEMU 误判修正：若 dladdr 将主二进制中的地址误识别为
-             * libmemorytracetool.so 中的地址，尝试用 backtrace_symbols 修正库名 */
+             * libmemorytracetool.so 中的地址，尝试用 backtrace_symbols 修正库名和函数名。
+             * 仅修正库名是不够的——dladdr 在 ARM32 QEMU 下返回的 dli_sname 也属于
+             * libmemorytracetool.so（如 mtt_capture_stack），会被内部帧过滤器拦截，
+             * 导致 write_leak_json 退化为原始 hex 地址输出。 */
 #if MTT_HAS_BACKTRACE
             if (lib_name != NULL && strstr(lib_name, "libmemorytracetool") != NULL) {
                 char **syms = backtrace_symbols(&addr, 1);
                 if (syms != NULL && syms[0] != NULL) {
+                    /* 解析格式: "binary(func+0xOFFSET) [0xADDR]" 或 "binary(+0xOFFSET) [0xADDR]" */
                     char *paren = strchr(syms[0], '(');
+                    char *plus  = (paren != NULL) ? strchr(paren, '+') : NULL;
+                    char *rparen = (paren != NULL) ? strchr(paren, ')') : NULL;
+
+                    /* 提取二进制/库名（paren 之前的部分） */
                     if (paren != NULL && paren > syms[0]) {
                         const char *bin_start = syms[0];
                         if (bin_start[0] == '.' && bin_start[1] == '/')
@@ -489,6 +502,28 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
                             memcpy(alt_lib2, bin_start, copy_n);
                             alt_lib2[copy_n] = '\0';
                             lib_name = alt_lib2;
+                        }
+                    }
+
+                    /* 提取函数名和偏移（paren -> plus -> rparen）。
+                     * 仅在 backtrace_symbols 提供了非空函数名时覆盖 dladdr 的结果，
+                     * 否则保留 dladdr 的 dli_sname（可能仍是错误的，但好过空字符串）。
+                     * 偏移始终从 backtrace_symbols 提取（函数相对偏移，比 dli_saddr 准确）。 */
+                    if (paren != NULL && plus != NULL && rparen != NULL
+                        && plus > paren && plus < rparen) {
+                        size_t nlen = (size_t)(plus - paren - 1);
+                        if (nlen > 0 && nlen < sizeof(func_name)) {
+                            memcpy(func_name, paren + 1, nlen);
+                            func_name[nlen] = '\0';
+                        }
+                        /* 使用 backtrace_symbols 的函数相对偏移 */
+                        func_off = (ptrdiff_t)strtoul(plus + 1, NULL, 16);
+                    } else if (paren != NULL && rparen != NULL && rparen > paren + 1) {
+                        /* 格式: "binary(func)" — 有函数名但无偏移 */
+                        size_t nlen = (size_t)(rparen - paren - 1);
+                        if (nlen > 0 && nlen < sizeof(func_name)) {
+                            memcpy(func_name, paren + 1, nlen);
+                            func_name[nlen] = '\0';
                         }
                     }
                     free(syms);

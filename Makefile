@@ -26,7 +26,7 @@ endif
 CC       = $(CROSS_COMPILE)gcc
 CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
 LDFLAGS  = -lpthread -ldl -latomic
-DEMO_CFLAGS = -Wall -Wextra -g -O1 $(DEMO_EXTRA) -rdynamic
+DEMO_CFLAGS = -Wall -Wextra -g -O1 $(DEMO_EXTRA) -rdynamic -funwind-tables -fno-omit-frame-pointer
 
 INC_SHARED = -Isrc
 INC_PUBLIC = -Iinclude -Isrc
