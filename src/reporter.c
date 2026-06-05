@@ -368,9 +368,17 @@ static void scan_and_report_locked(void)
         /* 跳过空栈（捕获失败） */
         if (sn->stack_frames <= 0) continue;
 
-        /* 获取栈缓存条目（含 hash） */
+        /* 获取栈缓存条目（含 hash），同步解析符号。
+         * 在条目首次创建时立即调用 mtt_stack_resolve，而非延迟到 Stage 3。
+         * 此顺序修正了原 Stage 3 中独立 hash 重匹配可能遗漏条目的问题：
+         * 若缓存满导致 mtt_stack_cache_lookup 返回 NULL，Stage 3 中同一条目的
+         * lookup 依然为 NULL，mtt_stack_resolve 永远不会被调用。现在在 Stage 2
+         * 条目创建时同步解析，确保每个缓存条目在写入 HTTP 缓存之前均已完成解析，
+         * 消除 ARM32 QEMU 下第二泄漏站点显示原始 hex 地址的问题。 */
         mtt_stack_entry_t *stack_entry = mtt_stack_cache_lookup(
             sn->stack, sn->stack_frames);
+        if (stack_entry != NULL && !stack_entry->is_resolved)
+            mtt_stack_resolve(stack_entry);
 
         uint64_t hash;
         if (stack_entry != NULL) {
@@ -435,11 +443,14 @@ static void scan_and_report_locked(void)
         /* else: 泄漏表满，静默跳过 */
     }
 
-    /* ---- 阶段 3: 懒解析栈符号 ---- */
+    /* ---- 阶段 3: 懒解析栈符号（安全网：补解析阶段 2 遗漏的条目） ----
+     * 正常情况下阶段 2 已将首次创建缓存条目时所关联栈全部解析完毕，
+     * 此阶段仅处理极端边界情况（如哈希碰撞导致 site->stack_hash 匹配了
+     * 另一个不同 stack 的快照）。正常情况下所有条目在阶段 2 已解析，
+     * se->is_resolved 为 1，此处直接跳过不重复解析。 */
     for (unsigned b = 0; b < MTT_LEAK_DEDUP_SIZE; b++) {
         mtt_leak_site_t *site = leak_table.entries[b];
         while (site != NULL) {
-             /* 遍历快照找到对应 hash 的栈帧并懒解析 */
             for (size_t i = 0; i < snap_count; i++) {
                 mtt_alloc_snap_t *sn = &snaps[i];
                 if (sn->stack_frames <= 0) continue;
@@ -449,7 +460,6 @@ static void scan_and_report_locked(void)
                         sn->stack, sn->stack_frames);
                     if (se != NULL && !se->is_resolved)
                         mtt_stack_resolve(se);
-                    /* 找到一个就跳出，后续同 hash 的已解析 */
                     break;
                 }
             }

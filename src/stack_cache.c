@@ -506,15 +506,22 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
                     }
 
                     /* 提取函数名和偏移（paren -> plus -> rparen）。
-                     * 仅在 backtrace_symbols 提供了非空函数名时覆盖 dladdr 的结果，
-                     * 否则保留 dladdr 的 dli_sname（可能仍是错误的，但好过空字符串）。
-                     * 偏移始终从 backtrace_symbols 提取（函数相对偏移，比 dli_saddr 准确）。 */
+                     * ARM32 QEMU 关键修正：若 backtrace_symbols 未提供函数名
+                     * （nlen==0，如 "binary(+0xOFFSET) [0xADDR]"），则清空 func_name
+                     * 以便后续 "??" 回退。之前保留 dli_sname（如 mtt_entry_new）的策略
+                     * 会导致 write_leak_json 内部帧过滤器拦截该符号（mtt_ 前缀匹配），
+                     * 进而所有已解析帧均被过滤，触发 hex 地址兜底输出。
+                     * 清空 func_name 后，"??+偏移" 格式可通过过滤器在 JSON 中渲染。 */
                     if (paren != NULL && plus != NULL && rparen != NULL
                         && plus > paren && plus < rparen) {
                         size_t nlen = (size_t)(plus - paren - 1);
                         if (nlen > 0 && nlen < sizeof(func_name)) {
                             memcpy(func_name, paren + 1, nlen);
                             func_name[nlen] = '\0';
+                        } else {
+                            /* backtrace_symbols 无函数名：清空以触发 "??" 回退，
+                             * 避免保留 dli_sname（ARM32 QEMU 下为内部 mtt_ 函数） */
+                            func_name[0] = '\0';
                         }
                         /* 使用 backtrace_symbols 的函数相对偏移 */
                         func_off = (ptrdiff_t)strtoul(plus + 1, NULL, 16);
@@ -525,6 +532,10 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
                             memcpy(func_name, paren + 1, nlen);
                             func_name[nlen] = '\0';
                         }
+                    } else {
+                        /* 无 '+' 号且无有效函数名：清空 func_name，
+                         * 后续统一回退为 "??+偏移" 格式 */
+                        func_name[0] = '\0';
                     }
                     free(syms);
                 }

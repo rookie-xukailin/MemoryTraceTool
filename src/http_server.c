@@ -254,6 +254,13 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
     write(fd, buf, (size_t)off);
 
     int wrote_frame = 0;
+    /* ARM32 QEMU 最后补救：若 reporter 线程未解析此栈条目（极端边界），
+     * 在第一次 HTTP 访问时同步解析，确保 JSON 输出始终包含解析后的符号。
+     * 调用方（handle_api_data / handle_api_leaks）持有 cache_lock，
+     * 此时 reporter 线程不会并发修改同一栈条目（scan 已完成，cache 已更新）。 */
+    if (se != NULL && !se->is_resolved) {
+        mtt_stack_resolve(se);
+    }
     if (se != NULL && se->is_resolved) {
         for (int j = 0; j < se->frame_count; j++) {
             const char *sym = se->resolved[j];
