@@ -37,6 +37,21 @@ endif
 
 CROSS_COMPILE := $(TARGET_PREFIX)
 
+# ---- 自动检测 sysroot（交叉编译器自带路径推算不准确时兜底） ----
+# ct-ng 工具链目录结构: ../$(target)/sysroot/usr/include/unistd.h
+ifneq ($(CROSS_COMPILE),)
+  _CC_DIR := $(dir $(CROSS_COMPILE))
+  _TARGET := $(patsubst %-,%,$(notdir $(CROSS_COMPILE)))
+  _AUTO_SYSROOT := $(_CC_DIR)/../$(_TARGET)/sysroot
+  ifneq ($(wildcard $(_AUTO_SYSROOT)/usr/include/unistd.h),)
+    CFLAGS_SYSROOT := --sysroot=$(_AUTO_SYSROOT)
+  else
+    CFLAGS_SYSROOT :=
+  endif
+else
+  CFLAGS_SYSROOT :=
+endif
+
 # 非 x86 平台用 -no-pie
 ifeq ($(ARCH),x86)
   DEMO_EXTRA := -no-pie -fno-stack-protector
@@ -45,9 +60,9 @@ else
 endif
 
 CC       = $(CROSS_COMPILE)gcc
-CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
-LDFLAGS  = -lpthread -ldl -latomic
-DEMO_CFLAGS = -Wall -Wextra -g -O1 $(DEMO_EXTRA) -rdynamic -funwind-tables -fno-omit-frame-pointer
+CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer $(CFLAGS_SYSROOT)
+LDFLAGS  = -lpthread -ldl -latomic $(CFLAGS_SYSROOT)
+DEMO_CFLAGS = -Wall -Wextra -g -O1 $(DEMO_EXTRA) -rdynamic -funwind-tables -fno-omit-frame-pointer $(CFLAGS_SYSROOT)
 
 INC_SHARED = -Isrc
 INC_PUBLIC = -Iinclude -Isrc
