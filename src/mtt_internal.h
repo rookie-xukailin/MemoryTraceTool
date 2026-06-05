@@ -12,6 +12,13 @@
 #define MTT_INTERNAL_H
 
 #include <stddef.h>
+#include <unistd.h>
+
+/* 安全忽略 write() 返回值（诊断输出场景，失败无影响）。
+ * GCC 14+ / 13+ 中 (void)write() 无法抑制 warn_unused_result，
+ * 必须通过实际捕获返回值来消除警告。 */
+#define MTT_DIAG_WRITE(fd, buf, len) \
+    do { ssize_t __mtt_w = write((fd), (buf), (len)); (void)__mtt_w; } while(0)
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>

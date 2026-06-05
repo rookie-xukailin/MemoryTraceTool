@@ -574,7 +574,7 @@ static void scan_and_report_locked(void)
                 "[MTT] ERROR: cannot open %s for writing: %s\n",
                 tmp_path, strerror(errno));
             if (err_len > 0 && err_len < (int)sizeof(err_buf))
-                write(STDERR_FILENO, err_buf, (size_t)err_len);
+                MTT_DIAG_WRITE(STDERR_FILENO, err_buf, (size_t)err_len);
             goto cleanup;
         }
 
@@ -856,7 +856,7 @@ skip_scan:
             "[MTT] WARNING: snapshot alloc failed for %llu entries, skipping scan\n",
             (unsigned long long)entry_total_orig);
         if (err_len > 0 && err_len < (int)sizeof(err_buf))
-            write(STDERR_FILENO, err_buf, (size_t)err_len);
+            MTT_DIAG_WRITE(STDERR_FILENO, err_buf, (size_t)err_len);
     }
 }
 
@@ -996,7 +996,7 @@ void mtt_reporter_start(void)
         "[MTT] Reporter thread started (pid=%d, log=%s, interval=%ds)\n",
         (int)getpid(), g_reporter.log_path, MTT_REPORT_INTERVAL_SEC);
     if (len > 0 && len < (int)sizeof(diag))
-        write(STDERR_FILENO, diag, (size_t)len);
+        MTT_DIAG_WRITE(STDERR_FILENO, diag, (size_t)len);
 }
 
 /**

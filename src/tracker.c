@@ -854,7 +854,7 @@ void mtt_signal_thread_start(void)
         "[MTT] Signal thread ready (kill -USR1 %d for instant report)\n",
         (int)getpid());
     if (len > 0 && len < (int)sizeof(diag))
-        write(STDERR_FILENO, diag, (size_t)len);
+        MTT_DIAG_WRITE(STDERR_FILENO, diag, (size_t)len);
 }
 
 /* ======================================================================== *

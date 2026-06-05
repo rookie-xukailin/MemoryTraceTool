@@ -48,7 +48,7 @@ static void first_call_diag(const char *func_name, _Atomic int *flag)
         int len = snprintf(buf, sizeof(buf),
             "[MTT] hook: %s first call (pid=%d)\n", func_name, (int)getpid());
         if (len > 0 && len < (int)sizeof(buf))
-            write(STDERR_FILENO, buf, (size_t)len);
+            MTT_DIAG_WRITE(STDERR_FILENO, buf, (size_t)len);
     }
 }
 

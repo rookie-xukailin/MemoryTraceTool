@@ -201,22 +201,22 @@ static const char g_dashboard_html[] =
 static void write_json_string(int fd, const char *str)
 {
     if (fd < 0 || str == NULL) return;
-    write(fd, "\"", 1);
+    MTT_DIAG_WRITE(fd, "\"", 1);
     for (const char *p = str; *p != '\0'; p++) {
         unsigned char c = (unsigned char)*p;
         if (c == '"' || c == '\\') {
-            write(fd, "\\", 1);
-            write(fd, p, 1);
+            MTT_DIAG_WRITE(fd, "\\", 1);
+            MTT_DIAG_WRITE(fd, p, 1);
         } else if (c < 0x20) {
             /* 控制字符：编码为 \\u00XX */
             char esc[8];
             int n = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
-            if (n > 0) write(fd, esc, (size_t)n);
+            if (n > 0) MTT_DIAG_WRITE(fd, esc, (size_t)n);
         } else {
-            write(fd, p, 1);
+            MTT_DIAG_WRITE(fd, p, 1);
         }
     }
-    write(fd, "\"", 1);
+    MTT_DIAG_WRITE(fd, "\"", 1);
 }
 
 /** 处理 GET / — 返回仪表盘 HTML */
@@ -228,8 +228,8 @@ static void handle_root(int client_fd)
         "Cache-Control: no-cache\r\n"
         "Connection: close\r\n"
         "\r\n";
-    write(client_fd, header, strlen(header));
-    write(client_fd, g_dashboard_html, strlen(g_dashboard_html));
+    MTT_DIAG_WRITE(client_fd, header, strlen(header));
+    MTT_DIAG_WRITE(client_fd, g_dashboard_html, strlen(g_dashboard_html));
 }
 
 /** 写入单个泄漏站点 JSON */
@@ -239,7 +239,7 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
 
     if (site == NULL) {
         /* 防御：调用者传入 NULL site，写入空对象 */
-        write(fd, "{}", 2);
+        MTT_DIAG_WRITE(fd, "{}", 2);
         return;
     }
 
@@ -255,7 +255,7 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
      * cap 到 (sizeof(buf)-1) 避免读取 buf 越界。正常情况下输出远小于 4096。 */
     if (off < 0) off = 0;
     else if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
-    write(fd, buf, (size_t)off);
+    MTT_DIAG_WRITE(fd, buf, (size_t)off);
 
     int wrote_frame = 0;
     /* ARM32 QEMU 最后补救：若 reporter 线程未解析此栈条目（极端边界），
@@ -274,26 +274,26 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
                 || strstr(sym, "capture_stack") != NULL
                 || strstr(sym, "backtrace") != NULL)
                 continue;
-            if (wrote_frame) write(fd, ",", 1);
+            if (wrote_frame) MTT_DIAG_WRITE(fd, ",", 1);
             wrote_frame = 1;
             /* 写入引号包裹的符号字符串，同时转义 JSON 特殊字符。
              * 控制字符（< 0x20）编码为 \\u00XX，与 write_json_string 保持一致。
              * 确保 ARM32 QEMU 等环境下的符号即使包含特殊字节也不破坏 JSON 格式。 */
-            write(fd, "\"", 1);
+            MTT_DIAG_WRITE(fd, "\"", 1);
             for (const char *p = sym; *p != '\0'; p++) {
                 unsigned char c = (unsigned char)*p;
                 if (c == '"' || c == '\\') {
-                    write(fd, "\\", 1);
-                    write(fd, p, 1);
+                    MTT_DIAG_WRITE(fd, "\\", 1);
+                    MTT_DIAG_WRITE(fd, p, 1);
                 } else if (c < 0x20) {
                     char esc[8];
                     int n = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
-                    if (n > 0) write(fd, esc, (size_t)n);
+                    if (n > 0) MTT_DIAG_WRITE(fd, esc, (size_t)n);
                 } else {
-                    write(fd, p, 1);
+                    MTT_DIAG_WRITE(fd, p, 1);
                 }
             }
-            write(fd, "\"", 1);
+            MTT_DIAG_WRITE(fd, "\"", 1);
         }
     }
 
@@ -307,7 +307,7 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
             if (j == 0) continue; /* 跳过 mtt_capture_stack 自身 */
 
             if (wrote_frame) {
-                write(fd, ",", 1);
+                MTT_DIAG_WRITE(fd, ",", 1);
             }
             wrote_frame = 1;
 
@@ -318,30 +318,30 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
                                (unsigned long)(uintptr_t)se->frames[j]);
                 if (off < 0) off = 0;
                 else if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
-                write(fd, buf, (size_t)off);
+                MTT_DIAG_WRITE(fd, buf, (size_t)off);
             } else {
                 /* 输出已解析符号（不过滤内部帧，与主循环保持一致
                  * 的 JSON 转义逻辑，处理 \" \\ 和控制字符） */
-                write(fd, "\"", 1);
+                MTT_DIAG_WRITE(fd, "\"", 1);
                 for (const char *p = fallback_sym; *p != '\0'; p++) {
                     unsigned char c = (unsigned char)*p;
                     if (c == '"' || c == '\\') {
-                        write(fd, "\\", 1);
-                        write(fd, p, 1);
+                        MTT_DIAG_WRITE(fd, "\\", 1);
+                        MTT_DIAG_WRITE(fd, p, 1);
                     } else if (c < 0x20) {
                         char esc[8];
                         int n = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
-                        if (n > 0) write(fd, esc, (size_t)n);
+                        if (n > 0) MTT_DIAG_WRITE(fd, esc, (size_t)n);
                     } else {
-                        write(fd, p, 1);
+                        MTT_DIAG_WRITE(fd, p, 1);
                     }
                 }
-                write(fd, "\"", 1);
+                MTT_DIAG_WRITE(fd, "\"", 1);
             }
         }
     }
 
-    write(fd, "]}", 2);
+    MTT_DIAG_WRITE(fd, "]}", 2);
 }
 
 /** 处理 GET /api/data */
@@ -354,7 +354,7 @@ static void handle_api_data(int client_fd)
         "Cache-Control: no-cache\r\n"
         "Connection: close\r\n"
         "\r\n";
-    write(client_fd, header, strlen(header));
+    MTT_DIAG_WRITE(client_fd, header, strlen(header));
 
     mtt_state_t *s = mtt_state_get();
     size_t cur_bytes  = (s != NULL) ? atomic_load_explicit(&s->current_bytes, memory_order_relaxed) : 0;
@@ -377,7 +377,7 @@ static void handle_api_data(int client_fd)
         (int)getpid());
     if (len < 0) len = 0;
     else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
-    write(client_fd, buf, (size_t)len);
+    MTT_DIAG_WRITE(client_fd, buf, (size_t)len);
     write_json_string(client_fd, proc_name);
 
     len = snprintf(buf, sizeof(buf),
@@ -388,10 +388,10 @@ static void handle_api_data(int client_fd)
         cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc);
     if (len < 0) len = 0;
     else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
-    write(client_fd, buf, (size_t)len);
+    MTT_DIAG_WRITE(client_fd, buf, (size_t)len);
 
     /* 时序数据 */
-    write(client_fd, ",\"time_series\":[", 16);
+    MTT_DIAG_WRITE(client_fd, ",\"time_series\":[", 16);
     if (mtt_ts_is_ready() && raw_malloc != NULL) {
         mtt_ts_point_t *ts_buf = (mtt_ts_point_t*)raw_malloc(360 * sizeof(mtt_ts_point_t));
         if (ts_buf != NULL) {
@@ -401,7 +401,7 @@ static void handle_api_data(int client_fd)
             int wrote_first = 0;
             for (uint32_t i = 0; i < ts_count; i++) {
                 if (ts_buf[i].timestamp == 0) continue;
-                if (wrote_first) write(client_fd, ",", 1);
+                if (wrote_first) MTT_DIAG_WRITE(client_fd, ",", 1);
                 wrote_first = 1;
                 len = snprintf(buf, sizeof(buf),
                     "{\"ts\":%lld,\"cur\":%zu,\"peak\":%zu,\"allocs\":%zu,\"frees\":%zu,\"entries\":%zu}",
@@ -410,15 +410,15 @@ static void handle_api_data(int client_fd)
                     ts_buf[i].free_count, ts_buf[i].entry_count);
                 if (len < 0) len = 0;
                 else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
-                write(client_fd, buf, (size_t)len);
+                MTT_DIAG_WRITE(client_fd, buf, (size_t)len);
             }
             raw_free(ts_buf);
         }
     }
-    write(client_fd, "]", 1);
+    MTT_DIAG_WRITE(client_fd, "]", 1);
 
     /* 泄漏站点 */
-    write(client_fd, ",\"leaks\":[", 10);
+    MTT_DIAG_WRITE(client_fd, ",\"leaks\":[", 10);
     pthread_mutex_lock(&rep->cache_lock);
     if (rep->cached_sites != NULL && rep->cached_site_count > 0) {
         size_t show = rep->cached_site_count;
@@ -426,7 +426,7 @@ static void handle_api_data(int client_fd)
         int wrote_leak = 0;
         for (size_t i = 0; i < show; i++) {
             if (rep->cached_sites[i] == NULL) continue;
-            if (wrote_leak) write(client_fd, ",", 1);
+            if (wrote_leak) MTT_DIAG_WRITE(client_fd, ",", 1);
             wrote_leak = 1;
             mtt_stack_entry_t *se = NULL;
             if (rep->cached_pairs != NULL) {
@@ -441,7 +441,7 @@ static void handle_api_data(int client_fd)
         }
     }
     pthread_mutex_unlock(&rep->cache_lock);
-    write(client_fd, "]}", 2);
+    MTT_DIAG_WRITE(client_fd, "]}", 2);
 }
 
 /** 处理 GET /api/leaks */
@@ -454,15 +454,15 @@ static void handle_api_leaks(int client_fd)
         "Cache-Control: no-cache\r\n"
         "Connection: close\r\n"
         "\r\n";
-    write(client_fd, header, strlen(header));
-    write(client_fd, "{\"leaks\":[", 10);
+    MTT_DIAG_WRITE(client_fd, header, strlen(header));
+    MTT_DIAG_WRITE(client_fd, "{\"leaks\":[", 10);
 
     pthread_mutex_lock(&rep->cache_lock);
     if (rep->cached_sites != NULL && rep->cached_site_count > 0) {
         int wrote_leak = 0;
         for (size_t i = 0; i < rep->cached_site_count; i++) {
             if (rep->cached_sites[i] == NULL) continue;
-            if (wrote_leak) write(client_fd, ",", 1);
+            if (wrote_leak) MTT_DIAG_WRITE(client_fd, ",", 1);
             wrote_leak = 1;
             mtt_stack_entry_t *se = NULL;
             if (rep->cached_pairs != NULL) {
@@ -477,7 +477,7 @@ static void handle_api_leaks(int client_fd)
         }
     }
     pthread_mutex_unlock(&rep->cache_lock);
-    write(client_fd, "]}", 2);
+    MTT_DIAG_WRITE(client_fd, "]}", 2);
 }
 
 static void handle_404(int client_fd)
@@ -489,8 +489,8 @@ static void handle_404(int client_fd)
         "Content-Type: application/json\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n\r\n", strlen(body));
-    write(client_fd, header, strlen(header));
-    write(client_fd, body, strlen(body));
+    MTT_DIAG_WRITE(client_fd, header, strlen(header));
+    MTT_DIAG_WRITE(client_fd, body, strlen(body));
 }
 
 /* ======================================================================== *
@@ -625,7 +625,7 @@ void mtt_http_server_start(uint16_t port)
     char diag[128];
     int len = snprintf(diag, sizeof(diag), "[MTT] HTTP dashboard: http://0.0.0.0:%u/\n", (unsigned)port);
     if (len > 0 && len < (int)sizeof(diag))
-        write(STDERR_FILENO, diag, (size_t)len);
+        MTT_DIAG_WRITE(STDERR_FILENO, diag, (size_t)len);
 }
 
 void mtt_http_server_stop(void)
