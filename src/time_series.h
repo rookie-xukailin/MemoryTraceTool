@@ -23,6 +23,7 @@ typedef struct {
     size_t   alloc_count;    /* 累计分配次数 */
     size_t   free_count;     /* 累计释放次数 */
     size_t   entry_count;    /* 哈希表中活跃条目数 */
+    size_t   rss_bytes;      /* 进程 RSS（驻留集大小，来自 /proc/self/statm） */
 } mtt_ts_point_t;
 
 /** 时序数据环形缓冲区 */

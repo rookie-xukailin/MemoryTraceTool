@@ -30,15 +30,28 @@
 #define THREAD_COUNT         4
 #define TEST_DURATION_SEC    60
 #define MONITOR_INTERVAL_SEC 2
-#define MAX_ALLOC_PER_THREAD 4096
+#define MAX_ALLOC_PER_THREAD 2048     /* ARM32 默认栈 8KB，2048 个指针 = 8KB，安全 */
 #define MAX_ALLOC_SIZE       65536
 #define MIN_ALLOC_SIZE       8
 
+/* ARM32 默认 pthread 栈 8KB，测试线程栈使用此大小（x86_64 默认 2MB 无影响） */
+#define TEST_THREAD_STACK_SIZE (256 * 1024)  /* 256 KB */
+
 /* ---- 全局控制 ---- */
+
+/** 带栈大小配置的安全线程创建（ARM32 默认栈仅 8KB） */
+static int create_test_thread(pthread_t *tid, void *(*fn)(void *), void *arg)
+{
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, TEST_THREAD_STACK_SIZE);
+    int rc = pthread_create(tid, &attr, fn, arg);
+    pthread_attr_destroy(&attr);
+    return rc;
+}
 
 static volatile int g_running = 1;
 static volatile int g_monitor_done = 0;
-static pthread_mutex_t g_print_lock = PTHREAD_MUTEX_INITIALIZER;
 static void format_bytes_local(size_t b, char *buf, size_t sz);
 
 /* ---- 断言 ---- */
@@ -212,7 +225,7 @@ static void test_a7_leak_near_zero(void)
  * ======================================================================== */
 
 #define PAIR_THREADS    10
-#define PAIR_ALLOCS    5000
+#define PAIR_ALLOCS    2000   /* 每个线程最多 2000 指针 = ARM32 8KB，配合 256KB 栈安全 */
 
 static void* pair_thread_fn(void *arg)
 {
@@ -231,7 +244,7 @@ static void test_b1_pairing_atomic(void)
     size_t a0 = mtt_get_alloc_count(), f0 = mtt_get_free_count();
 
     pthread_t threads[PAIR_THREADS];
-    for (int i = 0; i < PAIR_THREADS; i++) pthread_create(&threads[i], NULL, pair_thread_fn, NULL);
+    for (int i = 0; i < PAIR_THREADS; i++) create_test_thread(&threads[i], pair_thread_fn, NULL);
     for (int i = 0; i < PAIR_THREADS; i++) pthread_join(threads[i], NULL);
 
     size_t added = mtt_get_alloc_count() - a0;
@@ -264,7 +277,7 @@ static void test_c1_bucket_contention(void)
     size_t a0 = mtt_get_alloc_count(), f0 = mtt_get_free_count();
 
     pthread_t threads[BUCKET_THREADS];
-    for (int i = 0; i < BUCKET_THREADS; i++) pthread_create(&threads[i], NULL, bucket_thread_fn, NULL);
+    for (int i = 0; i < BUCKET_THREADS; i++) create_test_thread(&threads[i], bucket_thread_fn, NULL);
     for (int i = 0; i < BUCKET_THREADS; i++) pthread_join(threads[i], NULL);
 
     size_t added = mtt_get_alloc_count() - a0;
@@ -320,10 +333,10 @@ static void test_d1_concurrent_read_write(void)
     TEST("D1. concurrent reader + writer, no deadlock/crash");
     g_rw_running = 1;
     pthread_t w1, w2, r1, r2;
-    pthread_create(&w1, NULL, rw_worker_fn, NULL);
-    pthread_create(&w2, NULL, rw_worker_fn, NULL);
-    pthread_create(&r1, NULL, rw_reader_fn, NULL);
-    pthread_create(&r2, NULL, rw_reader_fn, NULL);
+    create_test_thread(&w1, rw_worker_fn, NULL);
+    create_test_thread(&w2, rw_worker_fn, NULL);
+    create_test_thread(&r1, rw_reader_fn, NULL);
+    create_test_thread(&r2, rw_reader_fn, NULL);
     sleep(5);
     g_rw_running = 0;
     pthread_join(w1, NULL); pthread_join(w2, NULL);
@@ -351,7 +364,7 @@ static void test_e1_race_initialization(void)
     size_t a0 = mtt_get_alloc_count(), f0 = mtt_get_free_count();
 
     pthread_t threads[20];
-    for (int i = 0; i < 20; i++) pthread_create(&threads[i], NULL, race_init_fn, NULL);
+    for (int i = 0; i < 20; i++) create_test_thread(&threads[i], race_init_fn, NULL);
     for (int i = 0; i < 20; i++) pthread_join(threads[i], NULL);
 
     /* 每个线程 alloc+free 1 次，共 20 对（库内部可能额外分配） */
@@ -387,7 +400,7 @@ static void test_f1_realloc_stress(void)
     size_t a0 = mtt_get_alloc_count(), f0 = mtt_get_free_count();
 
     pthread_t threads[4];
-    for (int i = 0; i < 4; i++) pthread_create(&threads[i], NULL, realloc_stress_fn, NULL);
+    for (int i = 0; i < 4; i++) create_test_thread(&threads[i], realloc_stress_fn, NULL);
     for (int i = 0; i < 4; i++) pthread_join(threads[i], NULL);
 
     T_ASSERT_GE(mtt_get_alloc_count(), a0 + 4, "realloc stress: allocs missing");
@@ -426,7 +439,7 @@ static void test_g1_edge_cases_concurrent(void)
 {
     TEST("G1. 5 threads edge cases (malloc(0)/4MB/calloc)");
     pthread_t threads[5];
-    for (int i = 0; i < 5; i++) pthread_create(&threads[i], NULL, edge_thread_fn, NULL);
+    for (int i = 0; i < 5; i++) create_test_thread(&threads[i], edge_thread_fn, NULL);
     for (int i = 0; i < 5; i++) pthread_join(threads[i], NULL);
     /* no crash = pass */
     T_ASSERT(mtt_get_alloc_count() >= mtt_get_free_count(), "counter corrupted");
@@ -468,7 +481,6 @@ static void test_h1_current_bytes_atomic(void)
 static void test_i1_peak_tracking(void)
 {
     TEST("I1. peak_bytes CAS correctness under concurrent updates");
-    size_t peak0 = mtt_get_peak_usage();
 
     /* 分配 10 个 1MB 块，peak 应不小于分配总量 */
     void *ptrs[10];
@@ -535,7 +547,7 @@ static void test_k1_thread_churn(void)
 
     for (int round = 0; round < 4; round++) {
         pthread_t threads[8];
-        for (int i = 0; i < 8; i++) pthread_create(&threads[i], NULL, quick_alloc_free_fn, NULL);
+        for (int i = 0; i < 8; i++) create_test_thread(&threads[i], quick_alloc_free_fn, NULL);
         for (int i = 0; i < 8; i++) pthread_join(threads[i], NULL);
     }
 
@@ -561,13 +573,13 @@ int main(void)
     printf("Baseline: alloc=%zu free=%zu\n", base_alloc, base_free);
 
     pthread_t monitor_tid;
-    pthread_create(&monitor_tid, NULL, monitor_thread_fn, NULL);
+    create_test_thread(&monitor_tid, monitor_thread_fn, NULL);
 
     pthread_t workers[THREAD_COUNT];
     for (int i = 0; i < THREAD_COUNT; i++) {
         int *id = (int *)malloc(sizeof(int));
         *id = i;
-        pthread_create(&workers[i], NULL, worker_thread_fn, id);
+        create_test_thread(&workers[i], worker_thread_fn, id);
     }
 
     printf("\nRunning stress test for %d seconds...\n", TEST_DURATION_SEC);

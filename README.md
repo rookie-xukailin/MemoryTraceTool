@@ -125,6 +125,47 @@ python3 tests/test_frontend_html.py    # HTML/JS/CSS 结构验证 (27 项)
 
 ARM32 验证环境：QEMU user 模式 (`qemu-arm-static -L /usr/arm-linux-gnueabihf`)
 
+## BMC 守护进程部署流程
+
+```bash
+# 1. 开发机交叉编译
+make clean PLATFORM=arm32 && make PLATFORM=arm32
+scp output/libmemorytracetool.so root@<bmc>:/tmp/
+
+# 2. BMC 上重启守护进程 + 注入监控
+ssh root@<bmc>
+systemctl stop <daemon>
+LD_PRELOAD=/tmp/libmemorytracetool.so \
+  MTT_HTTP_PORT=8080 \
+  MTT_LEAK_THRESHOLD_SEC=300 \
+  <daemon_path> &
+
+# 3. 浏览器查看仪表盘
+# http://<bmc-ip>:8080/
+
+# 4. 或在 BMC 上用 curl 查看
+curl -s http://localhost:8080/api/data | python3 -m json.tool | head -80
+# Growth > 0 → 正在泄漏
+# is_expired = 1 → probable leak
+
+# 5. 即时报告（无需等 60s 扫描周期）
+kill -USR1 $(pidof <daemon>)
+
+# 6. 离线火焰图分析
+scp root@<bmc>:/var/log/mtt/*.folded ./
+flamegraph.pl *.folded > flame.svg
+
+# 7. 源码定位
+addr2line -e /path/to/daemon.debug -f -C 0x460
+```
+
+### 无需重启的方案（运行时注入）
+
+```bash
+# GDB 脚本注入（需目标进程链接 libdl）
+./scripts/inject.sh $(pidof <daemon>) MTT_HTTP_PORT=8080
+```
+
 ## 部署到 ARM 设备
 
 ```bash

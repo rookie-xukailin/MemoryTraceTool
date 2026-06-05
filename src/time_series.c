@@ -11,6 +11,8 @@
 #include "time_series.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <unistd.h>
 
 /** 全局时序数据环形缓冲区（单例） */
 static mtt_time_series_t g_time_series;
@@ -78,12 +80,25 @@ void mtt_ts_record_point(void)
 
     /* 从全局状态读取当前统计值（relaxed 读取，近似值可接受） */
     mtt_ts_point_t pt;
+    memset(&pt, 0, sizeof(pt));
     pt.timestamp     = time(NULL);
     pt.current_bytes = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
     pt.peak_bytes    = atomic_load_explicit(&s->peak_bytes,    memory_order_relaxed);
     pt.alloc_count   = atomic_load_explicit(&s->alloc_count,  memory_order_relaxed);
     pt.free_count    = atomic_load_explicit(&s->free_count,   memory_order_relaxed);
     pt.entry_count   = (size_t)atomic_load_explicit(&s->entry_count, memory_order_relaxed);
+
+    /* 读取 RSS（驻留集大小）以区分堆泄漏和 mmap 泄漏。
+     * /proc/self/statm 第二个字段为 RSS 页数，不触发 malloc。 */
+    {
+        FILE *fp = fopen("/proc/self/statm", "r");
+        if (fp != NULL) {
+            long rss_pages = 0;
+            if (fscanf(fp, "%*s %ld", &rss_pages) == 1 && rss_pages > 0)
+                pt.rss_bytes = (size_t)rss_pages * (size_t)sysconf(_SC_PAGESIZE);
+            fclose(fp);
+        }
+    }
 
     pthread_mutex_lock(&g_time_series.lock);
 

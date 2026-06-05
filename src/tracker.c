@@ -130,8 +130,9 @@ static void* bootstrap_realloc(void *ptr, size_t size)
     if (size == 0) { bootstrap_free(ptr); return NULL; }
     void *new_ptr = bootstrap_malloc(size);
     if (new_ptr == NULL) return NULL;
-    /* 无法获取旧大小，保守拷贝 min(size, bootstrap 可用空间) */
-    memcpy(new_ptr, ptr, size);
+    /* 防御：旧大小不可知，限制拷贝上限 64KB 防止越界（仅 bootstrap 阶段） */
+    size_t copy_n = (size < MTT_BOOTSTRAP_BUF_SIZE) ? size : MTT_BOOTSTRAP_BUF_SIZE;
+    memcpy(new_ptr, ptr, copy_n);
     bootstrap_free(ptr);
     return new_ptr;
 }

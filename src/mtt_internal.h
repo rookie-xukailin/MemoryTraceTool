@@ -60,7 +60,7 @@
 
 #define MTT_BUCKETS             4096    /* 哈希桶数量（必须为 2 的幂，用于位掩码取模） */
 #define MTT_MAX_ENTRIES         65536   /* 分配追踪表最大条目数 */
-#define MTT_STACK_DEPTH         16      /* 调用栈最大深度 */
+#define MTT_STACK_DEPTH         32      /* 调用栈最大深度（满足闭源库穿透场景） */
 #define MTT_STACK_CACHE_SIZE    4096    /* 栈帧缓存最大条目（去重后） */
 #define MTT_LEAK_DEDUP_SIZE     2048    /* 泄漏去重表最大条目（报告输出上限） */
 #define MTT_SYMBOL_MAX          256     /* 单帧符号字符串最大长度 */

@@ -363,6 +363,17 @@ static void handle_api_data(int client_fd)
     size_t frees      = (s != NULL) ? atomic_load_explicit(&s->free_count, memory_order_relaxed) : 0;
     size_t total_alloc = (s != NULL) ? atomic_load_explicit(&s->total_bytes, memory_order_relaxed) : 0;
     size_t leak_count = (allocs > frees) ? (allocs - frees) : 0;
+    /* 读取当前 RSS（近似值，不触发 malloc） */
+    size_t rss_bytes = 0;
+    {
+        FILE *fp = fopen("/proc/self/statm", "r");
+        if (fp != NULL) {
+            long rss_pages = 0;
+            if (fscanf(fp, "%*s %ld", &rss_pages) == 1 && rss_pages > 0)
+                rss_bytes = (size_t)rss_pages * (size_t)sysconf(_SC_PAGESIZE);
+            fclose(fp);
+        }
+    }
 
     const char *proc_name = "unknown";
     if (s != NULL && s->proc_name_ready && s->proc_name[0] != '\0')
@@ -383,9 +394,9 @@ static void handle_api_data(int client_fd)
     len = snprintf(buf, sizeof(buf),
         ",\"session_start\":%lld,\"last_scan\":%lld,"
         "\"stats\":{\"current_bytes\":%zu,\"peak_bytes\":%zu,\"alloc_count\":%zu,"
-        "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu}",
+        "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu,\"rss_bytes\":%zu}",
         (long long)session_ts, (long long)time(NULL),
-        cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc);
+        cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc, rss_bytes);
     if (len < 0) len = 0;
     else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
     MTT_DIAG_WRITE(client_fd, buf, (size_t)len);
@@ -404,10 +415,11 @@ static void handle_api_data(int client_fd)
                 if (wrote_first) MTT_DIAG_WRITE(client_fd, ",", 1);
                 wrote_first = 1;
                 len = snprintf(buf, sizeof(buf),
-                    "{\"ts\":%lld,\"cur\":%zu,\"peak\":%zu,\"allocs\":%zu,\"frees\":%zu,\"entries\":%zu}",
+                    "{\"ts\":%lld,\"cur\":%zu,\"peak\":%zu,\"allocs\":%zu,\"frees\":%zu,\"entries\":%zu,\"rss\":%zu}",
                     (long long)ts_buf[i].timestamp, ts_buf[i].current_bytes,
                     ts_buf[i].peak_bytes, ts_buf[i].alloc_count,
-                    ts_buf[i].free_count, ts_buf[i].entry_count);
+                    ts_buf[i].free_count, ts_buf[i].entry_count,
+                    ts_buf[i].rss_bytes);
                 if (len < 0) len = 0;
                 else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
                 MTT_DIAG_WRITE(client_fd, buf, (size_t)len);
