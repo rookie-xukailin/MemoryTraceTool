@@ -206,6 +206,13 @@ static void handle_root(int client_fd)
 static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd)
 {
     static char buf[4096];
+
+    if (site == NULL) {
+        /* 防御：调用者传入 NULL site，写入空对象 */
+        write(fd, "{}", 2);
+        return;
+    }
+
     int off = snprintf(buf, sizeof(buf),
         "{\"hash\":\"0x%llx\",\"count\":%zu,\"per_leak_size\":%zu,"
         "\"total_size\":%zu,\"diff_size\":%zu,\"is_expired\":%d,"
@@ -214,10 +221,11 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
         site->per_leak_size, site->total_size,
         site->diff_size, site->is_expired,
         (long long)site->first_seen, (long long)site->last_seen);
+    if (off < 0) off = 0; /* snprintf 编码错误时防御 */
     write(fd, buf, (size_t)off);
 
+    int wrote_frame = 0;
     if (se != NULL && se->is_resolved) {
-        int first = 1;
         for (int j = 0; j < se->frame_count; j++) {
             const char *sym = se->resolved[j];
             if (sym == NULL || sym[0] == '\0'
@@ -226,8 +234,8 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
                 || strstr(sym, "capture_stack") != NULL
                 || strstr(sym, "backtrace") != NULL)
                 continue;
-            off = snprintf(buf, sizeof(buf), "%s", first ? "" : ",");
-            write(fd, buf, (size_t)off);
+            if (wrote_frame) write(fd, ",", 1);
+            wrote_frame = 1;
             /* 写入引号包裹的符号字符串 */
             write(fd, "\"", 1);
             for (const char *p = sym; *p != '\0'; p++) {
@@ -235,9 +243,29 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
                 write(fd, p, 1);
             }
             write(fd, "\"", 1);
-            first = 0;
         }
     }
+
+    /* 兜底：当所有已解析帧均被过滤时，输出原始帧地址作为后备，
+     * 确保 ARM32 QEMU 等符号解析受限环境下仍能显示调用栈。
+     * 仅跳过第 0 帧（mtt_capture_stack），保留其余所有帧的原始地址。 */
+    if (!wrote_frame && se != NULL && se->frame_count > 0) {
+        for (int j = 0; j < se->frame_count; j++) {
+            /* 仅跳过第 0 帧（始终为 mtt_capture_stack，无诊断价值） */
+            if (j == 0) continue;
+            if (wrote_frame) {
+                off = snprintf(buf, sizeof(buf), ",");
+                if (off < 0) off = 0;
+                write(fd, buf, (size_t)off);
+            }
+            wrote_frame = 1;
+            off = snprintf(buf, sizeof(buf), "\"0x%lx\"",
+                           (unsigned long)(uintptr_t)se->frames[j]);
+            if (off < 0) off = 0;
+            write(fd, buf, (size_t)off);
+        }
+    }
+
     write(fd, "]}", 2);
 }
 
@@ -306,9 +334,11 @@ static void handle_api_data(int client_fd)
     if (rep->cached_sites != NULL && rep->cached_site_count > 0) {
         size_t show = rep->cached_site_count;
         if (show > 50) show = 50;
+        int wrote_leak = 0;
         for (size_t i = 0; i < show; i++) {
             if (rep->cached_sites[i] == NULL) continue;
-            if (i > 0) write(client_fd, ",", 1);
+            if (wrote_leak) write(client_fd, ",", 1);
+            wrote_leak = 1;
             mtt_stack_entry_t *se = NULL;
             if (rep->cached_pairs != NULL) {
                 site_stack_pair_t *pp = (site_stack_pair_t*)rep->cached_pairs;
@@ -340,9 +370,11 @@ static void handle_api_leaks(int client_fd)
 
     pthread_mutex_lock(&rep->cache_lock);
     if (rep->cached_sites != NULL && rep->cached_site_count > 0) {
+        int wrote_leak = 0;
         for (size_t i = 0; i < rep->cached_site_count; i++) {
             if (rep->cached_sites[i] == NULL) continue;
-            if (i > 0) write(client_fd, ",", 1);
+            if (wrote_leak) write(client_fd, ",", 1);
+            wrote_leak = 1;
             mtt_stack_entry_t *se = NULL;
             if (rep->cached_pairs != NULL) {
                 site_stack_pair_t *pp = (site_stack_pair_t*)rep->cached_pairs;

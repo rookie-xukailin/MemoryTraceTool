@@ -463,6 +463,35 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
             func_name[nlen] = '\0';
             func_off = (char*)addr - (char*)info.dli_saddr;
             if (func_off < 0) func_off = 0;
+
+            /* ARM32 QEMU 误判修正：若 dladdr 将主二进制中的地址误识别为
+             * libmemorytracetool.so 中的地址，尝试用 backtrace_symbols 修正库名 */
+#if MTT_HAS_BACKTRACE
+            if (lib_name != NULL && strstr(lib_name, "libmemorytracetool") != NULL) {
+                char **syms = backtrace_symbols(&addr, 1);
+                if (syms != NULL && syms[0] != NULL) {
+                    char *paren = strchr(syms[0], '(');
+                    if (paren != NULL && paren > syms[0]) {
+                        const char *bin_start = syms[0];
+                        if (bin_start[0] == '.' && bin_start[1] == '/')
+                            bin_start += 2;
+                        ptrdiff_t bin_len = paren - bin_start;
+                        while (bin_len > 0 && (bin_start[bin_len - 1] == ' '
+                                               || bin_start[bin_len - 1] == '\t'))
+                            bin_len--;
+                        if (bin_len > 0) {
+                            static char alt_lib2[256];
+                            size_t copy_n = (size_t)bin_len;
+                            if (copy_n >= sizeof(alt_lib2)) copy_n = sizeof(alt_lib2) - 1;
+                            memcpy(alt_lib2, bin_start, copy_n);
+                            alt_lib2[copy_n] = '\0';
+                            lib_name = alt_lib2;
+                        }
+                    }
+                    free(syms);
+                }
+            }
+#endif
         } else {
             /* dli_sname 为 NULL：缺少 -rdynamic 导致符号未导出到 .dynsym 表。
              * 偏移使用 dli_fbase（dladdr 成功就有），确保与 addr2line -e 兼容。
@@ -472,15 +501,55 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
                 if (func_off < 0) func_off = 0;
             }
 #if MTT_HAS_BACKTRACE
-            /* 回退到 backtrace_symbols() 仅用于尝试提取函数名。
+            /* 回退到 backtrace_symbols() 用于提取函数名和库名。
              * 格式取决于是否启用 -rdynamic：
              *   有 -rdynamic: "binary(func+0xOFFSET) [0xADDR]"
-             *   无 -rdynamic: "binary(+0xOFFSET) [0xADDR]" — 函数名为空 */
+             *   无 -rdynamic: "binary(+0xOFFSET) [0xADDR]" — 函数名为空
+             *
+             * ARM32 QEMU 特例：qemu-user 下 dladdr 可能将主二进制中的地址
+             * 误识别为 LD_PRELOAD 库（libmemorytracetool.so）中的地址。
+             * 此时 backtrace_symbols 仍能返回正确的二进制名称，
+             * 优先使用 backtrace_symbols 的库名替换 dladdr 结果。 */
             char **syms = backtrace_symbols(&addr, 1);
             if (syms != NULL && syms[0] != NULL) {
+                /* 从 backtrace_symbols 提取二进制名称（'(' 之前的部分） */
                 char *paren = strchr(syms[0], '(');
                 char *plus  = (paren != NULL) ? strchr(paren, '+') : NULL;
                 char *rparen = (paren != NULL) ? strchr(paren, ')') : NULL;
+
+                /* 提取库名：若 backtrace_symbols 提供了有效名称，
+                 * 且 dladdr 返回的名称包含 "libmemorytracetool"（ARM32 QEMU 误判），
+                 * 则用 backtrace_symbols 的库名覆盖 */
+                if (paren != NULL && paren > syms[0]) {
+                    /* 库名 = syms[0] 到 paren 之间的内容，去除 '[' 和尾部空格 */
+                    const char *bin_start = syms[0];
+                    /* 跳过 './' 前缀 */
+                    if (bin_start[0] == '.' && bin_start[1] == '/')
+                        bin_start += 2;
+                    /* 跳过 '[' 前缀（某些平台格式 "[0xADDR] binary(func+...)")，
+                     * 检查第一个字符是否为 '[' 且不是完整的 '[' 在开头 */
+                    if (bin_start[0] == '[') {
+                        const char *space = strchr(bin_start, ' ');
+                        if (space != NULL) bin_start = space + 1;
+                    }
+                    ptrdiff_t bin_len = paren - bin_start;
+                    while (bin_len > 0 && (bin_start[bin_len - 1] == ' '
+                                           || bin_start[bin_len - 1] == '\t'))
+                        bin_len--;
+                    if (bin_len > 0) {
+                        /* 若 dladdr 返回的库名包含 libmemorytracetool，优先用
+                         * backtrace_symbols 的库名（ARM32 QEMU 误判修正） */
+                        if (lib_name != NULL && strstr(lib_name, "libmemorytracetool") != NULL) {
+                            static char alt_lib[256];
+                            size_t copy_n = (size_t)bin_len;
+                            if (copy_n >= sizeof(alt_lib)) copy_n = sizeof(alt_lib) - 1;
+                            memcpy(alt_lib, bin_start, copy_n);
+                            alt_lib[copy_n] = '\0';
+                            lib_name = alt_lib;
+                        }
+                    }
+                }
+
                 if (paren != NULL && plus != NULL && rparen != NULL
                     && plus > paren && plus < rparen) {
                     /* 尝试提取函数名（可能为空字符串，取决于 -rdynamic） */
