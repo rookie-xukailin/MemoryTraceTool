@@ -22,6 +22,7 @@
 #include <memorytracetool/memorytracetool.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -261,7 +262,8 @@ static void verify_total_allocated_positive(void)
     size_t t = mtt_get_total_allocated();
     T_ASSERT(t > 0, "total_allocated is 0 after 60s stress");
     /* 应远小于溢出值（64-bit 不可能溢出，但 sanity check） */
-    T_ASSERT(t < (size_t)1 << 62, "total_allocated suspiciously large");
+    /* ARM32: size_t 为 32-bit，用 SIZE_MAX/2 作上限（避免溢出回绕） */
+    T_ASSERT(t < SIZE_MAX / 2, "total_allocated suspiciously large");
     PASS();
 }
 
@@ -295,7 +297,6 @@ static void verify_peak_persists(void)
     TEST("peak_bytes stable after multiple reads");
     size_t p1 = mtt_get_peak_usage();
     size_t p2 = mtt_get_peak_usage();
-    char buf[128];
     if (p1 != p2) {
         /* peak 可能在两次读取之间有新的高水位，但不应该降低 */
         T_ASSERT(p2 >= p1, "peak_bytes decreased between reads");

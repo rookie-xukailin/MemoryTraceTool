@@ -24,7 +24,7 @@ else
 endif
 
 CC       = $(CROSS_COMPILE)gcc
-CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
+CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer -Wno-unused-result
 LDFLAGS  = -lpthread -ldl -latomic
 DEMO_CFLAGS = -Wall -Wextra -g -O1 $(DEMO_EXTRA) -rdynamic -funwind-tables -fno-omit-frame-pointer
 
@@ -126,15 +126,24 @@ run_demo_controlled_leak: demo_controlled_leak
 #  测试
 # =====================================================
 
+# ARM32/ARM64 通过 QEMU 运行测试，x86 直接执行
+ifeq ($(PLATFORM),arm32)
+  TEST_RUNNER = qemu-arm-static -L /usr/arm-linux-gnueabihf
+else ifeq ($(PLATFORM),arm64)
+  TEST_RUNNER = qemu-aarch64-static -L /usr/aarch64-linux-gnu
+else
+  TEST_RUNNER =
+endif
+
 test: $(SHARED_LIB) tests/test_basic.c | $(BUILD_DIR)
 	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/test_basic tests/test_basic.c \
 		-L$(BUILD_DIR) -lmemorytracetool $(LDFLAGS)
-	LD_LIBRARY_PATH=$(BUILD_DIR) $(BUILD_DIR)/test_basic
+	LD_LIBRARY_PATH=$(BUILD_DIR) $(TEST_RUNNER) $(BUILD_DIR)/test_basic
 
 test_stability: $(SHARED_LIB) tests/test_stability.c | $(BUILD_DIR)
 	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/test_stability tests/test_stability.c \
 		-L$(BUILD_DIR) -lmemorytracetool $(LDFLAGS)
-	LD_LIBRARY_PATH=$(BUILD_DIR) $(BUILD_DIR)/test_stability
+	LD_LIBRARY_PATH=$(BUILD_DIR) $(TEST_RUNNER) $(BUILD_DIR)/test_stability
 
 test_all: test test_stability
 	@echo "C tests done. Frontend tests need HTTP server running separately."
