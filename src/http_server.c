@@ -272,11 +272,22 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
                 continue;
             if (wrote_frame) write(fd, ",", 1);
             wrote_frame = 1;
-            /* 写入引号包裹的符号字符串 */
+            /* 写入引号包裹的符号字符串，同时转义 JSON 特殊字符。
+             * 控制字符（< 0x20）编码为 \\u00XX，与 write_json_string 保持一致。
+             * 确保 ARM32 QEMU 等环境下的符号即使包含特殊字节也不破坏 JSON 格式。 */
             write(fd, "\"", 1);
             for (const char *p = sym; *p != '\0'; p++) {
-                if (*p == '"' || *p == '\\') write(fd, "\\", 1);
-                write(fd, p, 1);
+                unsigned char c = (unsigned char)*p;
+                if (c == '"' || c == '\\') {
+                    write(fd, "\\", 1);
+                    write(fd, p, 1);
+                } else if (c < 0x20) {
+                    char esc[8];
+                    int n = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+                    if (n > 0) write(fd, esc, (size_t)n);
+                } else {
+                    write(fd, p, 1);
+                }
             }
             write(fd, "\"", 1);
         }

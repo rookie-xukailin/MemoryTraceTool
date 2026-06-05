@@ -150,12 +150,22 @@ void* malloc(size_t size)
     atomic_fetch_add_explicit(&s->total_bytes,   size, memory_order_relaxed);
 
     /* CAS 更新峰值 */
-    size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
-    size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
-    while (cur > old_peak) {
-        if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
-                memory_order_relaxed, memory_order_relaxed))
-            break;
+    {
+        int peak_changed = 0;
+        size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
+        size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
+        while (cur > old_peak) {
+            if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                peak_changed = 1;
+                break;
+            }
+        }
+        /* 峰值更新后通知 reporter 线程（借鉴 jemalloc prof_gdump）。
+         * 仅在 LD_PRELOAD 路径（hooks.c）中设置，mtt_malloc API 路径中也设置。
+         * ARM32: relaxed store 成本低廉，避免峰值漏报导致的延迟报告。 */
+        if (peak_changed)
+            atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
     }
 
     mtt_entry_add(s, e);
@@ -361,12 +371,19 @@ void* realloc(void *ptr, size_t size)
                         atomic_fetch_add_explicit(&s->current_bytes, size, memory_order_relaxed);
                         atomic_fetch_add_explicit(&s->total_bytes, size, memory_order_relaxed);
 
-                        size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
-                        size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
-                        while (cur > old_peak) {
-                            if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
-                                    memory_order_relaxed, memory_order_relaxed))
-                                break;
+                        {
+                            int peak_changed = 0;
+                            size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
+                            size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
+                            while (cur > old_peak) {
+                                if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
+                                        memory_order_relaxed, memory_order_relaxed)) {
+                                    peak_changed = 1;
+                                    break;
+                                }
+                            }
+                            if (peak_changed)
+                                atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
                         }
                         mtt_entry_add(s, new_e);
                     } else {
@@ -437,12 +454,19 @@ void* realloc(void *ptr, size_t size)
     atomic_fetch_add_explicit(&s->current_bytes, size, memory_order_relaxed);
     atomic_fetch_add_explicit(&s->total_bytes,   size, memory_order_relaxed);
 
-    size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
-    size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
-    while (cur > old_peak) {
-        if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
-                memory_order_relaxed, memory_order_relaxed))
-            break;
+    {
+        int peak_changed = 0;
+        size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
+        size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
+        while (cur > old_peak) {
+            if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                peak_changed = 1;
+                break;
+            }
+        }
+        if (peak_changed)
+            atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
     }
 
     mtt_entry_add(s, new_e);
