@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <errno.h>
@@ -472,17 +473,35 @@ static void* http_thread_fn(void *arg)
         FD_SET(g_http_server.listen_fd, &rfds);
         struct timeval tv = {1, 0};
         int ready = select(g_http_server.listen_fd + 1, &rfds, NULL, NULL, &tv);
-        if (ready < 0) { if (errno == EINTR) continue; break; }
+        if (ready < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            break;
+        }
         if (ready == 0) continue;
         if (!FD_ISSET(g_http_server.listen_fd, &rfds)) continue;
 
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
         int client_fd = accept(g_http_server.listen_fd, (struct sockaddr*)&client_addr, &addr_len);
-        if (client_fd < 0) { if (errno == EINTR || errno == EAGAIN) continue; break; }
+        if (client_fd < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+            break;
+        }
 
         memset(req_buf, 0, sizeof(req_buf));
         ssize_t n = recv(client_fd, req_buf, sizeof(req_buf) - 1, 0);
+        /* ARM32 QEMU: recv may spuriously return EAGAIN when data
+         * has not yet been delivered by QEMU user-mode networking.
+         * Retry up to 3 times with a 50ms wait between attempts. */
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            int retries = 0;
+            do {
+                struct timespec ts = {0, 50000000}; /* 50ms */
+                nanosleep(&ts, NULL);
+                n = recv(client_fd, req_buf, sizeof(req_buf) - 1, 0);
+                retries++;
+            } while (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) && retries < 3);
+        }
         if (n <= 0) { close(client_fd); continue; }
         req_buf[n] = '\0';
 
