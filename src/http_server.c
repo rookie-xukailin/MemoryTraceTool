@@ -250,7 +250,10 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
         site->per_leak_size, site->total_size,
         site->diff_size, site->is_expired,
         (long long)site->first_seen, (long long)site->last_seen);
-    if (off < 0) off = 0; /* snprintf 编码错误时防御 */
+    /* 防御：snprintf 可能返回 >= sizeof(buf)（truncation 情况），
+     * cap 到 (sizeof(buf)-1) 避免读取 buf 越界。正常情况下输出远小于 4096。 */
+    if (off < 0) off = 0;
+    else if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
     write(fd, buf, (size_t)off);
 
     int wrote_frame = 0;
@@ -303,12 +306,14 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
             if (wrote_frame) {
                 off = snprintf(buf, sizeof(buf), ",");
                 if (off < 0) off = 0;
+                else if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
                 write(fd, buf, (size_t)off);
             }
             wrote_frame = 1;
             off = snprintf(buf, sizeof(buf), "\"0x%lx\"",
                            (unsigned long)(uintptr_t)se->frames[j]);
             if (off < 0) off = 0;
+            else if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
             write(fd, buf, (size_t)off);
         }
     }
@@ -347,6 +352,8 @@ static void handle_api_data(int client_fd)
     int len = snprintf(buf, sizeof(buf),
         "{\"pid\":%d,\"proc_name\":",
         (int)getpid());
+    if (len < 0) len = 0;
+    else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
     write(client_fd, buf, (size_t)len);
     write_json_string(client_fd, proc_name);
 
@@ -356,6 +363,8 @@ static void handle_api_data(int client_fd)
         "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu}",
         (long long)session_ts, (long long)time(NULL),
         cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc);
+    if (len < 0) len = 0;
+    else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
     write(client_fd, buf, (size_t)len);
 
     /* 时序数据 */
@@ -376,6 +385,8 @@ static void handle_api_data(int client_fd)
                     (long long)ts_buf[i].timestamp, ts_buf[i].current_bytes,
                     ts_buf[i].peak_bytes, ts_buf[i].alloc_count,
                     ts_buf[i].free_count, ts_buf[i].entry_count);
+                if (len < 0) len = 0;
+                else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
                 write(client_fd, buf, (size_t)len);
             }
             raw_free(ts_buf);

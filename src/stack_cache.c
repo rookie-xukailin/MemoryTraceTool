@@ -539,6 +539,14 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
                     }
                     free(syms);
                 }
+                /* ARM32 QEMU 防御：若 backtrace_symbols 也未提供函数名
+                 * （如格式 "binary(+0xOFFSET) [0xADDR]" 中函数名为空），
+                 * 回退为 "??+偏移" 格式，避免输出以 '+' 开头的空函数名。
+                 * 此格式不会被内部帧过滤器拦截（因为不匹配 mtt_/backtrace 等），
+                 * 能在 JSON 输出中正确渲染调用栈帧。 */
+                if (func_name[0] == '\0') {
+                    snprintf(func_name, sizeof(func_name), "??");
+                }
             }
 #endif
         } else {
