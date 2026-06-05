@@ -36,7 +36,7 @@ LD_PRELOAD →
 | 文件 | 覆盖范围 | 用例数 |
 |------|---------|--------|
 | tests/test_basic.c | malloc/free/calloc/realloc 各种大小和边界 | 36 |
-| tests/test_stability.c | 60 秒并发 alloc/free 长稳测试 | 7 |
+| tests/test_stability.c | 60 秒长稳 + 并发配对/同桶竞争/读写并发/竞态初始化/realloc压力/边界并发/current_bytes原子/峰值CAS/混合操作/线程搅动 | 17 |
 | tests/test_frontend_json.py | /api/data JSON 结构和语义验证 | 20 |
 | tests/test_frontend_html.py | / 仪表盘 HTML/JS/CSS 结构验证 | 27 |
 

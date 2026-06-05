@@ -106,7 +106,7 @@ flamegraph.pl /var/log/mtt/<pid>_<name>.folded > flame.svg
 
 ```bash
 make PLATFORM=arm32 test       # test_basic (36 用例)
-make PLATFORM=arm32 test_all   # test_basic + test_stability
+make PLATFORM=arm32 test_all   # test_basic + test_stability (18 cases)
 
 # 前端测试（需先启动 HTTP 服务器）
 python3 tests/test_frontend_json.py    # JSON 结构和语义验证 (20 项)
