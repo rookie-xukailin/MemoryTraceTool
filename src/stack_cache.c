@@ -444,6 +444,7 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
     char func_name[256] = {0};
     const char *lib_name = "??";
     ptrdiff_t   func_off = 0;
+    ptrdiff_t   file_off = 0;  /* addr2line 可用的文件内偏移（addr - dli_fbase） */
 
     Dl_info info;
     memset(&info, 0, sizeof(info));
@@ -453,6 +454,12 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
         const char *base  = strrchr(fname, '/');
         if (base != NULL) fname = base + 1;
         lib_name = fname;
+
+        /* 总是计算文件内偏移（addr2line -e 可直接使用此值） */
+        if (info.dli_fbase != NULL) {
+            file_off = (char*)addr - (char*)info.dli_fbase;
+            if (file_off < 0) file_off = 0;
+        }
 
         if (info.dli_sname != NULL) {
             /* dladdr 成功解析符号名（需要 -rdynamic 链接选项）。
@@ -674,7 +681,7 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
     {
         char demangled_name[256] = {0};
         demangle_symbol(func_name, demangled_name, sizeof(demangled_name));
-        snprintf(out, out_size, "%s+%#tx (%s)", demangled_name, func_off, lib_name);
+        snprintf(out, out_size, "%s+%#tx (%s+%#tx)", demangled_name, func_off, lib_name, file_off);
     }
 
     /* 缓存到按地址索引的符号缓存（后续同一帧地址命中缓存，跳过 dladdr） */
