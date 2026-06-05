@@ -1,10 +1,32 @@
-CROSS_COMPILE ?=
+# MemoryTraceTool — 多平台编译
+#
+# 用法:
+#   make                    # 默认 x86_64 原生编译
+#   make PLATFORM=arm32     # ARM32 (arm-linux-gnueabihf)
+#   make PLATFORM=arm64     # ARM64 (aarch64-linux-gnu)
+#   make PLATFORM=x86       # x86_64 原生编译
+#   make PLATFORM=arm32 demo_controlled_leak test  # 编译+测试
+#
+# 产物: build/libmemorytracetool.so
+
+# ---- 平台选择 ----
+PLATFORM ?= x86
+
+ifeq ($(PLATFORM),arm32)
+  CROSS_COMPILE := arm-linux-gnueabihf-
+  DEMO_EXTRA := -no-pie
+else ifeq ($(PLATFORM),arm64)
+  CROSS_COMPILE := aarch64-linux-gnu-
+  DEMO_EXTRA := -no-pie
+else
+  CROSS_COMPILE :=
+  DEMO_EXTRA := -no-pie -fno-stack-protector
+endif
+
 CC       = $(CROSS_COMPILE)gcc
 CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
-LDFLAGS  = -lpthread -ldl -latomic -lstdc++
-# 可执行文件使用 -no-pie（PIE + LD_PRELOAD 在部分平台会导致 backtrace() 崩溃）
-DEMO_CFLAGS = -Wall -Wextra -g -O1 -no-pie -fno-stack-protector
-DEMO_LDFLAGS = -rdynamic
+LDFLAGS  = -lpthread -ldl -latomic
+DEMO_CFLAGS = -Wall -Wextra -g -O1 $(DEMO_EXTRA) -rdynamic
 
 INC_SHARED = -Isrc
 INC_PUBLIC = -Iinclude -Isrc
@@ -19,10 +41,14 @@ LIB_OBJS = $(BUILD_DIR)/hooks.o $(BUILD_DIR)/tracker.o \
 
 SHARED_LIB = $(BUILD_DIR)/libmemorytracetool.so
 
-.PHONY: all clean demo demo_preload demo_long_running test test_stability test_all
+.PHONY: all clean demo demo_preload demo_long_running demo_controlled_leak \
+        test test_stability test_all run_demo run_demo_preload \
+        run_demo_long_running run_demo_controlled_leak
 
 all: $(SHARED_LIB)
 	@rm -f $(BUILD_DIR)/*.o
+	@echo "=== Platform: $(PLATFORM) ==="
+	@file $(SHARED_LIB)
 
 # =====================================================
 #  共享库
@@ -67,22 +93,18 @@ $(BUILD_DIR):
 #  示例程序
 # =====================================================
 
-# 宏模式示例（显式链接库，调用 mtt_malloc/mtt_free）
 demo: $(SHARED_LIB) examples/demo.c | $(BUILD_DIR)
 	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/demo examples/demo.c \
 		-L$(BUILD_DIR) -lmemorytracetool $(LDFLAGS)
 
-# LD_PRELOAD 模式示例（标准 malloc/free，运行时注入）
 demo_preload: $(SHARED_LIB) examples/demo_preload.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) $(DEMO_LDFLAGS) -o $(BUILD_DIR)/demo_preload examples/demo_preload.c
+	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_preload examples/demo_preload.c
 
-# 长期运行示例（LD_PRELOAD 模式，持续分配+泄漏）
 demo_long_running: $(SHARED_LIB) examples/demo_long_running.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) $(DEMO_LDFLAGS) -o $(BUILD_DIR)/demo_long_running examples/demo_long_running.c -lpthread
+	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_long_running examples/demo_long_running.c -lpthread
 
-# 可控泄漏示例（20 分钟 ~50MB，配合 Web 仪表盘观察）
 demo_controlled_leak: $(SHARED_LIB) examples/demo_controlled_leak.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) $(DEMO_LDFLAGS) -o $(BUILD_DIR)/demo_controlled_leak examples/demo_controlled_leak.c -lpthread
+	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_controlled_leak examples/demo_controlled_leak.c -lpthread
 
 # =====================================================
 #  运行示例
@@ -105,19 +127,17 @@ run_demo_controlled_leak: demo_controlled_leak
 # =====================================================
 
 test: $(SHARED_LIB) tests/test_basic.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/test_basic tests/test_basic.c \
+	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/test_basic tests/test_basic.c \
 		-L$(BUILD_DIR) -lmemorytracetool $(LDFLAGS)
 	LD_LIBRARY_PATH=$(BUILD_DIR) $(BUILD_DIR)/test_basic
 
 test_stability: $(SHARED_LIB) tests/test_stability.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/test_stability tests/test_stability.c \
+	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/test_stability tests/test_stability.c \
 		-L$(BUILD_DIR) -lmemorytracetool $(LDFLAGS)
 	LD_LIBRARY_PATH=$(BUILD_DIR) $(BUILD_DIR)/test_stability
 
 test_all: test test_stability
-	@echo "Both C tests completed. Run frontend tests separately:"
-	@echo "  python3 tests/test_frontend_json.py"
-	@echo "  python3 tests/test_frontend_html.py"
+	@echo "C tests done. Frontend tests need HTTP server running separately."
 
 # =====================================================
 #  清理
