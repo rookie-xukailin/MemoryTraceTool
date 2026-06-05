@@ -11,7 +11,7 @@ make PLATFORM=arm32
 
 # 2. 编译 demo + 启动监控
 make PLATFORM=arm32 demo_controlled_leak
-LD_PRELOAD=./build/libmemorytracetool.so MTT_HTTP_PORT=8080 ./build/demo_controlled_leak &
+LD_PRELOAD=./output/libmemorytracetool.so MTT_HTTP_PORT=8080 ./output/demo_controlled_leak &
 
 # 3. 浏览器打开 http://localhost:8080
 ```
@@ -30,7 +30,7 @@ make PLATFORM=x86       # x86_64（等于默认）
 ## 监控你的程序
 
 ```bash
-LD_PRELOAD=./build/libmemorytracetool.so ./your_app
+LD_PRELOAD=./output/libmemorytracetool.so ./your_app
 ```
 
 程序运行时打开 `http://localhost:8080`，实时看到：

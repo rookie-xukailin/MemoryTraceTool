@@ -7,9 +7,10 @@
 #   make PLATFORM=x86       # x86_64 原生编译
 #   make PLATFORM=arm32 demo_controlled_leak test  # 编译+测试
 #
-# 产物: build/libmemorytracetool.so
+# 目录约定:
+#   build/   — 编译中间产物 (.o)，make clean 清除
+#   output/  — 最终发布产物 (.so, demo, test 可执行文件)
 
-# ---- 平台选择 ----
 PLATFORM ?= x86
 
 ifeq ($(PLATFORM),arm32)
@@ -32,33 +33,40 @@ INC_SHARED = -Isrc
 INC_PUBLIC = -Iinclude -Isrc
 SRC_DIR    = src
 BUILD_DIR  = build
+OUTPUT_DIR = output
 
-# 共享库目标文件（7 个模块）
 LIB_OBJS = $(BUILD_DIR)/hooks.o $(BUILD_DIR)/tracker.o \
            $(BUILD_DIR)/stack_cache.o $(BUILD_DIR)/reporter.o \
            $(BUILD_DIR)/time_series.o $(BUILD_DIR)/flamegraph.o \
            $(BUILD_DIR)/http_server.o
 
-SHARED_LIB = $(BUILD_DIR)/libmemorytracetool.so
+SHARED_LIB = $(OUTPUT_DIR)/libmemorytracetool.so
 
 .PHONY: all clean demo demo_preload demo_long_running demo_controlled_leak \
         test test_stability test_all run_demo run_demo_preload \
         run_demo_long_running run_demo_controlled_leak
 
 all: $(SHARED_LIB)
-	@rm -f $(BUILD_DIR)/*.o
 	@echo "=== Platform: $(PLATFORM) ==="
 	@file $(SHARED_LIB)
 
 # =====================================================
-#  共享库
+#  目录
 # =====================================================
 
-$(SHARED_LIB): $(LIB_OBJS) | $(BUILD_DIR)
+$(BUILD_DIR) $(OUTPUT_DIR):
+	mkdir -p $@
+
+# =====================================================
+#  共享库（链接到 output/）
+# =====================================================
+
+$(SHARED_LIB): $(LIB_OBJS) | $(OUTPUT_DIR)
 	$(CC) -shared -o $@ $^ $(LDFLAGS)
+	@rm -f $(BUILD_DIR)/*.o
 
 # =====================================================
-#  各模块编译规则
+#  各模块 .o → build/
 # =====================================================
 
 $(BUILD_DIR)/hooks.o: $(SRC_DIR)/hooks.c $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
@@ -83,50 +91,42 @@ $(BUILD_DIR)/http_server.o: $(SRC_DIR)/http_server.c $(SRC_DIR)/http_server.h $(
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
 # =====================================================
-#  构建目录
+#  示例程序 → output/
 # =====================================================
 
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
+demo: $(SHARED_LIB) examples/demo.c | $(OUTPUT_DIR)
+	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/demo examples/demo.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
 
-# =====================================================
-#  示例程序
-# =====================================================
+demo_preload: $(SHARED_LIB) examples/demo_preload.c | $(OUTPUT_DIR)
+	$(CC) $(DEMO_CFLAGS) -o $(OUTPUT_DIR)/demo_preload examples/demo_preload.c
 
-demo: $(SHARED_LIB) examples/demo.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/demo examples/demo.c \
-		-L$(BUILD_DIR) -lmemorytracetool $(LDFLAGS)
+demo_long_running: $(SHARED_LIB) examples/demo_long_running.c | $(OUTPUT_DIR)
+	$(CC) $(DEMO_CFLAGS) -o $(OUTPUT_DIR)/demo_long_running examples/demo_long_running.c -lpthread
 
-demo_preload: $(SHARED_LIB) examples/demo_preload.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_preload examples/demo_preload.c
-
-demo_long_running: $(SHARED_LIB) examples/demo_long_running.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_long_running examples/demo_long_running.c -lpthread
-
-demo_controlled_leak: $(SHARED_LIB) examples/demo_controlled_leak.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) -o $(BUILD_DIR)/demo_controlled_leak examples/demo_controlled_leak.c -lpthread
+demo_controlled_leak: $(SHARED_LIB) examples/demo_controlled_leak.c | $(OUTPUT_DIR)
+	$(CC) $(DEMO_CFLAGS) -o $(OUTPUT_DIR)/demo_controlled_leak examples/demo_controlled_leak.c -lpthread
 
 # =====================================================
 #  运行示例
 # =====================================================
 
 run_demo: demo
-	LD_LIBRARY_PATH=$(BUILD_DIR) $(BUILD_DIR)/demo
+	LD_LIBRARY_PATH=$(OUTPUT_DIR) $(OUTPUT_DIR)/demo
 
 run_demo_preload: demo_preload
-	LD_PRELOAD=$(SHARED_LIB) $(BUILD_DIR)/demo_preload
+	LD_PRELOAD=$(SHARED_LIB) $(OUTPUT_DIR)/demo_preload
 
 run_demo_long_running: demo_long_running
-	LD_PRELOAD=$(SHARED_LIB) $(BUILD_DIR)/demo_long_running
+	LD_PRELOAD=$(SHARED_LIB) $(OUTPUT_DIR)/demo_long_running
 
 run_demo_controlled_leak: demo_controlled_leak
-	LD_PRELOAD=$(SHARED_LIB) $(BUILD_DIR)/demo_controlled_leak
+	LD_PRELOAD=$(SHARED_LIB) $(OUTPUT_DIR)/demo_controlled_leak
 
 # =====================================================
-#  测试
+#  测试 → output/
 # =====================================================
 
-# ARM32/ARM64 通过 QEMU 运行测试，x86 直接执行
 ifeq ($(PLATFORM),arm32)
   TEST_RUNNER = qemu-arm-static -L /usr/arm-linux-gnueabihf
 else ifeq ($(PLATFORM),arm64)
@@ -135,15 +135,15 @@ else
   TEST_RUNNER =
 endif
 
-test: $(SHARED_LIB) tests/test_basic.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/test_basic tests/test_basic.c \
-		-L$(BUILD_DIR) -lmemorytracetool $(LDFLAGS)
-	LD_LIBRARY_PATH=$(BUILD_DIR) $(TEST_RUNNER) $(BUILD_DIR)/test_basic
+test: $(SHARED_LIB) tests/test_basic.c | $(OUTPUT_DIR)
+	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_basic tests/test_basic.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
+	LD_LIBRARY_PATH=$(OUTPUT_DIR) $(TEST_RUNNER) $(OUTPUT_DIR)/test_basic
 
-test_stability: $(SHARED_LIB) tests/test_stability.c | $(BUILD_DIR)
-	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(BUILD_DIR)/test_stability tests/test_stability.c \
-		-L$(BUILD_DIR) -lmemorytracetool $(LDFLAGS)
-	LD_LIBRARY_PATH=$(BUILD_DIR) $(TEST_RUNNER) $(BUILD_DIR)/test_stability
+test_stability: $(SHARED_LIB) tests/test_stability.c | $(OUTPUT_DIR)
+	$(CC) $(DEMO_CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_stability tests/test_stability.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
+	LD_LIBRARY_PATH=$(OUTPUT_DIR) $(TEST_RUNNER) $(OUTPUT_DIR)/test_stability
 
 test_all: test test_stability
 	@echo "C tests done. Frontend tests need HTTP server running separately."
@@ -153,4 +153,4 @@ test_all: test test_stability
 # =====================================================
 
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) $(OUTPUT_DIR)
