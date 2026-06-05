@@ -69,6 +69,10 @@ void mtt_ts_init(void)
  */
 void mtt_ts_record_point(void)
 {
+    /* 防御：若时序模块尚未初始化（极端竞态下可能），静默跳过，
+     * 避免访问未初始化的 mutex 导致崩溃或未定义行为。 */
+    if (!mtt_ts_is_ready()) return;
+
     mtt_state_t *s = mtt_state_get();
     if (s == NULL) return;
 

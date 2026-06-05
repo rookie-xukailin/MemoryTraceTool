@@ -461,7 +461,10 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
             if (nlen >= sizeof(func_name)) nlen = sizeof(func_name) - 1;
             memcpy(func_name, info.dli_sname, nlen);
             func_name[nlen] = '\0';
-            func_off = (char*)addr - (char*)info.dli_saddr;
+            /* ARM32 Thumb: dli_saddr 的 LSB 可能为 1（Thumb 符号编码），
+             * 但 addr 的 LSB 已由调用方清除。统一清除 LSB 后计算偏移，
+             * 避免 func+0x1 代替 func+0x0 的偏移偏差。 */
+            func_off = (char*)addr - (char*)MTT_FIX_THUMB_ADDR(info.dli_saddr);
             if (func_off < 0) func_off = 0;
 
             /* ARM32 QEMU 误判修正：若 dladdr 将主二进制中的地址误识别为

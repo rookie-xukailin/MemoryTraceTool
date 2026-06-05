@@ -189,6 +189,34 @@ static const char g_dashboard_html[] =
  *                        HTTP 请求处理器                                     *
  * ======================================================================== */
 
+/**
+ * 将字符串写入 fd，同时对 JSON 特殊字符（" \ 控制字符）进行转义。
+ * 用于安全输出 proc_name 等可能包含特殊字符的字符串字段。
+ *
+ * @param fd   目标文件描述符
+ * @param str  原始字符串
+ */
+static void write_json_string(int fd, const char *str)
+{
+    if (fd < 0 || str == NULL) return;
+    write(fd, "\"", 1);
+    for (const char *p = str; *p != '\0'; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') {
+            write(fd, "\\", 1);
+            write(fd, p, 1);
+        } else if (c < 0x20) {
+            /* 控制字符：编码为 \\u00XX */
+            char esc[8];
+            int n = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+            if (n > 0) write(fd, esc, (size_t)n);
+        } else {
+            write(fd, p, 1);
+        }
+    }
+    write(fd, "\"", 1);
+}
+
 /** 处理 GET / — 返回仪表盘 HTML */
 static void handle_root(int client_fd)
 {
@@ -293,19 +321,27 @@ static void handle_api_data(int client_fd)
     if (s != NULL && s->proc_name_ready && s->proc_name[0] != '\0')
         proc_name = s->proc_name;
 
+    time_t session_ts = (rep != NULL) ? rep->session_start : 0;
+
     static char buf[8192];
+    /* 先写 JSON 开头（到 proc_name 之前），再用 write_json_string 安全输出 proc_name */
     int len = snprintf(buf, sizeof(buf),
-        "{\"pid\":%d,\"proc_name\":\"%s\",\"session_start\":%lld,\"last_scan\":%lld,"
+        "{\"pid\":%d,\"proc_name\":",
+        (int)getpid());
+    write(client_fd, buf, (size_t)len);
+    write_json_string(client_fd, proc_name);
+
+    len = snprintf(buf, sizeof(buf),
+        ",\"session_start\":%lld,\"last_scan\":%lld,"
         "\"stats\":{\"current_bytes\":%zu,\"peak_bytes\":%zu,\"alloc_count\":%zu,"
         "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu}",
-        (int)getpid(), proc_name,
-        (long long)rep->session_start, (long long)time(NULL),
+        (long long)session_ts, (long long)time(NULL),
         cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc);
     write(client_fd, buf, (size_t)len);
 
     /* 时序数据 */
     write(client_fd, ",\"time_series\":[", 16);
-    if (mtt_ts_is_ready()) {
+    if (mtt_ts_is_ready() && raw_malloc != NULL) {
         mtt_ts_point_t *ts_buf = (mtt_ts_point_t*)raw_malloc(360 * sizeof(mtt_ts_point_t));
         if (ts_buf != NULL) {
             memset(ts_buf, 0, 360 * sizeof(mtt_ts_point_t));
