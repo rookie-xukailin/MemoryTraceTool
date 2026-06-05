@@ -296,25 +296,47 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
         }
     }
 
-    /* 兜底：当所有已解析帧均被过滤时，输出原始帧地址作为后备，
-     * 确保 ARM32 QEMU 等符号解析受限环境下仍能显示调用栈。
-     * 仅跳过第 0 帧（mtt_capture_stack），保留其余所有帧的原始地址。 */
+    /* 兜底：当所有已解析帧均被内部帧过滤器拦截时（常见于
+     * pthread_create 等初始化阶段的工具内部分配），回退为输出
+     * 已解析的符号字符串（不过滤），确保 ARM32 QEMU 等环境下
+     * 第二泄漏站点不会只显示原始 hex 地址，提升诊断可读性。
+     * 仅跳过第 0 帧（mtt_capture_stack），保留其余所有帧的符号。 */
     if (!wrote_frame && se != NULL && se->frame_count > 0) {
         for (int j = 0; j < se->frame_count; j++) {
-            /* 仅跳过第 0 帧（始终为 mtt_capture_stack，无诊断价值） */
-            if (j == 0) continue;
+            if (j == 0) continue; /* 跳过 mtt_capture_stack 自身 */
+
             if (wrote_frame) {
-                off = snprintf(buf, sizeof(buf), ",");
+                write(fd, ",", 1);
+            }
+            wrote_frame = 1;
+
+            const char *fallback_sym = se->resolved[j];
+            if (fallback_sym == NULL || fallback_sym[0] == '\0') {
+                /* 符号未解析时才降级为 hex 地址 */
+                off = snprintf(buf, sizeof(buf), "\"0x%lx\"",
+                               (unsigned long)(uintptr_t)se->frames[j]);
                 if (off < 0) off = 0;
                 else if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
                 write(fd, buf, (size_t)off);
+            } else {
+                /* 输出已解析符号（不过滤内部帧，与主循环保持一致
+                 * 的 JSON 转义逻辑，处理 \" \\ 和控制字符） */
+                write(fd, "\"", 1);
+                for (const char *p = fallback_sym; *p != '\0'; p++) {
+                    unsigned char c = (unsigned char)*p;
+                    if (c == '"' || c == '\\') {
+                        write(fd, "\\", 1);
+                        write(fd, p, 1);
+                    } else if (c < 0x20) {
+                        char esc[8];
+                        int n = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+                        if (n > 0) write(fd, esc, (size_t)n);
+                    } else {
+                        write(fd, p, 1);
+                    }
+                }
+                write(fd, "\"", 1);
             }
-            wrote_frame = 1;
-            off = snprintf(buf, sizeof(buf), "\"0x%lx\"",
-                           (unsigned long)(uintptr_t)se->frames[j]);
-            if (off < 0) off = 0;
-            else if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
-            write(fd, buf, (size_t)off);
         }
     }
 

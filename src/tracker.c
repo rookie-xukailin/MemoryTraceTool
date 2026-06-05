@@ -754,6 +754,16 @@ void mtt_ensure_init(void)
     /* 先初始化时序数据（必须在 reporter 线程启动前完成） */
     mtt_ts_init();
 
+    /* 启动子系统时设置 g_in_hook=1，防止 pthread_create / socket / bind 等
+     * 内部调用 malloc() 被 hook 拦截并追踪为"疑似泄漏"。
+     * save/restore 防止嵌套 mtt_ensure_init 调用破坏状态。
+     * 注：__thread 变量仅影响当前线程；reporter/http/signal 子线程
+     * 各自在入口函数首行设置 g_in_hook=1，但 glibc 线程启动代码
+     * 可能在入口函数执行前调用 calloc 分配 TLS/栈，此类分配
+     * 会被追踪但无法避免（见 stack_cache.c 中后台库引用说明）。 */
+    int saved_hook = g_in_hook;
+    g_in_hook = 1;
+
     /* 启动周期报告线程（锁外，避免 pthread_create 内部 malloc → 递归） */
     mtt_reporter_start();
 
@@ -773,6 +783,8 @@ void mtt_ensure_init(void)
 
     /* 启动信号处理线程（SIGUSR1 触发即时报告） */
     mtt_signal_thread_start();
+
+    g_in_hook = saved_hook;
 }
 
 /* ======================================================================== *
