@@ -28,6 +28,10 @@
       "allow": true
     }
   },
+  "sandbox": {
+    "excludedCommands": ["git"],
+    "enableWeakerNetworkIsolation": true
+  },
   "hooks": {
     "PostToolUse": [
       {

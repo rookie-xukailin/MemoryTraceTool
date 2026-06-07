@@ -103,7 +103,10 @@
       "Bash(build/test_basic: *)",
       "Bash(build/test_basic *)",
       "Bash(*)",
-      "PowerShell(Get-Command wsl -ErrorAction SilentlyContinue)"
+      "PowerShell(Get-Command wsl -ErrorAction SilentlyContinue)",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "WebFetch(domain:claudecode.ac.cn)"
     ]
   },
   "hooks": {
@@ -136,5 +139,15 @@
         ]
       }
     ]
+  },
+  "sandbox": {
+    "excludedCommands": ["git"],
+    "enableWeakerNetworkIsolation": true,
+    "network": {
+      "allowedDomains": [
+        "github.com",
+        "ssh.github.com"
+      ]
+    }
   }
 }
