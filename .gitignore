@@ -1,6 +1,9 @@
 build/
 output/
+sysroot/
 **/Temp/
 *.o
 *.so
 *.a
+*.core
+core

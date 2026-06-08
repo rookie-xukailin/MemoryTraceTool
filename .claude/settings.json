@@ -1,4 +1,5 @@
 {
+  "effortLevel": "max",
   "permissions": {
     "allow": [
       "Bash(make clean *)",
@@ -29,7 +30,6 @@
     }
   },
   "sandbox": {
-    "excludedCommands": ["git"],
     "enableWeakerNetworkIsolation": true
   },
   "hooks": {

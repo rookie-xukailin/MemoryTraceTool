@@ -1,0 +1,4 @@
+sysroot/
+build/
+output/
+.git/

@@ -1,7 +1,34 @@
 CROSS_COMPILE ?=
 CC       = $(CROSS_COMPILE)gcc
-CFLAGS   = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
+
+# 目标平台（arm32 / arm64 / 空=本机）
+PLATFORM ?=
+
+# 根据 PLATFORM 自动设置交叉编译工具链和 QEMU 参数
+ifeq ($(PLATFORM),arm32)
+    CROSS_COMPILE ?= arm-linux-gnueabihf-
+    QEMU_EXEC      ?= qemu-arm
+    QEMU_SYSROOT   ?= sysroot/arm32
+    ARCH_FLAGS     := -march=armv7-a
+endif
+
+ifeq ($(PLATFORM),arm64)
+    CROSS_COMPILE ?= aarch64-linux-gnu-
+    QEMU_EXEC      ?= qemu-aarch64
+    QEMU_SYSROOT   ?= sysroot/arm64
+    ARCH_FLAGS     := -march=armv8-a
+endif
+
+CORE_CFLAGS = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
+CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS)
 LDFLAGS  = -lpthread -ldl -latomic
+
+# 当设置了 QEMU 时，自动用 qemu-arm 包装测试执行
+ifneq ($(QEMU_SYSROOT),)
+    RUN = $(QEMU_EXEC) -L $(QEMU_SYSROOT) -E LD_LIBRARY_PATH=$(OUTPUT_DIR)
+else
+    RUN = LD_LIBRARY_PATH=$(OUTPUT_DIR)
+endif
 
 INC_SHARED = -Isrc
 INC_PUBLIC = -Iinclude -Isrc
@@ -17,8 +44,8 @@ LIB_OBJS = $(BUILD_DIR)/hooks.o $(BUILD_DIR)/tracker.o \
 
 SHARED_LIB = $(OUTPUT_DIR)/libmemorytracetool.so
 
-.PHONY: all clean demo demo_preload demo_long_running demo_controlled_leak \
-        test test_stability
+.PHONY: all clean distclean demo demo_preload demo_long_running demo_controlled_leak \
+        test test_stability test_all sysroot-arm32
 
 all: $(SHARED_LIB)
 
@@ -66,12 +93,26 @@ demo_controlled_leak: $(SHARED_LIB) examples/demo_controlled_leak.c | $(OUTPUT_D
 test: $(SHARED_LIB) tests/test_basic.c | $(OUTPUT_DIR)
 	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_basic tests/test_basic.c \
 		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
-	LD_LIBRARY_PATH=$(OUTPUT_DIR) $(OUTPUT_DIR)/test_basic
+	$(RUN) $(OUTPUT_DIR)/test_basic
 
 test_stability: $(SHARED_LIB) tests/test_stability.c | $(OUTPUT_DIR)
 	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_stability tests/test_stability.c \
 		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
-	LD_LIBRARY_PATH=$(OUTPUT_DIR) $(OUTPUT_DIR)/test_stability
+	$(RUN) $(OUTPUT_DIR)/test_stability
+
+test_all: test test_stability
 
 clean:
 	rm -rf $(BUILD_DIR) $(OUTPUT_DIR)
+
+distclean: clean
+	rm -rf sysroot/
+
+sysroot-arm32:
+	@echo "正在从 Docker 提取 ARM32 sysroot..."
+	@mkdir -p sysroot/arm32
+	docker run --platform linux/arm/v7 --rm \
+		-v $(PWD)/sysroot/arm32:/sysroot \
+		arm32-builder:latest \
+		bash -c "tar -cf - /lib /usr/lib 2>/dev/null | tar -xf - -C /sysroot 2>/dev/null"
+	@echo "ARM32 sysroot 已提取到 sysroot/arm32/"

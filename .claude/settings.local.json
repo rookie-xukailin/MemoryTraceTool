@@ -141,7 +141,6 @@
     ]
   },
   "sandbox": {
-    "excludedCommands": ["git"],
     "enableWeakerNetworkIsolation": true,
     "network": {
       "allowedDomains": [

@@ -23,6 +23,7 @@
  *     仅需原子递增，不需要同步其他数据
  */
 #define _GNU_SOURCE
+#include <signal.h>
 #include "mtt_internal.h"
 #include "reporter.h"
 #include "time_series.h"
