@@ -86,6 +86,12 @@ static inline void mtt_tls_safeguard(void)
  */
 void* malloc(size_t size)
 {
+    /* 最简诊断：直接用write(2)，无snprintf无变量，零失败可能 */
+    if (size == 10) {
+        static const char m10[] = "[MTT] M10\n";
+        MTT_DIAG_WRITE(STDERR_FILENO, m10, sizeof(m10) - 1);
+    }
+
     mtt_tls_safeguard();
 
     /* 首次调用诊断 */
