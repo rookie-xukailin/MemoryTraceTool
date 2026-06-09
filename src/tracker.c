@@ -301,35 +301,36 @@ void mtt_capture_stack(mtt_entry_t *entry)
     if (entry->stack_frames < 0)
         entry->stack_frames = 0;
 
-    /* 清除 ARM32 Thumb 模式的地址 LSB (bit 0)，
-     * 确保后续哈希计算和 dladdr() 符号解析正确。
-     * 在 ARM (非 Thumb) / ARM64 / x86 上此操作为空操作（bit 0 本就是 0）。 */
+    /* æ¸é¤ ARM32 Thumb æ¨¡å¼çå°å LSB (bit 0)ï¼
+     * ç¡®ä¿åç»­åå¸è®¡ç®å dladdr() ç¬¦å·è§£ææ­£ç¡®ã
+     * å¨ ARM (é Thumb) / ARM64 / x86 ä¸æ­¤æä½ä¸ºç©ºæä½ï¼bit 0 æ¬å°±æ¯ 0ï¼ã */
     for (int i = 0; i < entry->stack_frames; i++) {
         entry->stack[i] = MTT_FIX_THUMB_ADDR(entry->stack[i]);
     }
-#else
-    /* 无 backtrace() 时的兜底方案：帧指针链遍历。
-     * -fno-omit-frame-pointer 已确保函数保留了帧指针寄存器。
-     * ARM32(r11) / ARM64(x29) / x86_64(rbp) 帧布局一致：
-     *   *fp = 上一个帧指针, *(fp+1) = 返回地址(LR)
-     * void** 索引自动处理 sizeof(void*) 的平台差异（4 vs 8字节），
-     * 无需架构相关的 #ifdef。 */
-    {
+#endif
+
+    /* è¿è¡æ¶ååºï¼è¥ backtrace() è¿å 0 å¸§ï¼glibc ä¸æäºç¯å¢å¯è½å¤±è´¥ï¼ï¼
+     * æ¹ç¨å¸§æéé¾éåè·åè°ç¨æ ã
+     * -fno-omit-frame-pointer å·²ç¡®ä¿å½æ°ä¿çäºå¸§æéå¯å­å¨ã
+     * ARM32(r11) / ARM64(x29) / x86_64(rbp) å¸§å¸å±ä¸è´ï¼
+     *   *fp = ä¸ä¸ä¸ªå¸§æé, *(fp+1) = è¿åå°å(LR)
+     * void** ç´¢å¼èªå¨å¤ç sizeof(void*) çå¹³å°å·®å¼ï¼4 vs 8å­èï¼ï¼
+     * æ éæ¶æç¸å³ç #ifdefã */
+    if (entry->stack_frames == 0) {
         void **fp = (void**)__builtin_frame_address(0);
         int count = 0;
         while (fp != NULL && count < MTT_STACK_DEPTH) {
-            void *prev_fp = fp[0];   /* 前一个帧指针 */
-            void *lr      = fp[1];   /* 当前帧的返回地址 */
+            void *prev_fp = fp[0];   /* åä¸ä¸ªå¸§æé */
+            void *lr      = fp[1];   /* å½åå¸§çè¿åå°å */
             if (lr == NULL) break;
             entry->stack[count] = MTT_FIX_THUMB_ADDR(lr);
             count++;
-            /* 链尾（NULL）或自指（循环检测）终止遍历 */
+            /* é¾å°¾ï¼NULLï¼æèªæï¼å¾ªç¯æ£æµï¼ç»æ­¢éå */
             if (prev_fp == NULL || prev_fp == (void*)fp) break;
             fp = (void**)prev_fp;
         }
         entry->stack_frames = count;
     }
-#endif
 
     g_in_capture = saved;
 }
