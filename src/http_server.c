@@ -607,10 +607,8 @@ void mtt_http_server_start(uint16_t port)
     if (port == 0) return;
     if (atomic_load_explicit(&g_http_server.running, memory_order_acquire)) return;
 
-    /* ARM32 QEMU 防御：忽略 SIGPIPE，防止客户端断开连接时 write() 触发
-     * SIGPIPE 信号导致进程崩溃。ARM32 QEMU 用户态网络模拟较慢，
-     * 客户端（curl）可能在服务器仍在写入响应时断开连接。 */
-    signal(SIGPIPE, SIG_IGN);
+    /* SIGPIPE 已在 mtt_ensure_init() 中通过 sigaction 全局忽略，
+     * 无需在此重复设置。 */
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) return;

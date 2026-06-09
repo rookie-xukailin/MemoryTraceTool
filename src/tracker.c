@@ -636,6 +636,19 @@ static void mtt_register_fork_handlers(void);
 
 void mtt_ensure_init(void)
 {
+    /* 尽早忽略 SIGPIPE：HTTP 客户端断开连接时 write() 会触发 SIGPIPE，
+     * 默认行为是终止进程。此处用 sigaction(2) 替代 signal(2)：
+     * sigaction 是 POSIX 标准接口，语义明确（不会像 signal 那样
+     * 在 System V/BSD 之间摇摆），且 SA_RESTART 确保被中断的
+     * 系统调用自动重试。 */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = SIG_IGN;
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGPIPE, &sa, NULL);
+    }
+
     mtt_state_t *s = mtt_state_get();
     if (s == NULL) return;
 
