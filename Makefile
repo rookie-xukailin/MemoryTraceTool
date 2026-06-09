@@ -10,7 +10,9 @@ ifeq ($(ARCH),arm32)
     CROSS_COMPILE ?= arm-linux-gnueabihf-
     QEMU_EXEC      ?= qemu-arm
     QEMU_SYSROOT   ?= sysroot/arm32
-    ARCH_FLAGS     := -march=armv7-a
+    ARCH_FLAGS     := -march=armv7-a -fno-omit-frame-pointer
+    # 嵌入式 ARM32：减半栈缓存和符号长度，节省内存
+    MTT_EMBEDDED   ?= 1
 endif
 
 ifeq ($(ARCH),arm64)
@@ -19,6 +21,14 @@ ifeq ($(ARCH),arm64)
     QEMU_SYSROOT   ?= sysroot/arm64
     ARCH_FLAGS     := -march=armv8-a
 endif
+
+# 嵌入式配置：减半栈缓存和符号长度，节省 ~25MB 内存
+ifneq ($(MTT_EMBEDDED),)
+    EMBEDDED_DEFS  := -DMTT_STACK_CACHE_SIZE=512 -DMTT_SYMBOL_MAX=128
+endif
+
+CORE_CFLAGS = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
+CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS) $(EMBEDDED_DEFS)
 
 CC       = $(CROSS_COMPILE)gcc
 

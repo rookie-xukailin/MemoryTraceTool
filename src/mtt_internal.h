@@ -91,7 +91,12 @@
 /* 泄漏判定相关常量 */
 #define MTT_LEAK_THRESHOLD_DEFAULT 300  /* 默认泄漏阈值（秒）：存活超过此值→probable leak */
 #define MTT_SKIP_STARTUP_DEFAULT    0   /* 默认不跳过启动阶段 */
+#define MTT_STARTUP_GRACE_DEFAULT   3   /* 默认启动宽限期（秒），首次 g_raw_ready 或超时后结束 */
 #define MTT_TEMP_ALLOC_THRESHOLD_MS 100 /* 临时分配阈值（毫秒级，用 alloc_seq 近似） */
+
+/* 离线报告 */
+#define MTT_REPORT_FILE_DEFAULT NULL     /* 默认不启用离线 JSON 报告 */
+#define MTT_REPORT_HTML_DEFAULT NULL     /* 默认不启用离线 HTML 报告 */
 
 /* Bootstrap 分配器缓冲区大小（dlsym 阶段兜底） */
 #define MTT_BOOTSTRAP_BUF_SIZE  65536
@@ -119,6 +124,9 @@ extern raw_realloc_fn volatile raw_realloc;
 
 /* __thread 递归保护标志（在 tracker.c 中定义，hooks.c/reporter.c 引用） */
 extern __thread int g_in_hook;
+
+/* __thread 工具内部线程标志：reporter/HTTP 线程的分配不进入追踪 */
+extern __thread int g_tool_internal;
 
 /* ======================================================================== *
  *                       缓存行对齐的互斥锁（避免伪共享）                        *

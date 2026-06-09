@@ -88,6 +88,13 @@ static __thread int g_raw_resolving = 0;
  */
 __thread int g_in_hook = 0;
 
+/*
+ * 工具内部线程标志：
+ * reporter 线程和 HTTP 服务线程设置此标志，其后所有 malloc/free 直接透传 raw_*，
+ * 不进入追踪系统，避免工具自身的分配污染泄漏报告。
+ */
+__thread int g_tool_internal = 0;
+
 /* ======================================================================== *
  *                  Bootstrap 分配器（dlsym 阶段兜底）                         *
  * ======================================================================== */
@@ -607,6 +614,8 @@ static void get_process_name(char *buf, size_t size)
  * 致命错误处理：若桶表分配失败，设置 disabled=1 + initialized=1，
  * 后续所有 hook 调用直接透传到 raw_*，不再重试初始化。
  */
+static void mtt_register_fork_handlers(void);
+
 void mtt_ensure_init(void)
 {
     mtt_state_t *s = mtt_state_get();
@@ -787,6 +796,64 @@ void mtt_ensure_init(void)
     mtt_signal_thread_start();
 
     g_in_hook = saved_hook;
+
+    /* 注册 fork 安全处理器（仅需注册一次） */
+    static pthread_once_t g_fork_init = PTHREAD_ONCE_INIT;
+    pthread_once(&g_fork_init, mtt_register_fork_handlers);
+}
+
+/* ======================================================================== *
+ *                 fork() 安全处理（防止子进程死锁）                             *
+ * ======================================================================== */
+
+/** fork 前：尝试获取所有分段锁，阻塞直到 reporter 完成当前扫描 */
+static void mtt_fork_prepare(void)
+{
+    mtt_state_t *s = mtt_state_get();
+    if (s == NULL) return;
+    /* 锁定所有 64 个分段锁，确保 fork 时刻没有线程在临界区内 */
+    for (int i = 0; i < MTT_LOCK_STRIPES; i++)
+        pthread_mutex_lock(&s->bucket_locks[i].lock);
+}
+
+/** fork 后（父进程）：释放所有锁 */
+static void mtt_fork_parent(void)
+{
+    mtt_state_t *s = mtt_state_get();
+    if (s == NULL) return;
+    for (int i = 0; i < MTT_LOCK_STRIPES; i++)
+        pthread_mutex_unlock(&s->bucket_locks[i].lock);
+}
+
+/** fork 后（子进程）：重新初始化所有 mutex 和状态 */
+static void mtt_fork_child(void)
+{
+    mtt_state_t *s = mtt_state_get();
+    if (s == NULL) return;
+
+    /* 重新初始化所有分段锁（子进程中互斥锁状态未定义） */
+    for (int i = 0; i < MTT_LOCK_STRIPES; i++) {
+        pthread_mutex_t new_lock = PTHREAD_MUTEX_INITIALIZER;
+        s->bucket_locks[i].lock = new_lock;
+    }
+
+    /* 重置 key 状态：子进程是全新进程，parent 的追踪数据无意义 */
+    atomic_store(&s->entry_count, 0);
+    atomic_store(&s->alloc_count, 0);
+    atomic_store(&s->free_count, 0);
+    atomic_store(&s->current_bytes, 0);
+    atomic_store(&s->total_bytes, 0);
+    atomic_store(&s->alloc_seq, 0);
+
+    /* 清空桶表（子进程内存空间独立，parent 的追踪条目已无意义） */
+    for (unsigned j = 0; j < s->bucket_count; j++)
+        s->buckets[j] = NULL;
+}
+
+/** 注册 pthread_atfork 处理器 */
+static void mtt_register_fork_handlers(void)
+{
+    pthread_atfork(mtt_fork_prepare, mtt_fork_parent, mtt_fork_child);
 }
 
 /* ======================================================================== *

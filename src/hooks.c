@@ -26,7 +26,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <unistd.h>
+#include <errno.h>
 
 /*
  * 所有诊断输出使用 write() 系统调用（无 malloc）。
@@ -83,6 +85,14 @@ void* malloc(size_t size)
     g_in_hook = 1;
 
     mtt_resolve_raw_allocators();
+
+    /* 工具内部线程（reporter/HTTP）：直接透传，不追踪 */
+    if (g_tool_internal) {
+        void *ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
+        g_in_hook = saved_hook;
+        return ret;
+    }
+
     if (raw_malloc == NULL) {
         g_in_hook = saved_hook;
         return NULL;
@@ -97,6 +107,13 @@ void* malloc(size_t size)
 
     mtt_ensure_init();
     mtt_state_t *s = mtt_state_get();
+
+    /* 启动阶段宽限：跳过追踪，直接透传 */
+    if (s != NULL && mtt_is_startup_phase(s)) {
+        void *ret = raw_malloc(size);
+        g_in_hook = saved_hook;
+        return ret;
+    }
     if (s == NULL) {
         void *ret = raw_malloc(size);
         g_in_hook = saved_hook;
@@ -133,15 +150,42 @@ void* malloc(size_t size)
     /* 持锁插入哈希表 + 原子更新计数器 */
     mtt_stripe_lock(s, ptr);
 
-    /* 锁内二次检查容量：消除 TOCTOU 竞争窗口。
-     * 20 线程同时通过外部 mtt_is_over_capacity() 检查后，
-     * 此处仅允许前若干线程真正插入，其余丢弃追踪记录。 */
+    /* 锁内二次检查容量 + LRU 淘汰。
+     * 若已满，尝试淘汰最旧的条目为新分配腾出空间。 */
     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
-        atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
-        mtt_stripe_unlock(s, ptr);
-        if (raw_free != NULL) raw_free(e);
-        g_in_hook = saved_hook;
-        return ptr; /* 用户内存已分配，仅跳过追踪 */
+        /* 尝试淘汰 1 个条目：遍历桶表找到最旧的条目并移除 */
+        mtt_entry_t *oldest = NULL;
+        unsigned oldest_bucket = 0;
+        uint64_t oldest_seq = UINT64_MAX;
+        for (unsigned b = 0; b < (unsigned)s->bucket_count; b++) {
+            for (mtt_entry_t *cur = s->buckets[b]; cur != NULL; cur = cur->next) {
+                if (cur->alloc_num < oldest_seq) {
+                    oldest_seq = cur->alloc_num;
+                    oldest = cur;
+                    oldest_bucket = b;
+                }
+            }
+        }
+        if (oldest != NULL) {
+            /* 从链表中移除 oldest */
+            mtt_entry_t **prev = &s->buckets[oldest_bucket];
+            while (*prev != NULL && *prev != oldest)
+                prev = &(*prev)->next;
+            if (*prev == oldest) {
+                *prev = oldest->next;
+                atomic_fetch_sub_explicit(&s->current_bytes, oldest->size, memory_order_relaxed);
+                atomic_fetch_sub_explicit(&s->entry_count, 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
+                if (raw_free != NULL) raw_free(oldest);
+            }
+        } else {
+            /* 没有可淘汰的条目（极少情况） */
+            atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
+            mtt_stripe_unlock(s, ptr);
+            if (raw_free != NULL) raw_free(e);
+            g_in_hook = saved_hook;
+            return ptr;
+        }
     }
 
     e->alloc_num = atomic_fetch_add_explicit(&s->alloc_seq, 1, memory_order_relaxed) + 1;
@@ -194,6 +238,14 @@ void free(void *ptr)
     g_in_hook = 1;
 
     mtt_resolve_raw_allocators();
+
+    /* 工具内部线程：直接透传 */
+    if (g_tool_internal) {
+        if (raw_free != NULL) raw_free(ptr);
+        g_in_hook = saved_hook;
+        return;
+    }
+
     if (raw_free == NULL) {
         g_in_hook = saved_hook;
         return;
@@ -255,6 +307,17 @@ void* calloc(size_t count, size_t size)
         return p;
     }
 
+    /* 工具内部线程：直接透传 raw_malloc + memset，不追踪 */
+    if (g_tool_internal) {
+        mtt_resolve_raw_allocators();
+        if (raw_malloc == NULL) return NULL;
+        if (count > 0 && size > SIZE_MAX / count) return NULL;
+        size_t t = count * size;
+        void *p = raw_malloc(t);
+        if (p != NULL) memset(p, 0, t);
+        return p;
+    }
+
     /* 整数溢出检查 */
     if (count > 0 && size > SIZE_MAX / count)
         return NULL;
@@ -304,6 +367,20 @@ void* realloc(void *ptr, size_t size)
     g_in_hook = 1;
 
     mtt_resolve_raw_allocators();
+
+    /* 工具内部线程：直接透传 */
+    if (g_tool_internal) {
+        void *ret;
+        if (raw_realloc != NULL) {
+            ret = raw_realloc(ptr, size);
+        } else {
+            ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
+            if (ret != NULL && raw_free != NULL) raw_free(ptr);
+        }
+        g_in_hook = saved_hook;
+        return ret;
+    }
+
     if (raw_malloc == NULL) {
         g_in_hook = saved_hook;
         return NULL;
@@ -475,4 +552,127 @@ void* realloc(void *ptr, size_t size)
     raw_free(ptr);
     g_in_hook = saved_hook;
     return new_ptr;
+}
+
+/* ======================================================================== *
+ *              aligned_alloc / posix_memalign / reallocarray                 *
+ * ======================================================================== */
+
+/**
+ * LD_PRELOAD 拦截的 aligned_alloc (C11)。
+ * 手动实现对齐逻辑，通过 raw_malloc 分配，绕过 hook 递归。
+ */
+void* aligned_alloc(size_t alignment, size_t size)
+{
+    mtt_resolve_raw_allocators();
+    if (raw_malloc == NULL) return NULL;
+
+    /* 对齐必须为 2 的幂且 >= sizeof(void*) */
+    if (alignment < sizeof(void*)) alignment = sizeof(void*);
+    if ((alignment & (alignment - 1)) != 0) return NULL;
+    if (size == 0) size = 1;
+    /* 向上取整为 alignment 倍数 */
+    size = (size + alignment - 1) & ~(alignment - 1);
+
+    /* 多分配 alignment + sizeof(void*) 用于对齐和存储原始指针 */
+    size_t total = size + alignment + sizeof(void*);
+    char *raw = (char*)raw_malloc(total);
+    if (raw == NULL) return NULL;
+
+    /* 对齐到 alignment 边界，保留空间存原始指针 */
+    uintptr_t addr = (uintptr_t)(raw + sizeof(void*));
+    addr = (addr + alignment - 1) & ~((uintptr_t)(alignment - 1));
+    void *aligned = (void*)addr;
+    /* 在对齐指针前存储原始 raw 指针，供 aligned_free 使用 */
+    ((void**)aligned)[-1] = raw;
+
+    return aligned;
+}
+
+/** LD_PRELOAD 拦截的 posix_memalign (POSIX) */
+int posix_memalign(void **memptr, size_t alignment, size_t size)
+{
+    if (memptr == NULL) return 22; /* EINVAL */
+    if (alignment < sizeof(void*)) alignment = sizeof(void*);
+    if ((alignment & (alignment - 1)) != 0) return 22; /* EINVAL */
+    void *p = aligned_alloc(alignment, size);
+    if (p == NULL) return 12; /* ENOMEM */
+    *memptr = p;
+    return 0;
+}
+
+/** LD_PRELOAD 拦截的 reallocarray (BSD) */
+void* reallocarray(void *ptr, size_t nmemb, size_t size)
+{
+    if (nmemb > 0 && size > SIZE_MAX / nmemb) {
+        errno = 12; /* ENOMEM */
+        return NULL;
+    }
+    return realloc(ptr, nmemb * size);
+}
+
+/** LD_PRELOAD 拦截的 memalign (过时) */
+void* memalign(size_t alignment, size_t size)
+{
+    return aligned_alloc(alignment, size);
+}
+
+/** LD_PRELOAD 拦截的 valloc (过时) */
+void* valloc(size_t size)
+{
+    return aligned_alloc((size_t)getpagesize(), size);
+}
+
+/* ======================================================================== *
+ *            strdup / asprintf — 优化调用栈（跳过 libc 包装帧）                *
+ * ======================================================================== */
+
+/** LD_PRELOAD 拦截的 strdup：直接调 malloc，栈回溯跳过 strdup 自身 */
+char* strdup(const char *s)
+{
+    if (s == NULL) return NULL;
+    size_t len = strlen(s) + 1;
+    char *p = (char*)malloc(len);
+    if (p != NULL) memcpy(p, s, len);
+    return p;
+}
+
+/** LD_PRELOAD 拦截的 strndup */
+char* strndup(const char *s, size_t n)
+{
+    if (s == NULL) return NULL;
+    size_t len = strnlen(s, n);
+    char *p = (char*)malloc(len + 1);
+    if (p != NULL) {
+        memcpy(p, s, len);
+        p[len] = '\0';
+    }
+    return p;
+}
+
+/** LD_PRELOAD 拦截的 asprintf */
+int asprintf(char **strp, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int ret = vasprintf(strp, fmt, ap);
+    va_end(ap);
+    return ret;
+}
+
+/** LD_PRELOAD 拦截的 vasprintf */
+int vasprintf(char **strp, const char *fmt, va_list ap)
+{
+    if (strp == NULL) return -1;
+    va_list ap2;
+    va_copy(ap2, ap);
+    int len = vsnprintf(NULL, 0, fmt, ap);
+    if (len < 0) { va_end(ap2); return -1; }
+    char *buf = (char*)malloc((size_t)len + 1);
+    if (buf == NULL) { va_end(ap2); return -1; }
+    int written = vsnprintf(buf, (size_t)len + 1, fmt, ap2);
+    va_end(ap2);
+    if (written < 0) { free(buf); return -1; }
+    *strp = buf;
+    return written;
 }

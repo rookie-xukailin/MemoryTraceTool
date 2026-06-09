@@ -92,6 +92,7 @@ static const char g_dashboard_html[] =
 "</div>\n"
 "<script>\n"
 "var data=null,chartCanvas=document.getElementById('chart'),ctx=chartCanvas.getContext('2d'),tip=document.getElementById('tip');\n"
+"var expandedHashes=new Set(); /* 记录展开的泄漏站点 hash，刷新后恢复 */\n"
 "function fb(b){if(b==null)return'0 B';if(b>=1048576)return(b/1048576).toFixed(2)+' MB';if(b>=1024)return(b/1024).toFixed(2)+' KB';return b+' B'}\n"
 "function ft(t){if(!t||t<=0)return'N/A';return new Date(t*1000).toLocaleTimeString()}\n"
 "function draw(){\n"
@@ -154,7 +155,7 @@ static const char g_dashboard_html[] =
 "  for(var i=0;i<leaks.length;i++){\n"
 "    var l=leaks[i],h=l.hash||'',conf=l.is_expired?'probable leak':'possible leak';\n"
 "    var diff=l.diff_size>0?' class=\"diff-high\"':'';\n"
-"    rows+='<tr class=\"leak-row\"'+diff+' onclick=\"var s=document.getElementById(\\'s'+i+'\\');s.classList.toggle(\\'open\\')\">'+\n"
+"    rows+='<tr class=\"leak-row\"'+diff+' onclick=\"(function(){var s=document.getElementById(\\'s'+i+'\\');var opened=s.classList.toggle(\\'open\\');var h=\\''+h+'\\';if(opened)expandedHashes.add(h);else expandedHashes.delete(h);})()\">'+\n"
 "      '<td>'+(i+1)+'</td><td>'+l.count.toLocaleString()+'</td>'+\n"
 "      '<td>'+fb(l.per_leak_size)+'</td><td><b>'+fb(l.total_size)+'</b></td>'+\n"
 "      '<td>'+conf+'</td><td>'+ft(l.first_seen)+'</td><td>'+ft(l.last_seen)+'</td></tr>';\n"
@@ -169,6 +170,10 @@ static const char g_dashboard_html[] =
 "    }\n"
 "  }\n"
 "  tbody.innerHTML=rows;\n"
+"  /* 恢复展开状态 */\n"
+"  var newHashes=new Set();\n"
+"  for(var i=0;i<leaks.length;i++){var lh=leaks[i].hash||'';if(expandedHashes.has(lh)){var sr=document.getElementById('s'+i);if(sr){sr.classList.add('open');newHashes.add(lh);}}}\n"
+"  expandedHashes=newHashes; /* 清理已不存在的泄漏项 */\n"
 "}\n"
 "function refresh(){\n"
 "  document.getElementById('refreshLabel').textContent='刷新中...';\n"
@@ -527,6 +532,9 @@ static void* http_thread_fn(void *arg)
 {
     (void)arg;
     pthread_detach(pthread_self());
+
+    /* 标记为工具内部线程：所有分配直接透传 raw_*，不进入追踪系统 */
+    g_tool_internal = 1;
 
     static char req_buf[MTT_HTTP_BUF_SIZE];
     static char path[MTT_HTTP_MAX_PATH];

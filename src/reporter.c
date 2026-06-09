@@ -708,6 +708,34 @@ static void scan_and_report_locked(void)
         /* 同时输出 collapsed stacks 文件（兼容 flamegraph.pl） */
         mtt_flamegraph_write(log_dir, proc_name, sorted, site_count,
                              (void*)pairs);
+
+        /* 离线 JSON 报告：MTT_REPORT_FILE 环境变量指定输出路径 */
+        {
+            static const char *json_path = NULL;
+            static int json_checked = 0;
+            if (!json_checked) {
+                json_path = getenv("MTT_REPORT_FILE");
+                json_checked = 1;
+            }
+            if (json_path != NULL && json_path[0] != '\0') {
+                char json_tmp[512];
+                snprintf(json_tmp, sizeof(json_tmp), "%s.tmp", json_path);
+                FILE *jf = fopen(json_tmp, "w");
+                if (jf != NULL) {
+                    fprintf(jf, "{\"pid\":%d,\"ts\":%ld,\"leaks\":[",
+                            (int)getpid(), (long)now);
+                    for (size_t i = 0; i < site_count; i++) {
+                        mtt_leak_site_t *site = sorted[i];
+                        fprintf(jf, "%s{\"count\":%zu,\"size\":%zu,\"hash\":\"%llx\"}",
+                                i>0?",":"", site->count, site->total_size,
+                                (unsigned long long)site->stack_hash);
+                    }
+                    fprintf(jf, "]}\n");
+                    fclose(jf);
+                    rename(json_tmp, json_path);
+                }
+            }
+        }
     }
 
     /* ---- 阶段 6.5: 保存本次结果用于下次扫描差值计算（借鉴 jemalloc --base） ---- */
@@ -877,6 +905,9 @@ static void* reporter_thread_fn(void *arg)
 {
     (void)arg;
     pthread_detach(pthread_self());
+
+    /* 标记为工具内部线程：所有分配直接透传 raw_*，不进入追踪系统 */
+    g_tool_internal = 1;
 
     /* 报告线程全程设置 g_in_hook，确保所有 libc 调用绕过 hook，
      * 避免 fopen/fprintf/snprintf 等内部 malloc 导致递归死锁。 */
