@@ -276,6 +276,16 @@ static void scan_and_report_locked(void)
     uint64_t entry_total_orig = atomic_load_explicit(&s->entry_count, memory_order_relaxed);
     uint64_t entry_total = entry_total_orig;
 
+    /* 诊断：记录每次扫描入口 */
+    {
+        char dbuf[96];
+        int dlen = snprintf(dbuf, sizeof(dbuf),
+            "[MTT] scan enter: entry=%llu\n",
+            (unsigned long long)entry_total_orig);
+        if (dlen > 0 && dlen < (int)sizeof(dbuf))
+            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+    }
+
     /* ---- 阶段 0: 时序数据缓存更新（独立于扫描，始终执行） ----
      * 必须在快照分配之前更新，即使后续快照分配失败跳过扫描，
      * HTTP 仪表盘仍能获取最新的时序数据用于图表渲染。
@@ -876,6 +886,15 @@ cleanup:
             site = next;
         }
     }
+
+    /* 诊断：扫描正常完成 */
+    {
+        char dbuf[64];
+        int dlen = snprintf(dbuf, sizeof(dbuf),
+            "[MTT] scan done: sites=%zu\n", site_count);
+        if (dlen > 0 && dlen < (int)sizeof(dbuf))
+            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+    }
     return;
 
 skip_scan:
@@ -922,6 +941,13 @@ static void* reporter_thread_fn(void *arg)
      * 否则首次扫描的缓存中 time_series 将为空数组。 */
     mtt_ts_record_point();
     scan_and_report();
+    {
+        char dbuf[64];
+        int dlen = snprintf(dbuf, sizeof(dbuf),
+            "[MTT] reporter: first scan done, entering loop\n");
+        if (dlen > 0 && dlen < (int)sizeof(dbuf))
+            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+    }
 
     while (atomic_load_explicit(&g_reporter.running, memory_order_acquire)) {
         /* 分段睡眠，每 1 秒检查一次 running 标志（响应退出请求） */
@@ -933,6 +959,15 @@ static void* reporter_thread_fn(void *arg)
             /* 每秒记录时序数据点 */
             mtt_ts_record_point();
 
+            /* 每10秒输出一次心跳，确认线程存活 */
+            if (i % 10 == 9) {
+                char dbuf[64];
+                int dlen = snprintf(dbuf, sizeof(dbuf),
+                    "[MTT] reporter: alive at %ds\n", i + 1);
+                if (dlen > 0 && dlen < (int)sizeof(dbuf))
+                    MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+            }
+
             /* 检查峰值是否刚被更新（借鉴 jemalloc prof_gdump） */
             mtt_state_t *st = mtt_state_get();
             if (st != NULL &&
@@ -942,11 +977,26 @@ static void* reporter_thread_fn(void *arg)
             }
         }
 
-        if (atomic_load_explicit(&g_reporter.running, memory_order_acquire))
+        if (atomic_load_explicit(&g_reporter.running, memory_order_acquire)) {
+            {
+                char dbuf[64];
+                int dlen = snprintf(dbuf, sizeof(dbuf),
+                    "[MTT] reporter: periodic scan start\n");
+                if (dlen > 0 && dlen < (int)sizeof(dbuf))
+                    MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+            }
             scan_and_report();
+        }
     }
 
     /* 运行标志已清除，执行最后一次扫描 */
+    {
+        char dbuf[64];
+        int dlen = snprintf(dbuf, sizeof(dbuf),
+            "[MTT] reporter: final scan before exit\n");
+        if (dlen > 0 && dlen < (int)sizeof(dbuf))
+            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+    }
     scan_and_report();
 
     g_in_hook = saved_hook;
