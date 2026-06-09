@@ -3,9 +3,25 @@
 ## Build
 
 ```bash
-make          # 编译静态库和动态库
-make test     # 编译并运行测试
-make clean    # 清理构建产物
+make                    # 本机编译
+ARCH=arm32 make         # ARM32 交叉编译（需交叉工具链）
+ARCH=arm64 make         # ARM64 交叉编译（需交叉工具链）
+CROSS_COMPILE=arm-linux-gnueabihf- make  # 自定义工具链前缀
+make test               # 编译并运行测试
+make clean              # 清理构建产物
+```
+
+### 交叉编译环境变量
+
+| 变量 | 说明 | 示例 |
+|------|------|------|
+| `ARCH` | 目标架构，自动推导 `CROSS_COMPILE` | `arm32` / `arm64` |
+| `CROSS_COMPILE` | 工具链前缀（可单独使用或配合 ARCH 覆盖默认值） | `arm-linux-gnueabihf-` |
+
+**macOS 上**用 Docker 脚本（无需安装交叉工具链）：
+```bash
+./scripts/compile-arm32.sh test   # ARM32 编译+测试
+./scripts/compile-arm64.sh test   # ARM64 编译+测试
 ```
 
 ## Workflow

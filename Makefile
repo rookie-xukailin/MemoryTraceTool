@@ -1,23 +1,26 @@
+# 架构: arm32 / arm64 (空=本机)
+#   用法: ARCH=arm32 make
+#         ARCH=arm64 make test
+#   CROSS_COMPILE 可单独指定工具链前缀，结合 ARCH 使用时 ARCH 仅设置默认值
+ARCH ?=
 CROSS_COMPILE ?=
-CC       = $(CROSS_COMPILE)gcc
 
-# 目标平台（arm32 / arm64 / 空=本机）
-PLATFORM ?=
-
-# 根据 PLATFORM 自动设置交叉编译工具链和 QEMU 参数
-ifeq ($(PLATFORM),arm32)
+# ARCH 自动推导 CROSS_COMPILE 和 QEMU 参数
+ifeq ($(ARCH),arm32)
     CROSS_COMPILE ?= arm-linux-gnueabihf-
     QEMU_EXEC      ?= qemu-arm
     QEMU_SYSROOT   ?= sysroot/arm32
     ARCH_FLAGS     := -march=armv7-a
 endif
 
-ifeq ($(PLATFORM),arm64)
+ifeq ($(ARCH),arm64)
     CROSS_COMPILE ?= aarch64-linux-gnu-
     QEMU_EXEC      ?= qemu-aarch64
     QEMU_SYSROOT   ?= sysroot/arm64
     ARCH_FLAGS     := -march=armv8-a
 endif
+
+CC       = $(CROSS_COMPILE)gcc
 
 CORE_CFLAGS = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
 CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS)
