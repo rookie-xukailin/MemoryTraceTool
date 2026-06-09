@@ -32,8 +32,6 @@ CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS) $(EMBEDDED_DEFS)
 
 CC       = $(CROSS_COMPILE)gcc
 
-CORE_CFLAGS = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
-CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS)
 LDFLAGS  = -lpthread -ldl -latomic
 
 # 当设置了 QEMU 时，自动用 qemu-arm 包装测试执行

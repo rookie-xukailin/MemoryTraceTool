@@ -308,10 +308,27 @@ void mtt_capture_stack(mtt_entry_t *entry)
         entry->stack[i] = MTT_FIX_THUMB_ADDR(entry->stack[i]);
     }
 #else
-    /* 无 backtrace() 的平台上（musl / bionic），栈捕获不可用。
-     * 仅设置空栈，泄漏检测仍可工作（按大小统计），但无法显示调用栈。 */
-    entry->stack_frames = 0;
-    memset(entry->stack, 0, sizeof(entry->stack));
+    /* 无 backtrace() 时的兜底方案：帧指针链遍历。
+     * -fno-omit-frame-pointer 已确保函数保留了帧指针寄存器。
+     * ARM32(r11) / ARM64(x29) / x86_64(rbp) 帧布局一致：
+     *   *fp = 上一个帧指针, *(fp+1) = 返回地址(LR)
+     * void** 索引自动处理 sizeof(void*) 的平台差异（4 vs 8字节），
+     * 无需架构相关的 #ifdef。 */
+    {
+        void **fp = (void**)__builtin_frame_address(0);
+        int count = 0;
+        while (fp != NULL && count < MTT_STACK_DEPTH) {
+            void *prev_fp = fp[0];   /* 前一个帧指针 */
+            void *lr      = fp[1];   /* 当前帧的返回地址 */
+            if (lr == NULL) break;
+            entry->stack[count] = MTT_FIX_THUMB_ADDR(lr);
+            count++;
+            /* 链尾（NULL）或自指（循环检测）终止遍历 */
+            if (prev_fp == NULL || prev_fp == (void*)fp) break;
+            fp = (void**)prev_fp;
+        }
+        entry->stack_frames = count;
+    }
 #endif
 
     g_in_capture = saved;
