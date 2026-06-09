@@ -127,3 +127,6 @@ sysroot-arm32:
 		arm32-builder:latest \
 		bash -c "tar -cf - /lib /usr/lib 2>/dev/null | tar -xf - -C /sysroot 2>/dev/null"
 	@echo "ARM32 sysroot 已提取到 sysroot/arm32/"
+
+demo_small_leak: $(SHARED_LIB) examples/demo_small_leak.c | $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) -o $(OUTPUT_DIR)/demo_small_leak examples/demo_small_leak.c
