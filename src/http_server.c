@@ -352,6 +352,11 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
 /** 处理 GET /api/data */
 static void handle_api_data(int client_fd)
 {
+    /* 防止HTTP handler内部libc调用（fopen等）被hook拦截追踪，
+     * 避免在/api/data响应中产生虚假泄漏条目。 */
+    int saved_hook = g_in_hook;
+    g_in_hook = 1;
+
     mtt_reporter_t *rep = mtt_reporter_get();
     const char *header =
         "HTTP/1.0 200 OK\r\n"
@@ -459,11 +464,16 @@ static void handle_api_data(int client_fd)
     }
     pthread_mutex_unlock(&rep->cache_lock);
     MTT_DIAG_WRITE(client_fd, "]}", 2);
+
+    g_in_hook = saved_hook;
 }
 
 /** 处理 GET /api/leaks */
 static void handle_api_leaks(int client_fd)
 {
+    int saved_hook = g_in_hook;
+    g_in_hook = 1;
+
     mtt_reporter_t *rep = mtt_reporter_get();
     const char *header =
         "HTTP/1.0 200 OK\r\n"
@@ -495,6 +505,8 @@ static void handle_api_leaks(int client_fd)
     }
     pthread_mutex_unlock(&rep->cache_lock);
     MTT_DIAG_WRITE(client_fd, "]}", 2);
+
+    g_in_hook = saved_hook;
 }
 
 static void handle_404(int client_fd)

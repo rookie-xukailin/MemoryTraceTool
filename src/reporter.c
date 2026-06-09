@@ -363,27 +363,31 @@ static void scan_and_report_locked(void)
     for (size_t i = 0; i < snap_count; i++) {
         mtt_alloc_snap_t *sn = &snaps[i];
 
-        /* 跳过空栈（捕获失败） */
-        if (sn->stack_frames <= 0) continue;
-
-        /* 获取栈缓存条目（含 hash），同步解析符号。
-         * 在条目首次创建时立即调用 mtt_stack_resolve，而非延迟到 Stage 3。
-         * 此顺序修正了原 Stage 3 中独立 hash 重匹配可能遗漏条目的问题：
-         * 若缓存满导致 mtt_stack_cache_lookup 返回 NULL，Stage 3 中同一条目的
-         * lookup 依然为 NULL，mtt_stack_resolve 永远不会被调用。现在在 Stage 2
-         * 条目创建时同步解析，确保每个缓存条目在写入 HTTP 缓存之前均已完成解析，
-         * 消除 ARM32 QEMU 下第二泄漏站点显示原始 hex 地址的问题。 */
-        mtt_stack_entry_t *stack_entry = mtt_stack_cache_lookup(
-            sn->stack, sn->stack_frames);
-        if (stack_entry != NULL && !stack_entry->is_resolved)
-            mtt_stack_resolve(stack_entry);
-
         uint64_t hash;
-        if (stack_entry != NULL) {
-            hash = stack_entry->hash;
+        if (sn->stack_frames > 0) {
+            /* 获取栈缓存条目（含 hash），同步解析符号。
+             * 在条目首次创建时立即调用 mtt_stack_resolve，而非延迟到 Stage 3。
+             * 此顺序修正了原 Stage 3 中独立 hash 重匹配可能遗漏条目的问题：
+             * 若缓存满导致 mtt_stack_cache_lookup 返回 NULL，Stage 3 中同一条目的
+             * lookup 依然为 NULL，mtt_stack_resolve 永远不会被调用。现在在 Stage 2
+             * 条目创建时同步解析，确保每个缓存条目在写入 HTTP 缓存之前均已完成解析，
+             * 消除 ARM32 QEMU 下第二泄漏站点显示原始 hex 地址的问题。 */
+            mtt_stack_entry_t *stack_entry = mtt_stack_cache_lookup(
+                sn->stack, sn->stack_frames);
+            if (stack_entry != NULL && !stack_entry->is_resolved)
+                mtt_stack_resolve(stack_entry);
+
+            if (stack_entry != NULL) {
+                hash = stack_entry->hash;
+            } else {
+                /* 缓存满或分配失败，直接计算 hash（不去重缓存但不影响去重） */
+                hash = mtt_stack_hash_compute(sn->stack, sn->stack_frames);
+            }
         } else {
-            /* 缓存满或分配失败，直接计算 hash（不去重缓存但不影响去重） */
-            hash = mtt_stack_hash_compute(sn->stack, sn->stack_frames);
+            /* 无栈回溯可用（musl/bionic无backtrace平台的兜底策略）：
+             * 按分配大小生成hash键，同大小分配归入同一泄漏站点。
+             * 虽然丢失调用栈信息，但能按大小维度展示泄漏分布。 */
+            hash = (uint64_t)sn->size * UINT64_C(0x9E3779B97F4A7C15);
         }
 
         /* 查/插泄漏站点 */
