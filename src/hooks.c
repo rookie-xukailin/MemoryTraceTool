@@ -298,6 +298,15 @@ void free(void *ptr)
     mtt_stripe_lock(s, ptr);
     mtt_entry_t *e = mtt_entry_find(s, ptr);
     if (e != NULL) {
+        /* 诊断：小分配被释放 */
+        if (e->size <= 128) {
+            char dbuf[80];
+            int dlen = snprintf(dbuf, sizeof(dbuf),
+                "[MTT] hook: free(%zu) ptr=%p age=%lds\n",
+                e->size, ptr, (long)(time(NULL) - e->timestamp));
+            if (dlen > 0 && dlen < (int)sizeof(dbuf))
+                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+        }
         if (e->size <= atomic_load_explicit(&s->current_bytes, memory_order_relaxed))
             atomic_fetch_sub_explicit(&s->current_bytes, e->size, memory_order_relaxed);
         else
