@@ -72,6 +72,16 @@ static void first_call_diag(const char *func_name, _Atomic int *flag)
  */
 void* malloc(size_t size)
 {
+    /* 诊断入口：在任何hook逻辑之前，确认malloc(10)是否到达 */
+    if (size == 10) {
+        char dbuf[64];
+        int dlen = snprintf(dbuf, sizeof(dbuf),
+            "[MTT] ENTER malloc(10) hook=%d internal=%d\n",
+            g_in_hook, g_tool_internal);
+        if (dlen > 0 && dlen < (int)sizeof(dbuf))
+            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+    }
+
     /* 首次调用诊断 */
     first_call_diag("malloc", &g_first_malloc_diag);
 
@@ -257,6 +267,19 @@ void free(void *ptr)
     first_call_diag("free", &g_first_free_diag);
 
     if (ptr == NULL) return;
+
+    /* 诊断入口：在任何hook逻辑之前，检测是否被绕过 */
+    {
+        int cur_hook = g_in_hook;
+        if (cur_hook || g_tool_internal) {
+            char dbuf[64];
+            int dlen = snprintf(dbuf, sizeof(dbuf),
+                "[MTT] free BYPASS hook=%d internal=%d\n",
+                cur_hook, g_tool_internal);
+            if (dlen > 0 && dlen < (int)sizeof(dbuf))
+                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+        }
+    }
 
     /* 递归保护 */
     int saved_hook = g_in_hook;
