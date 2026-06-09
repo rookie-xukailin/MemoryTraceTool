@@ -58,6 +58,20 @@ static void first_call_diag(const char *func_name, _Atomic int *flag)
  *                     LD_PRELOAD 拦截入口                                     *
  * ======================================================================== */
 
+/* TLS 完整性检测：ARM64 上某些线程创建方式（clone）可能导致 __thread 变量
+ * 未归零。用魔数检测并强制初始化，确保 g_in_hook / g_tool_internal 安全。 */
+#define MTT_TLS_MAGIC UINT32_C(0x4D545400) /* "MTT\0" */
+
+static inline void mtt_tls_safeguard(void)
+{
+    static __thread uint32_t g_tls_magic = 0;
+    if (__builtin_expect(g_tls_magic != MTT_TLS_MAGIC, 0)) {
+        g_tls_magic     = MTT_TLS_MAGIC;
+        g_in_hook       = 0;
+        g_tool_internal = 0;
+    }
+}
+
 /**
  * LD_PRELOAD 拦截的 malloc。
  *
@@ -72,15 +86,7 @@ static void first_call_diag(const char *func_name, _Atomic int *flag)
  */
 void* malloc(size_t size)
 {
-    /* 诊断入口：在任何hook逻辑之前，确认malloc(10)是否到达 */
-    if (size == 10) {
-        char dbuf[64];
-        int dlen = snprintf(dbuf, sizeof(dbuf),
-            "[MTT] ENTER malloc(10) hook=%d internal=%d\n",
-            g_in_hook, g_tool_internal);
-        if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
-    }
+    mtt_tls_safeguard();
 
     /* 首次调用诊断 */
     first_call_diag("malloc", &g_first_malloc_diag);
@@ -264,22 +270,10 @@ void* malloc(size_t size)
  */
 void free(void *ptr)
 {
+    mtt_tls_safeguard();
     first_call_diag("free", &g_first_free_diag);
 
     if (ptr == NULL) return;
-
-    /* 诊断入口：在任何hook逻辑之前，检测是否被绕过 */
-    {
-        int cur_hook = g_in_hook;
-        if (cur_hook || g_tool_internal) {
-            char dbuf[64];
-            int dlen = snprintf(dbuf, sizeof(dbuf),
-                "[MTT] free BYPASS hook=%d internal=%d\n",
-                cur_hook, g_tool_internal);
-            if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
-        }
-    }
 
     /* 递归保护 */
     int saved_hook = g_in_hook;
@@ -356,6 +350,7 @@ void free(void *ptr)
  */
 void* calloc(size_t count, size_t size)
 {
+    mtt_tls_safeguard();
     first_call_diag("calloc", &g_first_calloc_diag);
 
     /* 递归保护：已在 hook 中则直接透传 raw_malloc */
@@ -404,6 +399,7 @@ void* calloc(size_t count, size_t size)
  */
 void* realloc(void *ptr, size_t size)
 {
+    mtt_tls_safeguard();
     first_call_diag("realloc", &g_first_realloc_diag);
 
     if (ptr == NULL) return malloc(size);
