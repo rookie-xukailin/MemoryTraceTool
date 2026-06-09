@@ -135,16 +135,46 @@ void* malloc(size_t size)
     }
 
     /* 采样与容量检查（不满足条件则放行不追踪） */
-    if (!mtt_should_track(s, size) || mtt_is_over_capacity(s)) {
-        g_in_hook = saved_hook;
-        return ptr;
+    {
+        int track_ok = mtt_should_track(s, size);
+        int over_cap = mtt_is_over_capacity(s);
+        if (!track_ok || over_cap) {
+            if (size <= 128) {
+                char dbuf[96];
+                int dlen = snprintf(dbuf, sizeof(dbuf),
+                    "[MTT] hook: malloc(%zu) SKIP track=%d overcap=%d\n",
+                    size, track_ok, over_cap);
+                if (dlen > 0 && dlen < (int)sizeof(dbuf))
+                    MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+            }
+            g_in_hook = saved_hook;
+            return ptr;
+        }
     }
 
     /* 创建追踪记录（内部使用 raw_malloc） */
     mtt_entry_t *e = mtt_entry_new(ptr, size);
     if (e == NULL) {
+        if (size <= 128) {
+            char dbuf[64];
+            int dlen = snprintf(dbuf, sizeof(dbuf),
+                "[MTT] hook: malloc(%zu) entry_new FAILED\n", size);
+            if (dlen > 0 && dlen < (int)sizeof(dbuf))
+                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+        }
         g_in_hook = saved_hook;
         return ptr; /* 追踪失败不阻塞业务 */
+    }
+
+    /* 诊断：小分配追踪成功 */
+    if (size <= 128) {
+        char dbuf[64];
+        int dlen = snprintf(dbuf, sizeof(dbuf),
+            "[MTT] hook: malloc(%zu) tracked, entry=%llu\n",
+            size, (unsigned long long)atomic_load_explicit(
+                &s->entry_count, memory_order_relaxed));
+        if (dlen > 0 && dlen < (int)sizeof(dbuf))
+            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
     }
 
     /* 持锁插入哈希表 + 原子更新计数器 */
