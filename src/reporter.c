@@ -312,22 +312,20 @@ static void scan_and_report_locked(void)
     size_t snap_count = 0;
 
     if (entry_total > 0) {
-        /* 尝试分配快照数组。
-         * 在 ARM 内存受限设备上可能失败 — 降级为半数容量重试。 */
-        size_t alloc_size = (size_t)(entry_total * sizeof(mtt_alloc_snap_t));
-        snaps = (mtt_alloc_snap_t*)raw_malloc(alloc_size);
-
-        if (snaps == NULL && entry_total > 1024) {
-            /* 降级：尝试半数容量（仍能覆盖大部分泄漏） */
-            entry_total = entry_total / 2;
-            alloc_size = (size_t)(entry_total * sizeof(mtt_alloc_snap_t));
+        /* 尝试分配快照数组，逐步减半直到成功 */
+        uint64_t try_entries = entry_total;
+        size_t alloc_size = 0;
+        do {
+            alloc_size = (size_t)(try_entries * sizeof(mtt_alloc_snap_t));
             snaps = (mtt_alloc_snap_t*)raw_malloc(alloc_size);
-        }
+            if (snaps != NULL) break;
+            try_entries /= 2;
+        } while (try_entries >= 1024);
 
-        if (snaps == NULL) {
-            /* 分配完全失败：跳过本次扫描，下个周期重试 */
+        if (snaps == NULL)
             goto skip_scan;
-        }
+        if (try_entries < entry_total)
+            entry_total = try_entries;
         memset(snaps, 0, alloc_size);
 
         /* 逐锁遍历所有桶，持锁期间拷贝字段，释放锁后安全访问 */

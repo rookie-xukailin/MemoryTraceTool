@@ -533,9 +533,6 @@ static void* http_thread_fn(void *arg)
     (void)arg;
     pthread_detach(pthread_self());
 
-    /* 标记为工具内部线程：所有分配直接透传 raw_*，不进入追踪系统 */
-    g_tool_internal = 1;
-
     static char req_buf[MTT_HTTP_BUF_SIZE];
     static char path[MTT_HTTP_MAX_PATH];
 
