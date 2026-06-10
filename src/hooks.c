@@ -132,7 +132,13 @@ void* malloc(size_t size)
     /* 第2层递归保护：pthread深度计数器 + g_in_hook双重检查。
      * depth>0 → 真正的递归调用 → bypass
      * g_in_hook && depth==0 → __thread被异常污染 → 清零后继续追踪 */
-    int depth = mtt_hook_enter();
+    /* MTT_DEBUG_NO_DEPTH=1: 绕过深度检查，用于诊断深度计数器是否卡住 */
+    static int g_no_depth = -1;
+    if (g_no_depth == -1) {
+        const char *env = getenv("MTT_DEBUG_NO_DEPTH");
+        g_no_depth = (env != NULL && strcmp(env, "1") == 0) ? 1 : 0;
+    }
+    int depth = g_no_depth ? 0 : mtt_hook_enter();
     if (depth > 0) {
         if (size == 10) {
             char dbuf[72];
@@ -147,9 +153,10 @@ void* malloc(size_t size)
     }
     /* depth==0: 用户代码直接调用，非递归 */
     if (size == 10) {
-        char m[56];
+        char m[72];
         int len = snprintf(m, sizeof(m),
-            "[MTT] M10-ENTER tid=%d\n", (int)syscall(SYS_gettid));
+            "[MTT] M10-ENTER tid=%d nodepth=%d\n",
+            (int)syscall(SYS_gettid), g_no_depth);
         if (len > 0 && len < (int)sizeof(m))
             MTT_DIAG_WRITE(2, m, (size_t)len);
     }
