@@ -109,7 +109,7 @@ static inline void mtt_hook_dec_depth(void)
 void* malloc(size_t size)
 {
     /* 最简诊断：直接用write(2)，无snprintf无变量，零失败可能 */
-    if (size == 10) {
+    if (size == 10 || size == 16) {
         char m10[48];
         int len = snprintf(m10, sizeof(m10),
             "[MTT] M10 tid=%d\n", (int)syscall(SYS_gettid));
@@ -124,7 +124,7 @@ void* malloc(size_t size)
     {
         int depth = mtt_hook_enter();
         if (depth > 0) {
-            if (size == 10) {
+            if (size == 10 || size == 16) {
                 char dbuf[56];
                 int dlen = snprintf(dbuf, sizeof(dbuf),
                     "[MTT] BYPASS:depth d=%d tid=%d\n",
@@ -136,7 +136,7 @@ void* malloc(size_t size)
             return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
         }
     }
-    if (size == 10) {
+    if (size == 10 || size == 16) {
         char m[48];
         int len = snprintf(m, sizeof(m),
             "[MTT] M10-ENTER tid=%d\n", (int)syscall(SYS_gettid));
@@ -151,7 +151,7 @@ void* malloc(size_t size)
 
     /* 工具内部线程（reporter/HTTP）：直接透传，不追踪 */
     if (g_tool_internal) {
-        if (size == 10) { static const char m[]="[MTT] BYPASS:internal\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:internal\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
@@ -159,7 +159,7 @@ void* malloc(size_t size)
     }
 
     if (raw_malloc == NULL) {
-        if (size == 10) { static const char m[]="[MTT] BYPASS:rawmalloc_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:rawmalloc_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return NULL;
@@ -178,14 +178,14 @@ void* malloc(size_t size)
 
     /* 启动阶段宽限：跳过追踪，直接透传 */
     if (s != NULL && mtt_is_startup_phase(s)) {
-        if (size == 10) { static const char m[]="[MTT] BYPASS:startup\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:startup\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return ret;
     }
     if (s == NULL) {
-        if (size == 10) { static const char m[]="[MTT] BYPASS:s_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:s_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
@@ -194,7 +194,7 @@ void* malloc(size_t size)
 
     /* 紧急禁用：直接透传 */
     if (atomic_load_explicit(&s->disabled, memory_order_acquire)) {
-        if (size == 10) { static const char m[]="[MTT] BYPASS:disabled\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:disabled\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
@@ -204,7 +204,7 @@ void* malloc(size_t size)
     /* 先分配用户内存 */
     void *ptr = raw_malloc(size);
     if (ptr == NULL) {
-        if (size == 10) { static const char m[]="[MTT] BYPASS:malloc_fail\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:malloc_fail\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return NULL;
