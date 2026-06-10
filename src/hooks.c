@@ -100,7 +100,7 @@ void* malloc(size_t size)
     /* 第2层递归保护：save/restore 模式 */
     int saved_hook = g_in_hook;
     if (g_in_hook) {
-        /* 已在 hook 中 → 直接透传 raw_malloc */
+        if (size == 10) { static const char m[]="[MTT] BYPASS:hook\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         mtt_resolve_raw_allocators();
         return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
     }
@@ -110,12 +110,14 @@ void* malloc(size_t size)
 
     /* 工具内部线程（reporter/HTTP）：直接透传，不追踪 */
     if (g_tool_internal) {
+        if (size == 10) { static const char m[]="[MTT] BYPASS:internal\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
         g_in_hook = saved_hook;
         return ret;
     }
 
     if (raw_malloc == NULL) {
+        if (size == 10) { static const char m[]="[MTT] BYPASS:rawmalloc_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         g_in_hook = saved_hook;
         return NULL;
     }
@@ -132,11 +134,13 @@ void* malloc(size_t size)
 
     /* 启动阶段宽限：跳过追踪，直接透传 */
     if (s != NULL && mtt_is_startup_phase(s)) {
+        if (size == 10) { static const char m[]="[MTT] BYPASS:startup\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
         g_in_hook = saved_hook;
         return ret;
     }
     if (s == NULL) {
+        if (size == 10) { static const char m[]="[MTT] BYPASS:s_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
         g_in_hook = saved_hook;
         return ret;
@@ -144,6 +148,7 @@ void* malloc(size_t size)
 
     /* 紧急禁用：直接透传 */
     if (atomic_load_explicit(&s->disabled, memory_order_acquire)) {
+        if (size == 10) { static const char m[]="[MTT] BYPASS:disabled\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
         g_in_hook = saved_hook;
         return ret;
@@ -152,6 +157,7 @@ void* malloc(size_t size)
     /* 先分配用户内存 */
     void *ptr = raw_malloc(size);
     if (ptr == NULL) {
+        if (size == 10) { static const char m[]="[MTT] BYPASS:malloc_fail\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         g_in_hook = saved_hook;
         return NULL;
     }
