@@ -122,11 +122,9 @@ extern raw_free_fn    volatile raw_free;
 extern raw_calloc_fn  volatile raw_calloc;
 extern raw_realloc_fn volatile raw_realloc;
 
-/* __thread 递归保护标志（在 tracker.c 中定义，hooks.c/reporter.c 引用） */
-extern __thread int g_in_hook;
-
-/* __thread 工具内部线程标志：reporter/HTTP 线程的分配不进入追踪 */
-extern __thread int g_tool_internal;
+/* 每线程上下文：替代 __thread，通过 TID 索引槽位数组管理。
+ * 见 src/per_thread.h — mtt_thread_get() 获取当前线程上下文 */
+#include "per_thread.h"
 
 /* ======================================================================== *
  *                       缓存行对齐的互斥锁（避免伪共享）                        *

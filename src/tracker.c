@@ -28,6 +28,7 @@
 #include "reporter.h"
 #include "time_series.h"
 #include "http_server.h"
+#include "per_thread.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,10 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdatomic.h>
+
+/* 全局线程上下文槽位数组（替代 __thread 变量）。
+ * 在 tracker.c 中定义，per_thread.h 中 extern 声明 */
+mtt_per_thread_t g_threads[MTT_MAX_THREADS];
 
 /* ======================================================================== *
  *                    全局单例状态                                             *
@@ -78,7 +83,7 @@ static atomic_int g_raw_resolved = 0;
 static atomic_int g_raw_ready = 0;
 
 /* 递归保护：dlsym 内部可能触发 malloc，防止 resolve 自身递归 */
-static __thread int g_raw_resolving = 0;
+/* g_raw_resolving 已迁移至 per_thread.h 槽位数组 */
 
 /*
  * 防递归核心标志 (__thread)：
@@ -86,14 +91,14 @@ static __thread int g_raw_resolving = 0;
  * 不做任何追踪、不分配 entry、不捕获栈。
  * 使用 save/restore 模式支持嵌套。
  */
-__thread int g_in_hook = 0;
+/* g_in_hook / g_tool_internal moved to per_thread.h */
 
 /*
  * 工具内部线程标志：
  * reporter 线程和 HTTP 服务线程设置此标志，其后所有 malloc/free 直接透传 raw_*，
  * 不进入追踪系统，避免工具自身的分配污染泄漏报告。
  */
-__thread int g_tool_internal = 0;
+
 
 /* ======================================================================== *
  *                  Bootstrap 分配器（dlsym 阶段兜底）                         *
@@ -181,7 +186,8 @@ void mtt_resolve_raw_allocators(void)
         return;
 
     /* 递归保护：dlsym 内部可能触发 malloc */
-    if (g_raw_resolving)
+    mtt_per_thread_t *ctx = mtt_thread_get();
+    if (ctx->raw_resolving)
         return;
 
     /* 预置 bootstrap 分配器：必须在 CAS 之前完成。
@@ -199,11 +205,11 @@ void mtt_resolve_raw_allocators(void)
     if (!atomic_compare_exchange_strong(&g_raw_resolved, &expected, 1))
         return;
 
-    g_raw_resolving = 1;
+    ctx->raw_resolving = 1;
 
     /* dlsym 内部可能触发 malloc，设置 g_in_hook 确保递归调用全部透传 */
-    int saved_hook = g_in_hook;
-    g_in_hook = 1;
+    int saved_hook = ctx->in_hook;
+    ctx->in_hook = 1;
 
     raw_malloc_fn real_malloc   = (raw_malloc_fn)dlsym(RTLD_NEXT, "malloc");
     raw_free_fn   real_free     = (raw_free_fn)dlsym(RTLD_NEXT, "free");
@@ -251,8 +257,8 @@ void mtt_resolve_raw_allocators(void)
         }
     }
 
-    g_in_hook = saved_hook;
-    g_raw_resolving = 0;
+    ctx->in_hook = saved_hook;
+    ctx->raw_resolving = 0;
 
     /* 发布屏障：确保 raw_* 指针写入对所有线程可见后，再置 ready 标志 */
     atomic_store_explicit(&g_raw_ready, 1, memory_order_release);
@@ -263,7 +269,7 @@ void mtt_resolve_raw_allocators(void)
  * ======================================================================== */
 
 /* __thread 递归保护：backtrace 内部可能触发 malloc */
-static __thread int g_in_capture = 0;
+/* g_in_capture moved to per_thread.h */
 
 /**
  * 捕获当前调用栈并存入 entry->stack[]。
@@ -288,13 +294,14 @@ void mtt_capture_stack(mtt_entry_t *entry)
 {
     if (entry == NULL) return;
 
-    if (g_in_capture) {
+    mtt_per_thread_t *ctx = mtt_thread_get();
+    if (ctx->in_capture) {
         entry->stack_frames = 0;
         return;
     }
 
-    int saved = g_in_capture;
-    g_in_capture = 1;
+    int saved = ctx->in_capture;
+    ctx->in_capture = 1;
 
 #if MTT_HAS_BACKTRACE
     entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
@@ -332,7 +339,7 @@ void mtt_capture_stack(mtt_entry_t *entry)
         entry->stack_frames = count;
     }
 
-    g_in_capture = saved;
+    ctx->in_capture = saved;
 }
 
 /* ======================================================================== *
@@ -796,15 +803,12 @@ void mtt_ensure_init(void)
     /* 先初始化时序数据（必须在 reporter 线程启动前完成） */
     mtt_ts_init();
 
-    /* 启动子系统时设置 g_in_hook=1，防止 pthread_create / socket / bind 等
+    /* 启动子系统时设置 in_hook=1，防止 pthread_create / socket / bind 等
      * 内部调用 malloc() 被 hook 拦截并追踪为"疑似泄漏"。
-     * save/restore 防止嵌套 mtt_ensure_init 调用破坏状态。
-     * 注：__thread 变量仅影响当前线程；reporter/http/signal 子线程
-     * 各自在入口函数首行设置 g_in_hook=1，但 glibc 线程启动代码
-     * 可能在入口函数执行前调用 calloc 分配 TLS/栈，此类分配
-     * 会被追踪但无法避免（见 stack_cache.c 中后台库引用说明）。 */
-    int saved_hook = g_in_hook;
-    g_in_hook = 1;
+     * save/restore 防止嵌套 mtt_ensure_init 调用破坏状态。 */
+    mtt_per_thread_t *ctx = mtt_thread_get();
+    int saved_hook = ctx->in_hook;
+    ctx->in_hook = 1;
 
     /* 启动周期报告线程（锁外，避免 pthread_create 内部 malloc → 递归） */
     mtt_reporter_start();
@@ -826,7 +830,7 @@ void mtt_ensure_init(void)
     /* 启动信号处理线程（SIGUSR1 触发即时报告） */
     mtt_signal_thread_start();
 
-    g_in_hook = saved_hook;
+    ctx->in_hook = saved_hook;
 
     /* 注册 fork 安全处理器（仅需注册一次） */
     static pthread_once_t g_fork_init = PTHREAD_ONCE_INIT;

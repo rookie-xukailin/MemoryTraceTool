@@ -352,6 +352,7 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
 /** 处理 GET /api/data */
 static void handle_api_data(int client_fd)
 {
+    mtt_per_thread_t *ctx = mtt_thread_get();
     mtt_reporter_t *rep = mtt_reporter_get();
     const char *header =
         "HTTP/1.0 200 OK\r\n"
@@ -369,11 +370,11 @@ static void handle_api_data(int client_fd)
     size_t total_alloc = (s != NULL) ? atomic_load_explicit(&s->total_bytes, memory_order_relaxed) : 0;
     size_t leak_count = (allocs > frees) ? (allocs - frees) : 0;
     /* 读取当前 RSS（近似值）。
-     * fopen/fclose 内部触发 libc malloc，设 g_in_hook 防止被追踪为虚假泄漏。 */
+     * fopen/fclose 内部触发 libc malloc，设 in_hook 防止被追踪为虚假泄漏。 */
     size_t rss_bytes = 0;
     {
-        int saved_hook = g_in_hook;
-        g_in_hook = 1;
+        int saved_hook = ctx->in_hook;
+        ctx->in_hook = 1;
         FILE *fp = fopen("/proc/self/statm", "r");
         if (fp != NULL) {
             long rss_pages = 0;
@@ -381,7 +382,7 @@ static void handle_api_data(int client_fd)
                 rss_bytes = (size_t)rss_pages * (size_t)sysconf(_SC_PAGESIZE);
             fclose(fp);
         }
-        g_in_hook = saved_hook;
+        ctx->in_hook = saved_hook;
     }
 
     const char *proc_name = "unknown";
