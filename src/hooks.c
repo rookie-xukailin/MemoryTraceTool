@@ -59,20 +59,30 @@ static void first_call_diag(const char *func_name, _Atomic int *flag)
  *                     LD_PRELOAD 拦截入口                                     *
  * ======================================================================== */
 
-/* 递归深度计数器：替代 __thread int g_in_hook 用于递归检测。
- * pthread_getspecific/setspecific 使用 glibc 内部 TCB（线程控制块），
- * pthread_getspecific 在某些 ARM64 设备上可能对未设置 key 的线程返回脏值，
- * 改用 __thread int 作为深度计数器：BSS 零初始化，每个线程独立，更可靠。 */
-static __thread int g_hook_depth = 0;
+/* 递归检测：__thread 深度计数器 + 哨兵初始化。
+ *
+ * 某些 ARM64 设备上 __thread 变量可能不会被 BSS 归零（TLS 初始化异常），
+ * 导致 g_hook_depth 残留非零值。解决：用第二个 __thread 变量 g_depth_inited
+ * 存储哨兵值 0x2A，若二者不一致则显式清零 g_hook_depth。
+ * 两个独立 __thread 变量同时被污染为特定值的概率极低。 */
 
-/** 获取当前 hook 调用深度（entry 前），entry 后 depth+1 */
+static __thread int g_hook_depth  = -1;   /* -1=tdata 初始值，用于检测 */
+static __thread int g_depth_inited = -1;  /* 哨兵：应为 0x2A */
+
+/** 获取当前 hook 调用深度，首次调用时自动修正脏值 */
 static inline int mtt_hook_enter(void)
 {
+    if (g_depth_inited != 0x2A) {
+        g_hook_depth = 0;
+        g_depth_inited = 0x2A;
+    }
     return g_hook_depth;
 }
 
 static inline void mtt_hook_inc_depth(void)
 {
+    int init_ok = (g_depth_inited == 0x2A);
+    if (!init_ok) { g_hook_depth = 0; g_depth_inited = 0x2A; }
     g_hook_depth++;
 }
 
@@ -81,7 +91,7 @@ static inline void mtt_hook_dec_depth(void)
     if (g_hook_depth > 0)
         g_hook_depth--;
     else
-        g_hook_depth = 0; /* 防御：异常归零，避免一直卡在负值 */
+        g_hook_depth = 0;
 }
 
 /**
@@ -110,33 +120,28 @@ void* malloc(size_t size)
     /* 首次调用诊断 */
     first_call_diag("malloc", &g_first_malloc_diag);
 
-    /* 第2层递归保护：pthread深度计数器 + g_in_hook双重检查。
-     * depth>0 → 真正的递归调用 → bypass
-     * g_in_hook && depth==0 → __thread被异常污染 → 清零后继续追踪 */
-    int depth = mtt_hook_enter();
-    if (depth > 0) {
-        if (size == 10) {
-            char dbuf[56];
-            int dlen = snprintf(dbuf, sizeof(dbuf),
-                "[MTT] BYPASS:depth d=%d tid=%d\n",
-                depth, (int)syscall(SYS_gettid));
-            if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                MTT_DIAG_WRITE(2, dbuf, (size_t)dlen);
+    /* 递归保护：__thread 深度计数器（哨兵自动修正脏值） */
+    {
+        int depth = mtt_hook_enter();
+        if (depth > 0) {
+            if (size == 10) {
+                char dbuf[56];
+                int dlen = snprintf(dbuf, sizeof(dbuf),
+                    "[MTT] BYPASS:depth d=%d tid=%d\n",
+                    depth, (int)syscall(SYS_gettid));
+                if (dlen > 0 && dlen < (int)sizeof(dbuf))
+                    MTT_DIAG_WRITE(2, dbuf, (size_t)dlen);
+            }
+            mtt_resolve_raw_allocators();
+            return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
         }
-        mtt_resolve_raw_allocators();
-        return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
     }
-    /* depth==0: 用户代码直接调用，非递归 */
     if (size == 10) {
         char m[48];
         int len = snprintf(m, sizeof(m),
             "[MTT] M10-ENTER tid=%d\n", (int)syscall(SYS_gettid));
         if (len > 0 && len < (int)sizeof(m))
             MTT_DIAG_WRITE(2, m, (size_t)len);
-    }
-    if (g_in_hook) {
-        if (size == 10) { static const char m[]="[MTT] BYPASS:hook\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
-        g_in_hook = 0; /* __thread卡在1，清零，继续追踪 */
     }
     mtt_hook_inc_depth();
     int saved_hook = g_in_hook;
@@ -333,14 +338,12 @@ void free(void *ptr)
 
     if (ptr == NULL) return;
 
-    /* 递归保护：深度计数器 + g_in_hook双重检查 */
-    int depth = mtt_hook_enter();
-    if (depth > 0) {
+    /* 递归保护：栈回溯检测 */
+    if (mtt_hook_enter() > 0) {
         mtt_resolve_raw_allocators();
         if (raw_free != NULL) raw_free(ptr);
         return;
     }
-    if (g_in_hook) g_in_hook = 0;
     mtt_hook_inc_depth();
     int saved_hook = g_in_hook;
     g_in_hook = 1;
@@ -427,9 +430,8 @@ void* calloc(size_t count, size_t size)
 {
     first_call_diag("calloc", &g_first_calloc_diag);
 
-    /* 递归保护：深度计数器 + g_in_hook双重检查 */
-    int depth = mtt_hook_enter();
-    if (depth > 0) {
+    /* 递归保护：栈回溯检测 */
+    if (mtt_hook_enter() > 0) {
         mtt_resolve_raw_allocators();
         if (raw_malloc == NULL) return NULL;
         if (count > 0 && size > SIZE_MAX / count) return NULL;
@@ -438,9 +440,6 @@ void* calloc(size_t count, size_t size)
         if (p != NULL) memset(p, 0, total);
         return p;
     }
-    if (g_in_hook) g_in_hook = 0;
-    mtt_hook_inc_depth();
-
     /* 工具内部线程：直接透传 raw_malloc + memset，不追踪 */
     if (g_tool_internal) {
         mtt_resolve_raw_allocators();
@@ -458,9 +457,9 @@ void* calloc(size_t count, size_t size)
     size_t total = count * size;
 
     /* 通过本文件的 malloc() 分配并追踪。
-     * 注意：不在此处设置 g_in_hook，让 malloc() 内部自行管理
-     * 其 save/restore。之前 g_in_hook=1 导致 malloc() 透传到 raw_malloc
-     * 而不创建追踪记录，calloc 分配的内存完全不被追踪。 */
+     * mtt_is_recursive_call() 确保 calloc→malloc 链路中
+     * malloc 能正确识别调用栈中的 calloc 帧并绕过追踪。
+     * g_in_hook 由 malloc 内部自行 save/restore。 */
     void *ptr = malloc(total);
     if (ptr != NULL) memset(ptr, 0, total);
 
@@ -481,9 +480,8 @@ void* realloc(void *ptr, size_t size)
     if (ptr == NULL) return malloc(size);
     if (size == 0) { free(ptr); return NULL; }
 
-    /* 递归保护：深度计数器 + g_in_hook双重检查 */
-    int depth = mtt_hook_enter();
-    if (depth > 0) {
+    /* 递归保护：栈回溯检测 */
+    if (mtt_hook_enter() > 0) {
         mtt_resolve_raw_allocators();
         if (raw_realloc != NULL)
             return raw_realloc(ptr, size);
@@ -493,7 +491,6 @@ void* realloc(void *ptr, size_t size)
         if (raw_free != NULL) raw_free(ptr);
         return new_ptr;
     }
-    if (g_in_hook) g_in_hook = 0;
     mtt_hook_inc_depth();
     int saved_hook = g_in_hook;
     g_in_hook = 1;
