@@ -363,6 +363,21 @@ static void scan_and_report_locked(void)
         }
     }
 
+    /* 诊断：统计 10 字节快照条目数 */
+    {
+        size_t n10 = 0;
+        for (size_t i = 0; i < snap_count; i++) {
+            if (snaps[i].size == 10) n10++;
+        }
+        if (n10 > 0) {
+            char dbuf[80];
+            int dlen = snprintf(dbuf, sizeof(dbuf),
+                "[MTT] scan: 10B snaps=%zu / total snaps=%zu\n", n10, snap_count);
+            if (dlen > 0 && dlen < (int)sizeof(dbuf))
+                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+        }
+    }
+
     /* ---- 阶段 2: 去重 —— 按栈 hash 分组到泄漏站点表 ---- */
     /* leak_table 大小约 16KB（64-bit）或 8KB（32-bit），不放在栈上：
      * ARM32 默认线程栈仅 8KB（Android bionic），直接溢出破坏相邻局部变量
@@ -453,6 +468,24 @@ static void scan_and_report_locked(void)
             leak_table.count++;
         }
         /* else: 泄漏表满，静默跳过 */
+    }
+
+    /* 诊断：统计 10 字节泄漏站点 */
+    {
+        size_t n10_sites = 0, n10_total = 0;
+        for (unsigned b = 0; b < MTT_LEAK_DEDUP_SIZE; b++) {
+            mtt_leak_site_t *site = leak_table.entries[b];
+            while (site != NULL) {
+                if (site->per_leak_size == 10) { n10_sites++; n10_total += site->count; }
+                site = site->next;
+            }
+        }
+        char dbuf[128];
+        int dlen = snprintf(dbuf, sizeof(dbuf),
+            "[MTT] dedup: 10B_sites=%zu 10B_total=%zu  all_sites=%zu  snaps=%zu\n",
+            n10_sites, n10_total, leak_table.count, snap_count);
+        if (dlen > 0 && dlen < (int)sizeof(dbuf))
+            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
     }
 
     /* ---- 阶段 3: 懒解析栈符号（安全网：补解析阶段 2 遗漏的条目） ----

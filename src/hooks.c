@@ -118,6 +118,7 @@ void* malloc(size_t size)
      * g_in_hook && depth==0 → __thread被异常污染 → 清零后继续追踪 */
     int depth = mtt_hook_enter();
     if (depth > 0) {
+        if (size == 10) { static const char m[]="[MTT] BYPASS:depth\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         mtt_resolve_raw_allocators();
         return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
     }
@@ -367,8 +368,17 @@ void free(void *ptr)
     mtt_stripe_lock(s, ptr);
     mtt_entry_t *e = mtt_entry_find(s, ptr);
     if (e != NULL) {
+        /* 诊断：10字节分配被释放（关键路径） */
+        if (e->size == 10) {
+            char dbuf[80];
+            int dlen = snprintf(dbuf, sizeof(dbuf),
+                "[MTT] FREE10: ptr=%p age=%lds\n",
+                ptr, (long)(time(NULL) - e->timestamp));
+            if (dlen > 0 && dlen < (int)sizeof(dbuf))
+                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+        }
         /* 诊断：小分配被释放 */
-        if (e->size <= 128) {
+        if (e->size <= 128 && e->size != 10) {
             char dbuf[80];
             int dlen = snprintf(dbuf, sizeof(dbuf),
                 "[MTT] hook: free(%zu) ptr=%p age=%lds\n",
