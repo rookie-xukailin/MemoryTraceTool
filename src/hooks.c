@@ -140,6 +140,11 @@ void* malloc(size_t size)
         mtt_resolve_raw_allocators();
         return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
     }
+    /* depth==0: 用户代码直接调用，非递归 */
+    if (size == 10) {
+        static const char m[] = "[MTT] M10-ENTER\n";
+        MTT_DIAG_WRITE(2, m, sizeof(m) - 1);
+    }
     if (g_in_hook) {
         if (size == 10) { static const char m[]="[MTT] BYPASS:hook\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         g_in_hook = 0; /* __thread卡在1，清零，继续追踪 */
