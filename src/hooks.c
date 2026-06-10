@@ -63,10 +63,12 @@ static void first_call_diag(const char *func_name, _Atomic int *flag)
 /* 深度计数器已迁移至 per_thread.h 槽位数组。
  * mtt_hook_enter/inc/dec 内部通过 mtt_thread_get() 访问。 */
 
-/** 获取当前 hook 调用深度，首次调用时自动修正脏值 */
+/** 获取当前 hook 调用深度，首次调用时自动修正脏值。
+ * 若槽位满返回 -1（降级：视为递归，直接透传 raw_*） */
 static inline int mtt_hook_enter(void)
 {
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get();
+    if (ctx == NULL) return -1; /* 降级：无槽位时保守视为递归 */
     if (ctx->depth_inited != 0x2A) {
         char dbuf[80];
         int dlen = snprintf(dbuf, sizeof(dbuf),
@@ -83,6 +85,7 @@ static inline int mtt_hook_enter(void)
 static inline void mtt_hook_inc_depth(void)
 {
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get();
+    if (ctx == NULL) return; /* 降级：无槽位时跳过 */
     int init_ok = (ctx->depth_inited == 0x2A);
     if (!init_ok) { ctx->hook_depth = 0; ctx->depth_inited = 0x2A; }
     ctx->hook_depth++;
@@ -91,6 +94,7 @@ static inline void mtt_hook_inc_depth(void)
 static inline void mtt_hook_dec_depth(void)
 {
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get();
+    if (ctx == NULL) return; /* 降级：无槽位时跳过 */
     if (ctx->hook_depth > 0)
         ctx->hook_depth--;
     else
@@ -147,6 +151,11 @@ void* malloc(size_t size)
             MTT_DIAG_WRITE(2, m, (size_t)len);
     }
     mtt_per_thread_t *ctx = mtt_thread_get();
+    if (ctx == NULL) {
+        /* 槽位满：降级透传，不追踪 */
+        mtt_resolve_raw_allocators();
+        return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
+    }
     mtt_hook_inc_depth();
     int saved_hook = ctx->in_hook;
     ctx->in_hook = 1;
@@ -349,6 +358,12 @@ void free(void *ptr)
         return;
     }
     mtt_per_thread_t *ctx = mtt_thread_get();
+    if (ctx == NULL) {
+        /* 槽位满：降级直接释放 */
+        mtt_resolve_raw_allocators();
+        if (raw_free != NULL) raw_free(ptr);
+        return;
+    }
     mtt_hook_inc_depth();
     int saved_hook = ctx->in_hook;
     ctx->in_hook = 1;
@@ -438,6 +453,16 @@ void* calloc(size_t count, size_t size)
         return p;
     }
     mtt_per_thread_t *ctx = mtt_thread_get();
+    if (ctx == NULL) {
+        /* 槽位满：降级，直接 raw_malloc + memset */
+        mtt_resolve_raw_allocators();
+        if (raw_malloc == NULL) return NULL;
+        if (count > 0 && size > SIZE_MAX / count) return NULL;
+        size_t total = count * size;
+        void *p = raw_malloc(total);
+        if (p != NULL) memset(p, 0, total);
+        return p;
+    }
     /* 工具内部线程：直接透传 raw_malloc + memset，不追踪 */
     if (ctx->tool_internal) {
         mtt_resolve_raw_allocators();
@@ -490,6 +515,16 @@ void* realloc(void *ptr, size_t size)
         return new_ptr;
     }
     mtt_per_thread_t *ctx = mtt_thread_get();
+    if (ctx == NULL) {
+        /* 槽位满：降级使用 raw_realloc */
+        mtt_resolve_raw_allocators();
+        if (raw_realloc != NULL) return raw_realloc(ptr, size);
+        if (raw_malloc == NULL) return NULL;
+        void *np = raw_malloc(size);
+        if (np == NULL) return NULL;
+        if (raw_free != NULL) raw_free(ptr);
+        return np;
+    }
     mtt_hook_inc_depth();
     int saved_hook = ctx->in_hook;
     ctx->in_hook = 1;

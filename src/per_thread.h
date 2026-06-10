@@ -49,15 +49,19 @@ static inline mtt_per_thread_t* mtt_thread_get(void)
             return &g_threads[i];
     }
 
-    /* 第二阶段: CAS 分配新槽位 */
+    /* 第二阶段: CAS 分配新槽位。
+     * 初始化必须在 CAS 成功之后，否则 CAS 失败会破坏其他线程的数据。
+     * 槽位 tid 为 0 期间其他线程不可见（TID 不匹配），无需担心 TOCTOU。 */
     for (int i = 0; i < MTT_MAX_THREADS; i++) {
         pid_t zero = 0;
         if (atomic_compare_exchange_strong_explicit(
                 &g_threads[i].tid, &zero, tid,
                 memory_order_acq_rel, memory_order_acquire)) {
-            /* 新槽位: 初始化哨兵值（其他字段 BSS 已为 0） */
-            g_threads[i].hook_depth  = -1;
-            g_threads[i].depth_inited = -1;
+            /* CAS 成功：初始化所有字段（release 语义确保可见性） */
+            g_threads[i].hook_depth    = -1;
+            g_threads[i].depth_inited  = -1;
+            g_threads[i].in_hook       = 0;
+            g_threads[i].tool_internal = 0;
             return &g_threads[i];
         }
     }

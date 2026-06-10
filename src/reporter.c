@@ -962,12 +962,14 @@ static void* reporter_thread_fn(void *arg)
 
     /* 标记为工具内部线程：所有分配直接透传 raw_*，不进入追踪系统 */
     mtt_per_thread_t *ctx = mtt_thread_get();
-    ctx->tool_internal = 1;
+    if (ctx != NULL) {
+        ctx->tool_internal = 1;
+    }
 
     /* 报告线程全程设置 in_hook，确保所有 libc 调用绕过 hook，
      * 避免 fopen/fprintf/snprintf 等内部 malloc 导致递归死锁。 */
-    int saved_hook = ctx->in_hook;
-    ctx->in_hook = 1;
+    int saved_hook = (ctx != NULL) ? ctx->in_hook : 0;
+    if (ctx != NULL) ctx->in_hook = 1;
 
     /* 等 1 秒让业务代码启动并产生分配，然后做首次扫描 */
     sleep(1);
@@ -1033,7 +1035,7 @@ static void* reporter_thread_fn(void *arg)
     }
     scan_and_report();
 
-    ctx->in_hook = saved_hook;
+    if (ctx != NULL) ctx->in_hook = saved_hook;
     return NULL;
 }
 

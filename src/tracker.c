@@ -187,7 +187,7 @@ void mtt_resolve_raw_allocators(void)
 
     /* 递归保护：dlsym 内部可能触发 malloc */
     mtt_per_thread_t *ctx = mtt_thread_get();
-    if (ctx->raw_resolving)
+    if (ctx == NULL || ctx->raw_resolving)
         return;
 
     /* 预置 bootstrap 分配器：必须在 CAS 之前完成。
@@ -295,7 +295,7 @@ void mtt_capture_stack(mtt_entry_t *entry)
     if (entry == NULL) return;
 
     mtt_per_thread_t *ctx = mtt_thread_get();
-    if (ctx->in_capture) {
+    if (ctx == NULL || ctx->in_capture) {
         entry->stack_frames = 0;
         return;
     }
@@ -807,8 +807,8 @@ void mtt_ensure_init(void)
      * 内部调用 malloc() 被 hook 拦截并追踪为"疑似泄漏"。
      * save/restore 防止嵌套 mtt_ensure_init 调用破坏状态。 */
     mtt_per_thread_t *ctx = mtt_thread_get();
-    int saved_hook = ctx->in_hook;
-    ctx->in_hook = 1;
+    int saved_hook = (ctx != NULL) ? ctx->in_hook : 0;
+    if (ctx != NULL) ctx->in_hook = 1;
 
     /* 启动周期报告线程（锁外，避免 pthread_create 内部 malloc → 递归） */
     mtt_reporter_start();
@@ -830,7 +830,7 @@ void mtt_ensure_init(void)
     /* 启动信号处理线程（SIGUSR1 触发即时报告） */
     mtt_signal_thread_start();
 
-    ctx->in_hook = saved_hook;
+    if (ctx != NULL) ctx->in_hook = saved_hook;
 
     /* 注册 fork 安全处理器（仅需注册一次） */
     static pthread_once_t g_fork_init = PTHREAD_ONCE_INIT;

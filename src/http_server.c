@@ -372,7 +372,7 @@ static void handle_api_data(int client_fd)
     /* 读取当前 RSS（近似值）。
      * fopen/fclose 内部触发 libc malloc，设 in_hook 防止被追踪为虚假泄漏。 */
     size_t rss_bytes = 0;
-    {
+    if (ctx != NULL) {
         int saved_hook = ctx->in_hook;
         ctx->in_hook = 1;
         FILE *fp = fopen("/proc/self/statm", "r");
