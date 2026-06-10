@@ -69,9 +69,21 @@ static void mtt_hook_key_init(void)
     pthread_key_create(&g_hook_depth_key, NULL);
 }
 
-/** 获取/设置 hook 调用深度，返回当前深度（entry 前），entry 后 depth+1 */
+/** 获取/设置 hook 调用深度，返回当前深度（entry 前），entry 后 depth+1
+ *
+ * 若 g_hook_depth_key 为 0（构造函数未执行，ARM64 上可能发生），
+ * 通过 CAS 懒初始化确保 key 有效，避免 pthread_getspecific(0) 的未定义行为。 */
 static inline int mtt_hook_enter(void)
 {
+    if (g_hook_depth_key == 0) {
+        /* 构造函数未执行：动态链接器在 SO 构造函数之前调用了 malloc。
+         * pthread_key_create 在 glibc 中使用预分配数组，不触发 malloc。 */
+        pthread_key_t k;
+        pthread_key_create(&k, NULL);
+        pthread_key_t zero = 0;
+        if (!__sync_bool_compare_and_swap(&g_hook_depth_key, zero, k))
+            pthread_key_delete(k); /* 另一线程抢先初始化，释放多余的 key */
+    }
     intptr_t d = (intptr_t)pthread_getspecific(g_hook_depth_key);
     int depth = (int)(d & 0x7FFFFFFF);
     return depth;
@@ -118,7 +130,13 @@ void* malloc(size_t size)
      * g_in_hook && depth==0 → __thread被异常污染 → 清零后继续追踪 */
     int depth = mtt_hook_enter();
     if (depth > 0) {
-        if (size == 10) { static const char m[]="[MTT] BYPASS:depth\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size == 10) {
+            char dbuf[56];
+            int dlen = snprintf(dbuf, sizeof(dbuf),
+                "[MTT] BYPASS:depth d=%d key=%u\n", depth, (unsigned)g_hook_depth_key);
+            if (dlen > 0 && dlen < (int)sizeof(dbuf))
+                MTT_DIAG_WRITE(2, dbuf, (size_t)dlen);
+        }
         mtt_resolve_raw_allocators();
         return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
     }
