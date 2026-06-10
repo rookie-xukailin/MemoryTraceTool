@@ -73,6 +73,12 @@ static __thread int g_depth_inited = -1;  /* 哨兵：应为 0x2A */
 static inline int mtt_hook_enter(void)
 {
     if (g_depth_inited != 0x2A) {
+        char dbuf[80];
+        int dlen = snprintf(dbuf, sizeof(dbuf),
+            "[MTT] SENTINEL: depth=%d inited=%d tid=%d → reset\n",
+            g_hook_depth, g_depth_inited, (int)syscall(SYS_gettid));
+        if (dlen > 0 && dlen < (int)sizeof(dbuf))
+            MTT_DIAG_WRITE(2, dbuf, (size_t)dlen);
         g_hook_depth = 0;
         g_depth_inited = 0x2A;
     }
