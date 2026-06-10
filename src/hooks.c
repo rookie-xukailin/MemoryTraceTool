@@ -135,16 +135,14 @@ void* malloc(size_t size)
     if (g_tool_internal) {
         if (size == 10) { static const char m[]="[MTT] BYPASS:internal\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return ret;
     }
 
     if (raw_malloc == NULL) {
         if (size == 10) { static const char m[]="[MTT] BYPASS:rawmalloc_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return NULL;
     }
@@ -152,8 +150,7 @@ void* malloc(size_t size)
     /* 0 字节分配：标准行为 */
     if (size == 0) {
         void *ret = raw_malloc(0);
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return ret;
     }
@@ -165,16 +162,14 @@ void* malloc(size_t size)
     if (s != NULL && mtt_is_startup_phase(s)) {
         if (size == 10) { static const char m[]="[MTT] BYPASS:startup\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return ret;
     }
     if (s == NULL) {
         if (size == 10) { static const char m[]="[MTT] BYPASS:s_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return ret;
     }
@@ -183,8 +178,7 @@ void* malloc(size_t size)
     if (atomic_load_explicit(&s->disabled, memory_order_acquire)) {
         if (size == 10) { static const char m[]="[MTT] BYPASS:disabled\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return ret;
     }
@@ -193,8 +187,7 @@ void* malloc(size_t size)
     void *ptr = raw_malloc(size);
     if (ptr == NULL) {
         if (size == 10) { static const char m[]="[MTT] BYPASS:malloc_fail\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return NULL;
     }
@@ -212,8 +205,7 @@ void* malloc(size_t size)
                 if (dlen > 0 && dlen < (int)sizeof(dbuf))
                     MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
             }
-            mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
             return ptr;
         }
@@ -229,8 +221,7 @@ void* malloc(size_t size)
             if (dlen > 0 && dlen < (int)sizeof(dbuf))
                 MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
         }
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return ptr; /* 追踪失败不阻塞业务 */
     }
@@ -282,8 +273,7 @@ void* malloc(size_t size)
             atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
             mtt_stripe_unlock(s, ptr);
             if (raw_free != NULL) raw_free(e);
-            mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
             return ptr;
         }
@@ -347,15 +337,13 @@ void free(void *ptr)
     /* 工具内部线程：直接透传 */
     if (g_tool_internal) {
         if (raw_free != NULL) raw_free(ptr);
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return;
     }
 
     if (raw_free == NULL) {
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return;
     }
@@ -364,16 +352,14 @@ void free(void *ptr)
     mtt_state_t *s = mtt_state_get();
     if (s == NULL) {
         raw_free(ptr);
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return;
     }
 
     if (atomic_load_explicit(&s->disabled, memory_order_acquire)) {
         raw_free(ptr);
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return;
     }
@@ -501,15 +487,13 @@ void* realloc(void *ptr, size_t size)
             ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
             if (ret != NULL && raw_free != NULL) raw_free(ptr);
         }
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return ret;
     }
 
     if (raw_malloc == NULL) {
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return NULL;
     }
@@ -520,23 +504,20 @@ void* realloc(void *ptr, size_t size)
         /* 降级：优先使用 raw_realloc */
         if (raw_realloc != NULL) {
             void *ret = raw_realloc(ptr, size);
-            mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
             return ret;
         }
         /* 无 raw_realloc：malloc+memcpy+free 降级 */
         void *new_ptr = raw_malloc(size);
         if (new_ptr == NULL) {
-            mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
             return NULL;
         }
         memcpy(new_ptr, ptr, size);
         if (raw_free != NULL) raw_free(ptr);
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return new_ptr;
     }
@@ -551,8 +532,7 @@ void* realloc(void *ptr, size_t size)
 
         void *new_ptr = raw_realloc(ptr, size);
         if (new_ptr == NULL) {
-            mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
             return NULL;
         }
@@ -610,8 +590,7 @@ void* realloc(void *ptr, size_t size)
         /* else: 旧指针不在追踪表中（tracking 之前分配的），
          * raw_realloc 已完成实际内存操作，无需维护追踪表 */
 
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return new_ptr;
     }
@@ -621,8 +600,7 @@ void* realloc(void *ptr, size_t size)
     /* 先分配新内存（失败不破坏旧状态） */
     void *new_ptr = raw_malloc(size);
     if (new_ptr == NULL) {
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return NULL;
     }
@@ -631,8 +609,7 @@ void* realloc(void *ptr, size_t size)
     mtt_entry_t *new_e = mtt_entry_new(new_ptr, size);
     if (new_e == NULL) {
         raw_free(new_ptr);
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return NULL;
     }
@@ -664,8 +641,7 @@ void* realloc(void *ptr, size_t size)
         mtt_stripe_unlock(s, new_ptr);
         if (raw_free != NULL) raw_free(new_e);
         raw_free(ptr);
-        mtt_hook_dec_depth();
-        mtt_hook_dec_depth();
+    mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return new_ptr;
     }
