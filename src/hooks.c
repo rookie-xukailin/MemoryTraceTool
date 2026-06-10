@@ -330,13 +330,16 @@ void free(void *ptr)
 
     if (ptr == NULL) return;
 
-    /* 递归保护 */
-    int saved_hook = g_in_hook;
-    if (g_in_hook) {
+    /* 递归保护：深度计数器 + g_in_hook双重检查 */
+    int depth = mtt_hook_enter();
+    if (depth > 0) {
         mtt_resolve_raw_allocators();
         if (raw_free != NULL) raw_free(ptr);
         return;
     }
+    if (g_in_hook) g_in_hook = 0;
+    mtt_hook_inc_depth();
+    int saved_hook = g_in_hook;
     g_in_hook = 1;
 
     mtt_resolve_raw_allocators();
@@ -416,8 +419,9 @@ void* calloc(size_t count, size_t size)
 {
     first_call_diag("calloc", &g_first_calloc_diag);
 
-    /* 递归保护：已在 hook 中则直接透传 raw_malloc */
-    if (g_in_hook) {
+    /* 递归保护：深度计数器 + g_in_hook双重检查 */
+    int depth = mtt_hook_enter();
+    if (depth > 0) {
         mtt_resolve_raw_allocators();
         if (raw_malloc == NULL) return NULL;
         if (count > 0 && size > SIZE_MAX / count) return NULL;
@@ -426,6 +430,8 @@ void* calloc(size_t count, size_t size)
         if (p != NULL) memset(p, 0, total);
         return p;
     }
+    if (g_in_hook) g_in_hook = 0;
+    mtt_hook_inc_depth();
 
     /* 工具内部线程：直接透传 raw_malloc + memset，不追踪 */
     if (g_tool_internal) {
@@ -467,23 +473,21 @@ void* realloc(void *ptr, size_t size)
     if (ptr == NULL) return malloc(size);
     if (size == 0) { free(ptr); return NULL; }
 
-    int saved_hook = g_in_hook;
-    if (g_in_hook) {
-        /* 递归上下文：直接透传到 raw_realloc（若可用），否则模拟 */
+    /* 递归保护：深度计数器 + g_in_hook双重检查 */
+    int depth = mtt_hook_enter();
+    if (depth > 0) {
         mtt_resolve_raw_allocators();
         if (raw_realloc != NULL)
             return raw_realloc(ptr, size);
-        /* raw_realloc 不可用时的降级（极端情况，仅在 bootstrap 阶段可能触发）。
-         * 注意：此时无法查询旧分配大小，若新 size > 旧 size，直接 memcpy(size)
-         * 会导致堆越界读取。作为防御，不复制旧数据（仅分配新内存），
-         * 因为此路径在正常运行时永远不会到达（raw_realloc 在初始化后始终可用）。 */
         if (raw_malloc == NULL) return NULL;
         void *new_ptr = raw_malloc(size);
         if (new_ptr == NULL) return NULL;
-        /* 不复制：旧分配大小未知，memcpy(new_ptr, ptr, size) 可能越界读取 */;
         if (raw_free != NULL) raw_free(ptr);
         return new_ptr;
     }
+    if (g_in_hook) g_in_hook = 0;
+    mtt_hook_inc_depth();
+    int saved_hook = g_in_hook;
     g_in_hook = 1;
 
     mtt_resolve_raw_allocators();
