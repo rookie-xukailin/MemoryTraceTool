@@ -28,6 +28,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <errno.h>
 
 /*
@@ -118,8 +119,11 @@ void* malloc(size_t size)
 {
     /* 最简诊断：直接用write(2)，无snprintf无变量，零失败可能 */
     if (size == 10) {
-        static const char m10[] = "[MTT] M10\n";
-        MTT_DIAG_WRITE(STDERR_FILENO, m10, sizeof(m10) - 1);
+        char m10[48];
+        int len = snprintf(m10, sizeof(m10),
+            "[MTT] M10 tid=%d\n", (int)syscall(SYS_gettid));
+        if (len > 0 && len < (int)sizeof(m10))
+            MTT_DIAG_WRITE(STDERR_FILENO, m10, (size_t)len);
     }
 
     /* 首次调用诊断 */
@@ -131,9 +135,10 @@ void* malloc(size_t size)
     int depth = mtt_hook_enter();
     if (depth > 0) {
         if (size == 10) {
-            char dbuf[56];
+            char dbuf[72];
             int dlen = snprintf(dbuf, sizeof(dbuf),
-                "[MTT] BYPASS:depth d=%d key=%u\n", depth, (unsigned)g_hook_depth_key);
+                "[MTT] BYPASS:depth d=%d key=%u tid=%d\n",
+                depth, (unsigned)g_hook_depth_key, (int)syscall(SYS_gettid));
             if (dlen > 0 && dlen < (int)sizeof(dbuf))
                 MTT_DIAG_WRITE(2, dbuf, (size_t)dlen);
         }
@@ -142,8 +147,11 @@ void* malloc(size_t size)
     }
     /* depth==0: 用户代码直接调用，非递归 */
     if (size == 10) {
-        static const char m[] = "[MTT] M10-ENTER\n";
-        MTT_DIAG_WRITE(2, m, sizeof(m) - 1);
+        char m[56];
+        int len = snprintf(m, sizeof(m),
+            "[MTT] M10-ENTER tid=%d\n", (int)syscall(SYS_gettid));
+        if (len > 0 && len < (int)sizeof(m))
+            MTT_DIAG_WRITE(2, m, (size_t)len);
     }
     if (g_in_hook) {
         if (size == 10) { static const char m[]="[MTT] BYPASS:hook\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
