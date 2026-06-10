@@ -61,46 +61,27 @@ static void first_call_diag(const char *func_name, _Atomic int *flag)
 
 /* 递归深度计数器：替代 __thread int g_in_hook 用于递归检测。
  * pthread_getspecific/setspecific 使用 glibc 内部 TCB（线程控制块），
- * 不依赖 ELF TLS 段，ARM64 上即使 __thread 异常，pthread key 仍可靠。 */
-static pthread_key_t g_hook_depth_key;
+ * pthread_getspecific 在某些 ARM64 设备上可能对未设置 key 的线程返回脏值，
+ * 改用 __thread int 作为深度计数器：BSS 零初始化，每个线程独立，更可靠。 */
+static __thread int g_hook_depth = 0;
 
-__attribute__((constructor))
-static void mtt_hook_key_init(void)
-{
-    pthread_key_create(&g_hook_depth_key, NULL);
-}
-
-/** 获取/设置 hook 调用深度，返回当前深度（entry 前），entry 后 depth+1
- *
- * 若 g_hook_depth_key 为 0（构造函数未执行，ARM64 上可能发生），
- * 通过 CAS 懒初始化确保 key 有效，避免 pthread_getspecific(0) 的未定义行为。 */
+/** 获取当前 hook 调用深度（entry 前），entry 后 depth+1 */
 static inline int mtt_hook_enter(void)
 {
-    if (g_hook_depth_key == 0) {
-        /* 构造函数未执行：动态链接器在 SO 构造函数之前调用了 malloc。
-         * pthread_key_create 在 glibc 中使用预分配数组，不触发 malloc。 */
-        pthread_key_t k;
-        pthread_key_create(&k, NULL);
-        pthread_key_t zero = 0;
-        if (!__sync_bool_compare_and_swap(&g_hook_depth_key, zero, k))
-            pthread_key_delete(k); /* 另一线程抢先初始化，释放多余的 key */
-    }
-    intptr_t d = (intptr_t)pthread_getspecific(g_hook_depth_key);
-    int depth = (int)(d & 0x7FFFFFFF);
-    return depth;
+    return g_hook_depth;
 }
 
 static inline void mtt_hook_inc_depth(void)
 {
-    intptr_t d = (intptr_t)pthread_getspecific(g_hook_depth_key);
-    pthread_setspecific(g_hook_depth_key, (void*)(d + 1));
+    g_hook_depth++;
 }
 
 static inline void mtt_hook_dec_depth(void)
 {
-    intptr_t d = (intptr_t)pthread_getspecific(g_hook_depth_key);
-    if (d > 0)
-        pthread_setspecific(g_hook_depth_key, (void*)(d - 1));
+    if (g_hook_depth > 0)
+        g_hook_depth--;
+    else
+        g_hook_depth = 0; /* 防御：异常归零，避免一直卡在负值 */
 }
 
 /**
@@ -132,19 +113,13 @@ void* malloc(size_t size)
     /* 第2层递归保护：pthread深度计数器 + g_in_hook双重检查。
      * depth>0 → 真正的递归调用 → bypass
      * g_in_hook && depth==0 → __thread被异常污染 → 清零后继续追踪 */
-    /* MTT_DEBUG_NO_DEPTH=1: 绕过深度检查，用于诊断深度计数器是否卡住 */
-    static int g_no_depth = -1;
-    if (g_no_depth == -1) {
-        const char *env = getenv("MTT_DEBUG_NO_DEPTH");
-        g_no_depth = (env != NULL && strcmp(env, "1") == 0) ? 1 : 0;
-    }
-    int depth = g_no_depth ? 0 : mtt_hook_enter();
+    int depth = mtt_hook_enter();
     if (depth > 0) {
         if (size == 10) {
-            char dbuf[72];
+            char dbuf[56];
             int dlen = snprintf(dbuf, sizeof(dbuf),
-                "[MTT] BYPASS:depth d=%d key=%u tid=%d\n",
-                depth, (unsigned)g_hook_depth_key, (int)syscall(SYS_gettid));
+                "[MTT] BYPASS:depth d=%d tid=%d\n",
+                depth, (int)syscall(SYS_gettid));
             if (dlen > 0 && dlen < (int)sizeof(dbuf))
                 MTT_DIAG_WRITE(2, dbuf, (size_t)dlen);
         }
@@ -153,10 +128,9 @@ void* malloc(size_t size)
     }
     /* depth==0: 用户代码直接调用，非递归 */
     if (size == 10) {
-        char m[72];
+        char m[48];
         int len = snprintf(m, sizeof(m),
-            "[MTT] M10-ENTER tid=%d nodepth=%d\n",
-            (int)syscall(SYS_gettid), g_no_depth);
+            "[MTT] M10-ENTER tid=%d\n", (int)syscall(SYS_gettid));
         if (len > 0 && len < (int)sizeof(m))
             MTT_DIAG_WRITE(2, m, (size_t)len);
     }
