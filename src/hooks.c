@@ -115,7 +115,7 @@ static inline void mtt_hook_dec_depth(void)
 void* malloc(size_t size)
 {
     /* 最简诊断：直接用write(2)，无snprintf无变量，零失败可能 */
-    if (size == 10 || size == 16) {
+    if (size <= 128) {
         char m10[48];
         int len = snprintf(m10, sizeof(m10),
             "[MTT] M10 tid=%d\n", (int)syscall(SYS_gettid));
@@ -130,7 +130,7 @@ void* malloc(size_t size)
     {
         int depth = mtt_hook_enter();
         if (depth > 0) {
-            if (size == 10 || size == 16) {
+            if (size <= 128) {
                 char dbuf[56];
                 int dlen = snprintf(dbuf, sizeof(dbuf),
                     "[MTT] BYPASS:depth d=%d tid=%d\n",
@@ -142,7 +142,7 @@ void* malloc(size_t size)
             return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
         }
     }
-    if (size == 10 || size == 16) {
+    if (size <= 128) {
         char m[48];
         int len = snprintf(m, sizeof(m),
             "[MTT] M10-ENTER tid=%d\n", (int)syscall(SYS_gettid));
@@ -157,7 +157,7 @@ void* malloc(size_t size)
 
     /* 工具内部线程（reporter/HTTP）：直接透传，不追踪 */
     if (g_tool_internal) {
-        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:internal\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size <= 128) { static const char m[]="[MTT] BYPASS:internal\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
@@ -165,7 +165,7 @@ void* malloc(size_t size)
     }
 
     if (raw_malloc == NULL) {
-        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:rawmalloc_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size <= 128) { static const char m[]="[MTT] BYPASS:rawmalloc_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return NULL;
@@ -184,14 +184,14 @@ void* malloc(size_t size)
 
     /* 启动阶段宽限：跳过追踪，直接透传 */
     if (s != NULL && mtt_is_startup_phase(s)) {
-        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:startup\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size <= 128) { static const char m[]="[MTT] BYPASS:startup\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return ret;
     }
     if (s == NULL) {
-        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:s_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size <= 128) { static const char m[]="[MTT] BYPASS:s_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
@@ -200,7 +200,7 @@ void* malloc(size_t size)
 
     /* 紧急禁用：直接透传 */
     if (atomic_load_explicit(&s->disabled, memory_order_acquire)) {
-        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:disabled\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size <= 128) { static const char m[]="[MTT] BYPASS:disabled\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
@@ -210,7 +210,7 @@ void* malloc(size_t size)
     /* 先分配用户内存 */
     void *ptr = raw_malloc(size);
     if (ptr == NULL) {
-        if (size == 10 || size == 16) { static const char m[]="[MTT] BYPASS:malloc_fail\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
+        if (size <= 128) { static const char m[]="[MTT] BYPASS:malloc_fail\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
     mtt_hook_dec_depth();
     g_in_hook = saved_hook;
         return NULL;
@@ -389,21 +389,13 @@ void free(void *ptr)
     mtt_stripe_lock(s, ptr);
     mtt_entry_t *e = mtt_entry_find(s, ptr);
     if (e != NULL) {
-        /* 诊断：10字节分配被释放（关键路径） */
-        if (e->size == 10) {
-            char dbuf[80];
+        /* 诊断：小分配被释放（关键路径） */
+        if (e->size <= 128) {
+            char dbuf[96];
             int dlen = snprintf(dbuf, sizeof(dbuf),
-                "[MTT] FREE10: ptr=%p age=%lds\n",
-                ptr, (long)(time(NULL) - e->timestamp));
-            if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
-        }
-        /* 诊断：小分配被释放 */
-        if (e->size <= 128 && e->size != 10) {
-            char dbuf[80];
-            int dlen = snprintf(dbuf, sizeof(dbuf),
-                "[MTT] hook: free(%zu) ptr=%p age=%lds\n",
-                e->size, ptr, (long)(time(NULL) - e->timestamp));
+                "[MTT] FREE: size=%zu ptr=%p age=%lds tid=%d\n",
+                e->size, ptr, (long)(time(NULL) - e->timestamp),
+                (int)syscall(SYS_gettid));
             if (dlen > 0 && dlen < (int)sizeof(dbuf))
                 MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
         }
