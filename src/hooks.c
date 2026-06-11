@@ -766,7 +766,6 @@ void* aligned_alloc(size_t alignment, size_t size)
 /** LD_PRELOAD 拦截的 posix_memalign (POSIX) */
 int posix_memalign(void **memptr, size_t alignment, size_t size)
 {
-    if (memptr == NULL) return 22; /* EINVAL */
     if (alignment < sizeof(void*)) alignment = sizeof(void*);
     if ((alignment & (alignment - 1)) != 0) return 22; /* EINVAL */
     void *p = aligned_alloc(alignment, size);
@@ -804,7 +803,6 @@ void* valloc(size_t size)
 /** LD_PRELOAD 拦截的 strdup：直接调 malloc，栈回溯跳过 strdup 自身 */
 char* strdup(const char *s)
 {
-    if (s == NULL) return NULL;
     size_t len = strlen(s) + 1;
     char *p = (char*)malloc(len);
     if (p != NULL) memcpy(p, s, len);
@@ -814,7 +812,6 @@ char* strdup(const char *s)
 /** LD_PRELOAD 拦截的 strndup */
 char* strndup(const char *s, size_t n)
 {
-    if (s == NULL) return NULL;
     size_t len = strnlen(s, n);
     char *p = (char*)malloc(len + 1);
     if (p != NULL) {
