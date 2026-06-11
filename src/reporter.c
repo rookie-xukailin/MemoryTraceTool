@@ -995,11 +995,17 @@ static void* reporter_thread_fn(void *arg)
             /* 每秒记录时序数据点 */
             mtt_ts_record_point();
 
-            /* 每10秒输出一次心跳，确认线程存活 */
+            /* 每10秒输出一次心跳，确认线程存活 + 关键指标 */
             if (i % 10 == 9) {
-                char dbuf[64];
+                mtt_state_t *st = mtt_state_get();
+                size_t cur_b = st ? atomic_load(&st->current_bytes) : 0;
+                size_t entry_n = st ? atomic_load(&st->entry_count) : 0;
+                size_t overcap = st ? atomic_load(&st->skipped_overcap) : 0;
+                size_t sampled = st ? atomic_load(&st->skipped_sampled) : 0;
+                char dbuf[128];
                 int dlen = snprintf(dbuf, sizeof(dbuf),
-                    "[MTT] reporter: alive at %ds\n", i + 1);
+                    "[MTT] heartbeat %ds: cur_bytes=%zu entry=%zu overcap=%zu sampled=%zu\n",
+                    i + 1, cur_b, entry_n, overcap, sampled);
                 if (dlen > 0 && dlen < (int)sizeof(dbuf))
                     MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
             }
