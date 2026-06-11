@@ -34,6 +34,18 @@ CC       = $(CROSS_COMPILE)gcc
 
 LDFLAGS  = -lpthread -ldl -latomic
 
+# ct-ng 交叉工具链 sysroot 自动检测：从 CROSS_COMPILE 推算 sysroot 路径
+# 目录结构: bin/arm-gcc13-linux-gnueabi-gcc → ../arm-gcc13-linux-gnueabi/sysroot
+ifneq ($(CROSS_COMPILE),)
+  CC_DIR := $(dir $(CROSS_COMPILE))
+  TARGET := $(patsubst %-,%,$(notdir $(CROSS_COMPILE)))
+  AUTO_SYSROOT := $(CC_DIR)/../$(TARGET)/sysroot
+  ifneq ($(wildcard $(AUTO_SYSROOT)/usr/include/unistd.h),)
+    CFLAGS   += --sysroot=$(AUTO_SYSROOT)
+    LDFLAGS  += --sysroot=$(AUTO_SYSROOT)
+  endif
+endif
+
 # 当设置了 QEMU 时，自动用 qemu-arm 包装测试执行
 ifneq ($(QEMU_SYSROOT),)
     RUN = $(QEMU_EXEC) -L $(QEMU_SYSROOT) -E LD_LIBRARY_PATH=$(OUTPUT_DIR)
