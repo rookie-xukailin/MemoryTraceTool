@@ -70,12 +70,6 @@ static inline int mtt_hook_enter(void)
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get();
     if (ctx == NULL) return -1; /* 降级：无槽位时保守视为递归 */
     if (ctx->depth_inited != 0x2A) {
-        char dbuf[80];
-        int dlen = snprintf(dbuf, sizeof(dbuf),
-            "[MTT] SENTINEL: depth=%d inited=%d tid=%d -> reset\n",
-            ctx->hook_depth, ctx->depth_inited, (int)syscall(SYS_gettid));
-        if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_WRITE(2, dbuf, (size_t)dlen);
         ctx->hook_depth = 0;
         ctx->depth_inited = 0x2A;
     }
@@ -115,15 +109,6 @@ static inline void mtt_hook_dec_depth(void)
  */
 void* malloc(size_t size)
 {
-    /* 最简诊断：直接用write(2)，无snprintf无变量，零失败可能 */
-    if (size <= 128) {
-        char m10[48];
-        int len = snprintf(m10, sizeof(m10),
-            "[MTT] M10 tid=%d\n", (int)syscall(SYS_gettid));
-        if (len > 0 && len < (int)sizeof(m10))
-            MTT_DIAG_WRITE(STDERR_FILENO, m10, (size_t)len);
-    }
-
     /* 首次调用诊断 */
     first_call_diag("malloc", &g_first_malloc_diag);
 
@@ -131,24 +116,9 @@ void* malloc(size_t size)
     {
         int depth = mtt_hook_enter();
         if (depth > 0) {
-            if (size <= 128) {
-                char dbuf[56];
-                int dlen = snprintf(dbuf, sizeof(dbuf),
-                    "[MTT] BYPASS:depth d=%d tid=%d\n",
-                    depth, (int)syscall(SYS_gettid));
-                if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                    MTT_DIAG_WRITE(2, dbuf, (size_t)dlen);
-            }
             mtt_resolve_raw_allocators();
             return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
         }
-    }
-    if (size <= 128) {
-        char m[48];
-        int len = snprintf(m, sizeof(m),
-            "[MTT] M10-ENTER tid=%d\n", (int)syscall(SYS_gettid));
-        if (len > 0 && len < (int)sizeof(m))
-            MTT_DIAG_WRITE(2, m, (size_t)len);
     }
     mtt_per_thread_t *ctx = mtt_thread_get();
     if (ctx == NULL) {
@@ -164,7 +134,6 @@ void* malloc(size_t size)
 
     /* 工具内部线程（reporter/HTTP）：直接透传，不追踪 */
     if (ctx->tool_internal) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:internal\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
@@ -172,7 +141,6 @@ void* malloc(size_t size)
     }
 
     if (raw_malloc == NULL) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:rawmalloc_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
         return NULL;
@@ -191,14 +159,12 @@ void* malloc(size_t size)
 
     /* 启动阶段宽限：跳过追踪，直接透传 */
     if (s != NULL && mtt_is_startup_phase(s)) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:startup\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
         return ret;
     }
     if (s == NULL) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:s_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
@@ -207,7 +173,6 @@ void* malloc(size_t size)
 
     /* 紧急禁用：直接透传 */
     if (atomic_load_explicit(&s->disabled, memory_order_acquire)) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:disabled\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
@@ -217,7 +182,6 @@ void* malloc(size_t size)
     /* 先分配用户内存 */
     void *ptr = raw_malloc(size);
     if (ptr == NULL) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:malloc_fail\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
         return NULL;
@@ -228,14 +192,6 @@ void* malloc(size_t size)
         int track_ok = mtt_should_track(s, size);
         int over_cap = mtt_is_over_capacity(s);
         if (!track_ok || over_cap) {
-            if (size <= 128) {
-                char dbuf[96];
-                int dlen = snprintf(dbuf, sizeof(dbuf),
-                    "[MTT] hook: malloc(%zu) SKIP track=%d overcap=%d\n",
-                    size, track_ok, over_cap);
-                if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                    MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
-            }
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
             return ptr;
@@ -245,27 +201,9 @@ void* malloc(size_t size)
     /* 创建追踪记录（内部使用 raw_malloc） */
     mtt_entry_t *e = mtt_entry_new(ptr, size);
     if (e == NULL) {
-        if (size <= 128) {
-            char dbuf[64];
-            int dlen = snprintf(dbuf, sizeof(dbuf),
-                "[MTT] hook: malloc(%zu) entry_new FAILED\n", size);
-            if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
-        }
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
         return ptr; /* 追踪失败不阻塞业务 */
-    }
-
-    /* 诊断：小分配追踪成功 */
-    if (size <= 128) {
-        char dbuf[64];
-        int dlen = snprintf(dbuf, sizeof(dbuf),
-            "[MTT] hook: malloc(%zu) tracked, entry=%llu\n",
-            size, (unsigned long long)atomic_load_explicit(
-                &s->entry_count, memory_order_relaxed));
-        if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
     }
 
     /* 持锁插入哈希表 + 原子更新计数器 */
@@ -403,16 +341,6 @@ void free(void *ptr)
     mtt_stripe_lock(s, ptr);
     mtt_entry_t *e = mtt_entry_find(s, ptr);
     if (e != NULL) {
-        /* 诊断：小分配被释放（关键路径） */
-        if (e->size <= 128) {
-            char dbuf[96];
-            int dlen = snprintf(dbuf, sizeof(dbuf),
-                "[MTT] FREE: size=%zu ptr=%p age=%lds tid=%d\n",
-                e->size, ptr, (long)(time(NULL) - e->timestamp),
-                (int)syscall(SYS_gettid));
-            if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
-        }
         if (e->size <= atomic_load_explicit(&s->current_bytes, memory_order_relaxed))
             atomic_fetch_sub_explicit(&s->current_bytes, e->size, memory_order_relaxed);
         else
