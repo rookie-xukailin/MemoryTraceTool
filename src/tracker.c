@@ -216,10 +216,22 @@ void mtt_resolve_raw_allocators(void)
     raw_calloc_fn real_calloc   = (raw_calloc_fn)dlsym(RTLD_NEXT, "calloc");
     raw_realloc_fn real_realloc = (raw_realloc_fn)dlsym(RTLD_NEXT, "realloc");
 
-    if (real_malloc  != NULL) raw_malloc  = real_malloc;
-    if (real_free    != NULL) raw_free    = real_free;
-    if (real_calloc  != NULL) raw_calloc  = real_calloc;
-    if (real_realloc != NULL) raw_realloc = real_realloc;
+    /* RTLD_NEXT 在某些 ARM32 系统上可能错误返回 LD_PRELOAD 自身，
+     * 用 dladdr 验证解析到的函数不在 libmemorytracetool 内。 */
+    #define RAW_SAFE_SET(fn, val) do { \
+        if ((val) != NULL) { \
+            Dl_info _info; \
+            if (!dladdr((void*)(val), &_info) \
+                || strstr(_info.dli_fname, "libmemorytracetool") == NULL) { \
+                (fn) = (val); \
+            } \
+        } \
+    } while(0)
+    RAW_SAFE_SET(raw_malloc,  real_malloc);
+    RAW_SAFE_SET(raw_free,    real_free);
+    RAW_SAFE_SET(raw_calloc,  real_calloc);
+    RAW_SAFE_SET(raw_realloc, real_realloc);
+    #undef RAW_SAFE_SET
 
     /* RTLD_NEXT 失败时遍历 libc 候选库列表（dlopen/ptrace 注入路径）。
      * 通过检查 raw_* 是否仍为 bootstrap 函数来判断 RTLD_NEXT 是否成功，
