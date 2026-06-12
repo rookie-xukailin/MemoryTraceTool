@@ -307,36 +307,29 @@ void mtt_capture_stack(mtt_entry_t *entry)
     entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
     if (entry->stack_frames < 0)
         entry->stack_frames = 0;
-
-    /* æ¸é¤ ARM32 Thumb æ¨¡å¼çå°å LSB (bit 0)ï¼
-     * ç¡®ä¿åç»­åå¸è®¡ç®å dladdr() ç¬¦å·è§£ææ­£ç¡®ã
-     * å¨ ARM (é Thumb) / ARM64 / x86 ä¸æ­¤æä½ä¸ºç©ºæä½ï¼bit 0 æ¬å°±æ¯ 0ï¼ã */
-    for (int i = 0; i < entry->stack_frames; i++) {
+    for (int i = 0; i < entry->stack_frames; i++)
         entry->stack[i] = MTT_FIX_THUMB_ADDR(entry->stack[i]);
-    }
 #endif
 
-    /* è¿è¡æ¶ååºï¼è¥ backtrace() è¿å 0 å¸§ï¼glibc ä¸æäºç¯å¢å¯è½å¤±è´¥ï¼ï¼
-     * æ¹ç¨å¸§æéé¾éåè·åè°ç¨æ ã
-     * -fno-omit-frame-pointer å·²ç¡®ä¿å½æ°ä¿çäºå¸§æéå¯å­å¨ã
-     * ARM32(r11) / ARM64(x29) / x86_64(rbp) å¸§å¸å±ä¸è´ï¼
-     *   *fp = ä¸ä¸ä¸ªå¸§æé, *(fp+1) = è¿åå°å(LR)
-     * void** ç´¢å¼èªå¨å¤ç sizeof(void*) çå¹³å°å·®å¼ï¼4 vs 8å­èï¼ï¼
-     * æ éæ¶æç¸å³ç #ifdefã */
-    if (entry->stack_frames == 0) {
+    /* FP chain parallel: take whichever gets more frames */
+    {
+        void *fp_stack[MTT_STACK_DEPTH];
+        int fp_count = 0;
         void **fp = (void**)__builtin_frame_address(0);
-        int count = 0;
-        while (fp != NULL && count < MTT_STACK_DEPTH) {
-            void *prev_fp = fp[0];   /* åä¸ä¸ªå¸§æé */
-            void *lr      = fp[1];   /* å½åå¸§çè¿åå°å */
+        while (fp != NULL && fp_count < MTT_STACK_DEPTH) {
+            void *prev_fp = fp[0];
+            void *lr      = fp[1];
             if (lr == NULL) break;
-            entry->stack[count] = MTT_FIX_THUMB_ADDR(lr);
-            count++;
-            /* é¾å°¾ï¼NULLï¼æèªæï¼å¾ªç¯æ£æµï¼ç»æ­¢éå */
+            fp_stack[fp_count] = MTT_FIX_THUMB_ADDR(lr);
+            fp_count++;
             if (prev_fp == NULL || prev_fp == (void*)fp) break;
             fp = (void**)prev_fp;
         }
-        entry->stack_frames = count;
+        if (fp_count > entry->stack_frames) {
+            for (int i = 0; i < fp_count; i++)
+                entry->stack[i] = fp_stack[i];
+            entry->stack_frames = fp_count;
+        }
     }
 
     ctx->in_capture = saved;
