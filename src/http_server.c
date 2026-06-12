@@ -302,47 +302,38 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
         }
     }
 
-    /* 兜底：当所有已解析帧均被内部帧过滤器拦截时（常见于
-     * pthread_create 等初始化阶段的工具内部分配），回退为输出
-     * 已解析的符号字符串（不过滤），确保 ARM32 QEMU 等环境下
-     * 第二泄漏站点不会只显示原始 hex 地址，提升诊断可读性。
-     * 仅跳过第 0 帧（mtt_capture_stack），保留其余所有帧的符号。 */
+    /* 兜底：当所有已解析帧均被内部帧过滤器拦截时，回退输出不过滤的帧。
+     * 同样跳过内部帧（mtt_/libmemorytracetool/capture_stack/backtrace），
+     * 避免工具内部函数出现在页面。未解析帧降级为 hex 地址。 */
     if (!wrote_frame && se != NULL && se->frame_count > 0) {
         for (int j = 0; j < se->frame_count; j++) {
             if (j == 0) continue; /* 跳过 mtt_capture_stack 自身 */
-
-            if (wrote_frame) {
-                MTT_DIAG_WRITE(fd, ",", 1);
-            }
-            wrote_frame = 1;
-
             const char *fallback_sym = se->resolved[j];
-            if (fallback_sym == NULL || fallback_sym[0] == '\0') {
-                /* 符号未解析时才降级为 hex 地址 */
-                off = snprintf(buf, sizeof(buf), "\"0x%lx\"",
-                               (unsigned long)(uintptr_t)se->frames[j]);
-                if (off < 0) off = 0;
-                else if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
-                MTT_DIAG_WRITE(fd, buf, (size_t)off);
-            } else {
-                /* 输出已解析符号（不过滤内部帧，与主循环保持一致
-                 * 的 JSON 转义逻辑，处理 \" \\ 和控制字符） */
-                MTT_DIAG_WRITE(fd, "\"", 1);
-                for (const char *p = fallback_sym; *p != '\0'; p++) {
-                    unsigned char c = (unsigned char)*p;
-                    if (c == '"' || c == '\\') {
-                        MTT_DIAG_WRITE(fd, "\\", 1);
-                        MTT_DIAG_WRITE(fd, p, 1);
-                    } else if (c < 0x20) {
-                        char esc[8];
-                        int n = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
-                        if (n > 0) MTT_DIAG_WRITE(fd, esc, (size_t)n);
-                    } else {
-                        MTT_DIAG_WRITE(fd, p, 1);
-                    }
+            /* 过滤内部帧和未解析帧 */
+            if (fallback_sym == NULL || fallback_sym[0] == '\0'
+                || strstr(fallback_sym, "libmemorytracetool") != NULL
+                || strstr(fallback_sym, "mtt_") == fallback_sym
+                || strstr(fallback_sym, "capture_stack") != NULL
+                || strstr(fallback_sym, "backtrace") != NULL)
+                continue;
+            if (wrote_frame) MTT_DIAG_WRITE(fd, ",", 1);
+            wrote_frame = 1;
+            /* 输出已解析符号，JSON 转义 */
+            MTT_DIAG_WRITE(fd, "\"", 1);
+            for (const char *p = fallback_sym; *p != '\0'; p++) {
+                unsigned char c = (unsigned char)*p;
+                if (c == '"' || c == '\\') {
+                    MTT_DIAG_WRITE(fd, "\\", 1);
+                    MTT_DIAG_WRITE(fd, p, 1);
+                } else if (c < 0x20) {
+                    char esc[8];
+                    int n = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+                    if (n > 0) MTT_DIAG_WRITE(fd, esc, (size_t)n);
+                } else {
+                    MTT_DIAG_WRITE(fd, p, 1);
                 }
-                MTT_DIAG_WRITE(fd, "\"", 1);
             }
+            MTT_DIAG_WRITE(fd, "\"", 1);
         }
     }
 
