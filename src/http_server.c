@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <poll.h>
 
 /** HTTP 服务器单例 */
 static mtt_http_server_t g_http_server = {0};
@@ -69,6 +70,7 @@ static const char g_dashboard_html[] =
 ".refresh{font-size:.75rem;color:#6e7681;float:right}\n"
 ".toggle-btn{font-size:.75rem;padding:4px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg2);color:var(--text);cursor:pointer;margin-right:6px}\n"
 ".toggle-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}\n"
+".toggle-btn:disabled{opacity:.4;cursor:not-allowed}\n"
 ".stop-btn{font-size:.75rem;padding:4px 10px;border:1px solid var(--warn);border-radius:4px;background:var(--bg2);color:var(--warn);cursor:pointer}\n"
 "</style>\n"
 "</head>\n"
@@ -83,16 +85,22 @@ static const char g_dashboard_html[] =
 "  <div class=\"tooltip\" id=\"tip\"></div>\n"
 "</div>\n"
 "<div class=\"card\">\n"
-"  <h2>泄漏站点排行（按占用大小降序）</h2>\n"
+"  <h2>泄漏站点排行（按泄漏次数降序）</h2>\n"
 "  <table>\n"
 "    <thead><tr><th>#</th><th>次数</th><th>单次</th><th>总占用</th><th>置信度</th><th>首次</th><th>最后</th></tr></thead>\n"
 "    <tbody id=\"leaks-tbody\"></tbody>\n"
 "  </table>\n"
+"  <div style=\"margin-top:12px;text-align:center;font-size:.85rem;color:#6e7681\">\n"
+"    <button class=\"toggle-btn\" id=\"prevPageBtn\" onclick=\"changePage(-1)\">上一页</button>\n"
+"    <span id=\"pageInfo\" style=\"margin:0 12px\"></span>\n"
+"    <button class=\"toggle-btn\" id=\"nextPageBtn\" onclick=\"changePage(1)\">下一页</button>\n"
+"  </div>\n"
 "</div>\n"
 "</div>\n"
 "<script>\n"
 "var data=null,chartCanvas=document.getElementById('chart'),ctx=chartCanvas.getContext('2d'),tip=document.getElementById('tip');\n"
 "var expandedHashes=new Set(); /* 记录展开的泄漏站点 hash，刷新后恢复 */\n"
+"var curPage=1, PAGE_SIZE=50, allLeaks=[];\n"
 "function fb(b){if(b==null)return'0 B';if(b>=1048576)return(b/1048576).toFixed(2)+' MB';if(b>=1024)return(b/1024).toFixed(2)+' KB';return b+' B'}\n"
 "function ft(t){if(!t||t<=0)return'N/A';return new Date(t*1000).toLocaleTimeString()}\n"
 "function draw(){\n"
@@ -149,11 +157,16 @@ static const char g_dashboard_html[] =
 "}\n"
 "function alCmd(frame){var m1=frame.match(/\\((.+)\\)$/);var m2=frame.match(/\\+(0x[0-9a-fA-F]+)/);if(m1&&m2)return'addr2line -e '+m1[1]+' -f -C '+m2[1];return''}\n"
 "function renderLeaks(leaks){\n"
+"  allLeaks=leaks||[];\n"
+"  var total=Math.ceil(allLeaks.length/PAGE_SIZE)||1;\n"
+"  if(curPage>total)curPage=total;\n"
+"  if(curPage<1)curPage=1;\n"
 "  var tbody=document.getElementById('leaks-tbody');\n"
-"  if(!leaks||leaks.length===0){tbody.innerHTML='<tr><td colspan=\"7\" style=\"text-align:center;color:#6e7681\">暂无泄漏数据</td></tr>';return}\n"
+"  if(!allLeaks.length){tbody.innerHTML='<tr><td colspan=\"7\" style=\"text-align:center;color:#6e7681\">暂无泄漏数据</td></tr>';document.getElementById('pageInfo').textContent='';document.getElementById('prevPageBtn').disabled=document.getElementById('nextPageBtn').disabled=true;return}\n"
+"  var startIdx=(curPage-1)*PAGE_SIZE, endIdx=Math.min(startIdx+PAGE_SIZE, allLeaks.length);\n"
 "  var rows='';\n"
-"  for(var i=0;i<leaks.length;i++){\n"
-"    var l=leaks[i],h=l.hash||'',conf=l.is_expired?'probable leak':'possible leak';\n"
+"  for(var i=startIdx;i<endIdx;i++){\n"
+"    var l=allLeaks[i],h=l.hash||'',conf=l.is_expired?'probable leak':'possible leak';\n"
 "    var diff=l.diff_size>0?' class=\"diff-high\"':'';\n"
 "    rows+='<tr class=\"leak-row\"'+diff+' onclick=\"(function(){var s=document.getElementById(\\'s'+i+'\\');var opened=s.classList.toggle(\\'open\\');var h=\\''+h+'\\';if(opened)expandedHashes.add(h);else expandedHashes.delete(h);})()\">'+\n"
 "      '<td>'+(i+1)+'</td><td>'+l.count.toLocaleString()+'</td>'+\n"
@@ -170,11 +183,16 @@ static const char g_dashboard_html[] =
 "    }\n"
 "  }\n"
 "  tbody.innerHTML=rows;\n"
+"  /* 分页控件 */\n"
+"  document.getElementById('pageInfo').textContent='第 '+curPage+' / '+total+' 页 (共 '+allLeaks.length+' 条,当前 '+(endIdx-startIdx)+' 条)';\n"
+"  document.getElementById('prevPageBtn').disabled=(curPage<=1);\n"
+"  document.getElementById('nextPageBtn').disabled=(curPage>=total);\n"
 "  /* 恢复展开状态 */\n"
 "  var newHashes=new Set();\n"
-"  for(var i=0;i<leaks.length;i++){var lh=leaks[i].hash||'';if(expandedHashes.has(lh)){var sr=document.getElementById('s'+i);if(sr){sr.classList.add('open');newHashes.add(lh);}}}\n"
-"  expandedHashes=newHashes; /* 清理已不存在的泄漏项 */\n"
+"  for(var i=startIdx;i<endIdx;i++){var lh=allLeaks[i].hash||'';if(expandedHashes.has(lh)){var sr=document.getElementById('s'+i);if(sr){sr.classList.add('open');newHashes.add(lh);}}}\n"
+"  expandedHashes=newHashes;\n"
 "}\n"
+"function changePage(delta){var total=Math.ceil(allLeaks.length/PAGE_SIZE)||1;var np=curPage+delta;if(np<1||np>total)return;curPage=np;renderLeaks(allLeaks);}\n"
 "function refresh(){\n"
 "  document.getElementById('refreshLabel').textContent='刷新中...';\n"
 "  fetch('/api/data').then(function(r){return r.json()}).then(function(d){\n"
@@ -430,14 +448,12 @@ static void handle_api_data(int client_fd)
     }
     MTT_DIAG_WRITE(client_fd, "]", 1);
 
-    /* 泄漏站点 */
+    /* 泄漏站点 — 返回全量(前端做分页,每页 50) */
     MTT_DIAG_WRITE(client_fd, ",\"leaks\":[", 10);
     pthread_mutex_lock(&rep->cache_lock);
     if (rep->cached_sites != NULL && rep->cached_site_count > 0) {
-        size_t show = rep->cached_site_count;
-        if (show > 50) show = 50;
         int wrote_leak = 0;
-        for (size_t i = 0; i < show; i++) {
+        for (size_t i = 0; i < rep->cached_site_count; i++) {
             if (rep->cached_sites[i] == NULL) continue;
             if (wrote_leak) MTT_DIAG_WRITE(client_fd, ",", 1);
             wrote_leak = 1;
@@ -533,17 +549,19 @@ static void* http_thread_fn(void *arg)
     static char path[MTT_HTTP_MAX_PATH];
 
     while (atomic_load_explicit(&g_http_server.running, memory_order_acquire)) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(g_http_server.listen_fd, &rfds);
-        struct timeval tv = {1, 0};
-        int ready = select(g_http_server.listen_fd + 1, &rfds, NULL, NULL, &tv);
+        /* 用 poll 替代 select:无 FD_SETSIZE 上限,glibc _FORTIFY_SOURCE 不会
+         * 因 fd_set 越界 abort。某些 LD_PRELOAD 场景下 select 会触发
+         * "bit out of range 0 - FD_SETSIZE" 误报,poll 完全规避。 */
+        struct pollfd pfd;
+        pfd.fd = g_http_server.listen_fd;
+        pfd.events = POLLIN;
+        int ready = poll(&pfd, 1, 1000); /* 1 秒超时 */
         if (ready < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             break;
         }
         if (ready == 0) continue;
-        if (!FD_ISSET(g_http_server.listen_fd, &rfds)) continue;
+        if (!(pfd.revents & POLLIN)) continue;
 
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);

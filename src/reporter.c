@@ -236,13 +236,17 @@ static int is_internal_frame(const char *symbol)
 }
 
 /* ======================================================================== *
- *                   qsort 比较函数：按 total_size 降序                        *
+ *                   qsort 比较函数：按 count 降序,次级 total_size            *
  * ======================================================================== */
 
-static int cmp_leak_by_size(const void *a, const void *b)
+static int cmp_leak_by_count(const void *a, const void *b)
 {
     const mtt_leak_site_t *sa = *(const mtt_leak_site_t**)a;
     const mtt_leak_site_t *sb = *(const mtt_leak_site_t**)b;
+    /* 主排序:count(泄漏次数)降序 */
+    if (sb->count > sa->count) return  1;
+    if (sb->count < sa->count) return -1;
+    /* 次级排序:total_size(总占用)降序,保证同 count 时大泄漏在前 */
     if (sb->total_size > sa->total_size) return  1;
     if (sb->total_size < sa->total_size) return -1;
     return 0;
@@ -528,7 +532,7 @@ static void scan_and_report_locked(void)
                 }
             }
             /* 按 total_size 降序排列 */
-            qsort(sorted, idx, sizeof(mtt_leak_site_t*), cmp_leak_by_size);
+            qsort(sorted, idx, sizeof(mtt_leak_site_t*), cmp_leak_by_count);
             site_count = idx;
         }
     }
