@@ -77,6 +77,7 @@ raw_malloc_fn  volatile raw_malloc  = NULL;
 raw_free_fn    volatile raw_free    = NULL;
 raw_calloc_fn  volatile raw_calloc  = NULL;
 raw_realloc_fn volatile raw_realloc = NULL;
+raw_posix_memalign_fn volatile raw_posix_memalign = NULL;
 
 /* CAS 保护的一次性解析标志 */
 static atomic_int g_raw_resolved = 0;
@@ -129,6 +130,9 @@ static void bootstrap_free(void *ptr)
 
 static void* bootstrap_calloc(size_t count, size_t size)
 {
+    /* 整数溢出检查:与 hooks.c calloc 保持一致 */
+    if (count > 0 && size > 0 && count > SIZE_MAX / size)
+        return NULL;
     size_t total = count * size;
     void *p = bootstrap_malloc(total);
     if (p != NULL) {
@@ -217,6 +221,7 @@ void mtt_resolve_raw_allocators(void)
     raw_free_fn   real_free     = (raw_free_fn)dlsym(RTLD_NEXT, "free");
     raw_calloc_fn real_calloc   = (raw_calloc_fn)dlsym(RTLD_NEXT, "calloc");
     raw_realloc_fn real_realloc = (raw_realloc_fn)dlsym(RTLD_NEXT, "realloc");
+    raw_posix_memalign_fn real_pma = (raw_posix_memalign_fn)dlsym(RTLD_NEXT, "posix_memalign");
 
     /* RTLD_NEXT 在某些 ARM32 系统上可能错误返回 LD_PRELOAD 自身,
      * 用 dladdr 验证解析到的函数不在 libmemorytracetool 内。
@@ -236,6 +241,7 @@ void mtt_resolve_raw_allocators(void)
     RAW_SAFE_SET(raw_free,    real_free);
     RAW_SAFE_SET(raw_calloc,  real_calloc);
     RAW_SAFE_SET(raw_realloc, real_realloc);
+    RAW_SAFE_SET(raw_posix_memalign, real_pma);
     #undef RAW_SAFE_SET
 
     /* RTLD_NEXT 失败时遍历 libc 候选库列表（dlopen/ptrace 注入路径）。
@@ -264,6 +270,11 @@ void mtt_resolve_raw_allocators(void)
             if (raw_realloc == bootstrap_realloc) {
                 raw_realloc_fn fn = (raw_realloc_fn)dlsym(libc_handle, "realloc");
                 if (fn != NULL) raw_realloc = fn;
+            }
+            if (raw_posix_memalign == NULL) {
+                raw_posix_memalign_fn fn =
+                    (raw_posix_memalign_fn)dlsym(libc_handle, "posix_memalign");
+                if (fn != NULL) raw_posix_memalign = fn;
             }
 
             /* 不 dlclose：避免 raw_* 悬空。

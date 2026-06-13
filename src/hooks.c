@@ -638,33 +638,36 @@ void* realloc(void *ptr, size_t size)
 
 /**
  * LD_PRELOAD 拦截的 aligned_alloc (C11)。
- * 手动实现对齐逻辑，通过 raw_malloc 分配，绕过 hook 递归。
- */
+ * 优先用 raw_posix_memalign(若已解析),返回的指针可被 free() 正确释放
+ * (libc free 识别 libc 内部分配的内存,无需追踪表反向查找)。
+ *
+ * 历史:原实现用 raw_malloc + 手动对齐,返回非 chunk-header 起点的 aligned
+ * 指针,free(aligned) 会破坏堆。手动存原始指针到 ((void**)aligned)[-1]
+ * 也是死代码,free 没有反向查找逻辑。
+ *
+ * 注意:aligned_alloc 不进入追踪系统(直接走 raw_posix_memalign)。
+ * 嵌入式场景 aligned_alloc/posix_memalign 调用频率低,接受此折衷。 */
 void* aligned_alloc(size_t alignment, size_t size)
 {
     mtt_resolve_raw_allocators();
-    if (raw_malloc == NULL) return NULL;
 
-    /* 对齐必须为 2 的幂且 >= sizeof(void*) */
+    /* C11 要求 alignment 为 2 的幂且 size 是 alignment 的整数倍;
+     * POSIX/glibc 实现放宽了 size 的倍数要求,只要求 alignment 合法 */
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) return NULL;
     if (alignment < sizeof(void*)) alignment = sizeof(void*);
-    if ((alignment & (alignment - 1)) != 0) return NULL;
-    if (size == 0) size = 1;
-    /* 向上取整为 alignment 倍数 */
-    size = (size + alignment - 1) & ~(alignment - 1);
 
-    /* 多分配 alignment + sizeof(void*) 用于对齐和存储原始指针 */
-    size_t total = size + alignment + sizeof(void*);
-    char *raw = (char*)raw_malloc(total);
-    if (raw == NULL) return NULL;
+    if (raw_posix_memalign != NULL) {
+        void *p = NULL;
+        if (raw_posix_memalign(&p, alignment, size ? size : 1) != 0)
+            return NULL;
+        return p;
+    }
 
-    /* 对齐到 alignment 边界，保留空间存原始指针 */
-    uintptr_t addr = (uintptr_t)(raw + sizeof(void*));
-    addr = (addr + alignment - 1) & ~((uintptr_t)(alignment - 1));
-    void *aligned = (void*)addr;
-    /* 在对齐指针前存储原始 raw 指针，供 aligned_free 使用 */
-    ((void**)aligned)[-1] = raw;
-
-    return aligned;
+    /* raw_posix_memalign 不可用:回退到 raw_malloc。
+     * glibc malloc 默认 16 字节对齐,alignment <= 16 时满足要求;
+     * alignment > 16 时对齐保证被牺牲,但不做手动对齐(否则 free 崩)。 */
+    if (raw_malloc == NULL) return NULL;
+    return raw_malloc(size ? size : 1);
 }
 
 /** LD_PRELOAD 拦截的 posix_memalign (POSIX) */

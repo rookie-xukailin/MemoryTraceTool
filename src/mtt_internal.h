@@ -112,6 +112,7 @@ typedef void* (*raw_malloc_fn)(size_t);
 typedef void  (*raw_free_fn)(void*);
 typedef void* (*raw_calloc_fn)(size_t, size_t);
 typedef void* (*raw_realloc_fn)(void*, size_t);
+typedef int   (*raw_posix_memalign_fn)(void**, size_t, size_t);
 
 /* 全局原始分配器指针（在 tracker.c 中定义）。
  * volatile 限定符：防止编译器将跨函数调用的读取优化为寄存器缓存，
@@ -121,6 +122,7 @@ extern raw_malloc_fn  volatile raw_malloc;
 extern raw_free_fn    volatile raw_free;
 extern raw_calloc_fn  volatile raw_calloc;
 extern raw_realloc_fn volatile raw_realloc;
+extern raw_posix_memalign_fn volatile raw_posix_memalign;
 
 /* 每线程上下文：替代 __thread，通过 TID 索引槽位数组管理。
  * 见 src/per_thread.h — mtt_thread_get() 获取当前线程上下文 */
