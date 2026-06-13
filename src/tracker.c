@@ -530,6 +530,9 @@ mtt_entry_t* mtt_entry_find(mtt_state_t *s, const void *ptr)
 /**
  * 从哈希桶中删除指定指针的分配记录。
  *
+ * 池子模式（ACTIVE）：从桶链表摘下后清空关键字段，归还 free list 复用。
+ * Fallback 模式：直接 raw_free 单条释放。
+ *
  * @param s    全局状态指针
  * @param ptr  内存指针
  */
@@ -631,12 +634,13 @@ static void mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e)
 /**
  * 创建新的分配追踪记录。
  *
- * 使用 raw_malloc 分配（不触发 hook），捕获调用栈和分配时间。
- * 仅在 raw_malloc 已解析完成后调用，否则需通过 bootstrap 路径。
+ * 优先走 entry 池模式（ACTIVE）：从 free list 取头，无 libc 调用。
+ * 池子未就绪或申请失败时降级为 Fallback 模式：raw_malloc 单条申请。
+ * 捕获调用栈和分配时间，调用方负责后续 entry_add 插入桶链表。
  *
  * @param ptr   分配的用户内存指针（可为 NULL，由调用者后设）
  * @param size  分配字节数
- * @return      新条目指针，raw_malloc 失败时返回 NULL
+ * @return      新条目指针，池子满或 raw_malloc 失败时返回 NULL
  */
 mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
 {
