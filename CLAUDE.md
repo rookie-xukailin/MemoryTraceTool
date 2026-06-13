@@ -85,6 +85,14 @@ docker build --platform linux/arm64 -f Dockerfile.hdm3-sim -t hdm3-sim:latest .
   realloc 失败丢失指针、全局缓存无限增长
 - 故意 dlopen 不 dlclose(模拟模块未卸载)
 
+## 代码走读 Skill
+
+详见 `skills/code-review.md`。触发条件:用户说「执行代码走读 skill」「代码走读」「执行 N 轮代码走读」。
+
+10 轮 5 维度循环:并发 → 正确性 → 跨平台 → 性能 → 可维护 → (深度二轮重复)。
+
+每轮:全工程阅读 + 修复 + 两平台编译/测试 + 模拟环境验证 + 单独 commit,不允许失败就退出。
+
 ## 编码规范
 
 1. **每个函数都要有函数头（doxygen 风格 `/** ... */`）**，说明用途、参数、返回值

@@ -87,6 +87,7 @@ flamegraph.pl /var/log/mtt/<pid>_<name>.folded > flame.svg
 | `MTT_LEAK_THRESHOLD_SEC` | 300 | 存活超过此秒数 → probable leak |
 | `MTT_SKIP_STARTUP_SEC` | 0 | 进程启动后跳过 N 秒不追踪 |
 | `MTT_LIB_BLACKLIST` | 无 | 逗号分隔的库黑名单（如 `libc.so,libfoo.so`） |
+| `MTT_POOL_ENTRIES` | 16384 | 工具自身 entry 池容量（控制预占用内存，[1024, 65536]，约 600B/entry） |
 
 ## 借鉴的成熟方案
 
