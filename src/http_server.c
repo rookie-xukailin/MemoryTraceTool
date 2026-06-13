@@ -147,13 +147,32 @@ static const char g_dashboard_html[] =
 "}\n"
 "function renderStats(st){\n"
 "  var s=st||{};\n"
+"  var p=(window.__lastData&&window.__lastData.pool)||{};\n"
+"  var modeText = p.mode===1 ? 'POOL' : (p.mode===2 ? 'FALLBACK' : 'N/A');\n"
+"  var modeColor = p.mode===1 ? '#3fb950' : (p.mode===2 ? '#f85149' : '#6e7681');\n"
+"  var poolHtml='';\n"
+"  if(p.mode===1){\n"
+"    var pct = p.bytes_total>0 ? Math.round(p.bytes_used*100/p.bytes_total) : 0;\n"
+"    var barColor = pct<60 ? '#3fb950' : (pct<85 ? '#d29922' : '#f85149');\n"
+"    poolHtml='<div class=\"val\">'+fb(p.bytes_used||0)+' / '+fb(p.bytes_total||0)+'</div>'+\n"
+"      '<div class=\"lbl\">工具内存池 <span style=\"color:'+modeColor+';font-weight:bold\">['+modeText+']</span></div>'+\n"
+"      '<div style=\"margin-top:4px;height:6px;background:#21262d;border-radius:3px;overflow:hidden\"><div style=\"width:'+pct+'%;height:100%;background:'+barColor+'\"></div></div>'+\n"
+"      '<div style=\"margin-top:2px;font-size:11px;color:#6e7681\">'+pct+'% | '+(p.used||0).toLocaleString()+' / '+(p.capacity||0).toLocaleString()+' entries</div>';\n"
+"  } else if(p.mode===2){\n"
+"    poolHtml='<div class=\"val\" style=\"color:'+modeColor+'\">降级模式</div>'+\n"
+"      '<div class=\"lbl\">工具内存池 <span style=\"color:'+modeColor+';font-weight:bold\">['+modeText+']</span></div>'+\n"
+"      '<div style=\"margin-top:4px;font-size:11px;color:#6e7681\">池子申请失败,按需 raw_malloc</div>';\n"
+"  } else {\n"
+"    poolHtml='<div class=\"val\">-</div><div class=\"lbl\">工具内存池</div>';\n"
+"  }\n"
 "  document.getElementById('stats').innerHTML=\n"
 "    '<div class=\"stat\"><div class=\"val\">'+fb(s.current_bytes||0)+'</div><div class=\"lbl\">当前未释放</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+fb(s.peak_bytes||0)+'</div><div class=\"lbl\">历史峰值</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+(s.alloc_count||0).toLocaleString()+'</div><div class=\"lbl\">累计分配</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+(s.free_count||0).toLocaleString()+'</div><div class=\"lbl\">累计释放</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+(s.leak_count||0).toLocaleString()+'</div><div class=\"lbl\">疑似泄漏</div></div>'+\n"
-"    '<div class=\"stat\"><div class=\"val\">'+fb(s.total_allocated||0)+'</div><div class=\"lbl\">累计分配总量</div></div>';\n"
+"    '<div class=\"stat\"><div class=\"val\">'+fb(s.total_allocated||0)+'</div><div class=\"lbl\">累计分配总量</div></div>'+\n"
+"    '<div class=\"stat\">'+poolHtml+'</div>';\n"
 "}\n"
 "function alCmd(frame){var m1=frame.match(/\\((.+)\\)$/);var m2=frame.match(/\\+(0x[0-9a-fA-F]+)/);if(m1&&m2)return'addr2line -e '+m1[1]+' -f -C '+m2[1];return''}\n"
 "function renderLeaks(leaks){\n"
@@ -196,7 +215,7 @@ static const char g_dashboard_html[] =
 "function refresh(){\n"
 "  document.getElementById('refreshLabel').textContent='刷新中...';\n"
 "  fetch('/api/data').then(function(r){return r.json()}).then(function(d){\n"
-"    data=d;\n"
+"    data=d;window.__lastData=d;\n"
 "    document.getElementById('info').textContent='PID: '+d.pid+' | '+d.proc_name+' | 会话: '+ft(d.session_start)+' | 上次扫描: '+ft(d.last_scan);\n"
 "    renderStats(d.stats);draw();renderLeaks(d.leaks);\n"
 "    document.getElementById('refreshLabel').textContent='已刷新 — '+new Date().toLocaleTimeString();\n"
@@ -378,6 +397,13 @@ static void handle_api_data(int client_fd)
     size_t frees      = (s != NULL) ? atomic_load_explicit(&s->free_count, memory_order_relaxed) : 0;
     size_t total_alloc = (s != NULL) ? atomic_load_explicit(&s->total_bytes, memory_order_relaxed) : 0;
     size_t leak_count = (allocs > frees) ? (allocs - frees) : 0;
+
+    /* entry 池指标（工具自身内存占用可视化） */
+    size_t pool_used      = (s != NULL) ? atomic_load_explicit(&s->pool_used, memory_order_relaxed) : 0;
+    size_t pool_capacity  = (s != NULL) ? s->pool_capacity : 0;
+    size_t pool_bytes_total = (s != NULL) ? s->pool_raw_size : 0;
+    size_t pool_bytes_used  = pool_used * sizeof(mtt_entry_t);
+    int    pool_mode      = (s != NULL) ? atomic_load_explicit(&s->pool_mode, memory_order_relaxed) : MTT_POOL_MODE_NONE;
     /* 读取当前 RSS（近似值）。
      * fopen/fclose 内部触发 libc malloc，设 in_hook 防止被追踪为虚假泄漏。 */
     size_t rss_bytes = 0;
@@ -413,9 +439,11 @@ static void handle_api_data(int client_fd)
     len = snprintf(buf, sizeof(buf),
         ",\"session_start\":%lld,\"last_scan\":%lld,"
         "\"stats\":{\"current_bytes\":%zu,\"peak_bytes\":%zu,\"alloc_count\":%zu,"
-        "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu,\"rss_bytes\":%zu}",
+        "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu,\"rss_bytes\":%zu},"
+        "\"pool\":{\"used\":%zu,\"capacity\":%zu,\"bytes_used\":%zu,\"bytes_total\":%zu,\"mode\":%d}",
         (long long)session_ts, (long long)time(NULL),
-        cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc, rss_bytes);
+        cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc, rss_bytes,
+        pool_used, pool_capacity, pool_bytes_used, pool_bytes_total, pool_mode);
     if (len < 0) len = 0;
     else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
     MTT_DIAG_WRITE(client_fd, buf, (size_t)len);

@@ -543,12 +543,43 @@ void mtt_entry_remove(mtt_state_t *s, const void *ptr)
         if ((*pp)->ptr == ptr) {
             mtt_entry_t *dead = *pp;
             *pp = dead->next;
-            if (raw_free != NULL) raw_free(dead);
             atomic_fetch_sub_explicit(&s->entry_count, 1, memory_order_relaxed);
+
+            /* 池子模式：清空关键字段后归还 free list */
+            if (s->pool != NULL) {
+                memset(dead, 0, sizeof(*dead));
+                pthread_mutex_lock(&s->pool_lock);
+                dead->next = s->pool_free_list;
+                s->pool_free_list = dead;
+                pthread_mutex_unlock(&s->pool_lock);
+                atomic_fetch_sub_explicit(&s->pool_used, 1, memory_order_relaxed);
+            } else if (raw_free != NULL) {
+                /* Fallback：直接 raw_free */
+                raw_free(dead);
+            }
             return;
         }
         pp = &(*pp)->next;
     }
+}
+
+/**
+ * 判断指针是否落在 entry 池范围内。
+ *
+ * 用户进程不应该 free 工具池子里的内存（池子由工具自申请、自管理）。
+ * 若误传给 free()，应直接透传到 raw_free 之外，避免破坏池子结构。
+ *
+ * @param ptr  待检测指针
+ * @return     1=落在池子内（不应被业务 free），0=不在池子内
+ */
+int mtt_pool_contains(const void *ptr)
+{
+    mtt_state_t *s = mtt_state_get();
+    if (s == NULL || s->pool == NULL || ptr == NULL) return 0;
+    const char *base = (const char*)s->pool;
+    const char *end  = base + s->pool_raw_size;
+    const char *p    = (const char*)ptr;
+    return (p >= base && p < end) ? 1 : 0;
 }
 
 /**
@@ -568,6 +599,31 @@ void mtt_entry_add(mtt_state_t *s, mtt_entry_t *entry)
 }
 
 /**
+ * 归还/释放一个已分配但未插入桶链表的 entry。
+ *
+ * 用于 entry_new 成功后、未走到 entry_add 就因容量上限需要回滚的场景。
+ * 池子模式下归还 free list；Fallback 模式下走 raw_free。
+ *
+ * @param s  全局状态指针（NULL 安全，函数立即返回）
+ * @param e  待归还的 entry（NULL 安全，函数立即返回）
+ */
+static void mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e)
+{
+    if (s == NULL || e == NULL) return;
+
+    if (s->pool != NULL) {
+        memset(e, 0, sizeof(*e));
+        pthread_mutex_lock(&s->pool_lock);
+        e->next = s->pool_free_list;
+        s->pool_free_list = e;
+        pthread_mutex_unlock(&s->pool_lock);
+        atomic_fetch_sub_explicit(&s->pool_used, 1, memory_order_relaxed);
+    } else if (raw_free != NULL) {
+        raw_free(e);
+    }
+}
+
+/**
  * 创建新的分配追踪记录。
  *
  * 使用 raw_malloc 分配（不触发 hook），捕获调用栈和分配时间。
@@ -579,6 +635,39 @@ void mtt_entry_add(mtt_state_t *s, mtt_entry_t *entry)
  */
 mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
 {
+    mtt_state_t *s = mtt_state_get();
+
+    /* 池子模式：从 free list 取头，无 libc 调用 */
+    if (s != NULL && s->pool != NULL) {
+        pthread_mutex_lock(&s->pool_lock);
+        mtt_entry_t *e = s->pool_free_list;
+        if (e != NULL) {
+            s->pool_free_list = e->next;
+            atomic_fetch_add_explicit(&s->pool_used, 1, memory_order_relaxed);
+        }
+        pthread_mutex_unlock(&s->pool_lock);
+
+        if (e == NULL) {
+            /* 池子满：跳过本次记录，调用方会更新 skipped_overcap */
+            return NULL;
+        }
+
+        /* 清零整个结构体（同原 raw_malloc 路径，防止上次使用残留泄漏到栈缓存） */
+        memset(e, 0, sizeof(*e));
+
+        e->ptr           = ptr;
+        e->size          = size;
+        e->alloc_num     = 0;
+        e->timestamp     = time(NULL);
+        e->next          = NULL;
+        e->stack_frames  = 0;
+        memset(e->stack, 0, sizeof(e->stack));
+
+        mtt_capture_stack(e);
+        return e;
+    }
+
+    /* Fallback：池子未就绪或申请失败，走旧 raw_malloc 路径 */
     if (raw_malloc == NULL) return NULL;
 
     mtt_entry_t *e = (mtt_entry_t*)raw_malloc(sizeof(mtt_entry_t));
@@ -713,6 +802,7 @@ void mtt_ensure_init(void)
     size_t   want_srate    = MTT_SAMPLE_RATE_DEFAULT; /* 默认使用字节统计采样 */
     time_t   want_leak_threshold = MTT_LEAK_THRESHOLD_DEFAULT;
     time_t   want_skip_startup   = MTT_SKIP_STARTUP_DEFAULT;
+    size_t   want_pool_entries   = MTT_POOL_ENTRIES_DEFAULT; /* 池子容量，可被 MTT_POOL_ENTRIES 覆盖 */
 
     {
         const char *env_disable = getenv("MTT_DISABLE");
@@ -734,6 +824,14 @@ void mtt_ensure_init(void)
             int sr = atoi(env_srate);
             if (sr >= 0 && sr <= MTT_SAMPLE_RATE_MAX)
                 want_srate = (size_t)sr;
+        }
+
+        /* entry 池容量（MTT_POOL_ENTRIES=N，控制工具自身预占用内存大小） */
+        const char *env_pool = getenv("MTT_POOL_ENTRIES");
+        if (env_pool != NULL) {
+            long pe = atol(env_pool);
+            if (pe >= (long)MTT_POOL_ENTRIES_MIN && pe <= (long)MTT_POOL_ENTRIES_MAX)
+                want_pool_entries = (size_t)pe;
         }
 
         /* 泄漏判定阈值（MTT_LEAK_THRESHOLD_SEC=N，存活超过 N 秒→probable leak） */
@@ -806,6 +904,39 @@ void mtt_ensure_init(void)
     for (int i = 0; i < MTT_LOCK_STRIPES; i++)
         pthread_mutex_init(&s->bucket_locks[i].lock, NULL);
 
+    /* 申请 entry 池：一次性大块 raw_malloc，entry 复用槽位。
+     * 失败时降级为 Fallback 模式（entry_new/remove 走旧 raw_malloc 路径）。
+     * 工具自身这次大申请不进 hook（raw_malloc 直调 libc），天然豁免。 */
+    pthread_mutex_init(&s->pool_lock, NULL);
+    s->pool_capacity = want_pool_entries;
+    s->pool_raw_size = want_pool_entries * sizeof(mtt_entry_t);
+    s->pool = NULL;
+    s->pool_free_list = NULL;
+    atomic_store_explicit(&s->pool_used, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->pool_mode, MTT_POOL_MODE_NONE, memory_order_relaxed);
+
+    if (raw_malloc != NULL) {
+        s->pool = (mtt_entry_t*)raw_malloc(s->pool_raw_size);
+    }
+    if (s->pool == NULL && raw_calloc != NULL) {
+        /* raw_malloc 失败时尝试 raw_calloc 兜底（同时完成清零） */
+        s->pool = (mtt_entry_t*)raw_calloc(s->pool_capacity, sizeof(mtt_entry_t));
+    }
+
+    if (s->pool != NULL) {
+        /* 串起 free list：所有 entry 空闲 */
+        for (size_t i = 0; i < s->pool_capacity; i++) {
+            s->pool[i].next = (i + 1 < s->pool_capacity) ? &s->pool[i + 1] : NULL;
+        }
+        s->pool_free_list = &s->pool[0];
+        atomic_store_explicit(&s->pool_mode, MTT_POOL_MODE_ACTIVE, memory_order_relaxed);
+    } else {
+        /* 池子申请失败：降级为旧模式，工具功能不丢，仅性能下降 */
+        s->pool_capacity = 0;
+        s->pool_raw_size = 0;
+        atomic_store_explicit(&s->pool_mode, MTT_POOL_MODE_FALLBACK, memory_order_relaxed);
+    }
+
     /* 初始化原子计数器（relaxed：此时仅有当前线程可见，release store 最后做） */
     atomic_store_explicit(&s->alloc_seq,       0, memory_order_relaxed);
     atomic_store_explicit(&s->alloc_count,     0, memory_order_relaxed);
@@ -836,6 +967,22 @@ void mtt_ensure_init(void)
     /* 读取进程名 */
     get_process_name(s->proc_name, sizeof(s->proc_name));
     s->proc_name_ready = 1;
+
+    /* 输出 pool 初始化日志（stderr，便于用户观察工具自身内存占用情况） */
+    {
+        int mode = atomic_load_explicit(&s->pool_mode, memory_order_relaxed);
+        char log_buf[160];
+        if (mode == MTT_POOL_MODE_ACTIVE) {
+            int len = snprintf(log_buf, sizeof(log_buf),
+                "[MTT] pool init: mode=ACTIVE capacity=%zu bytes=%zu\n",
+                s->pool_capacity, s->pool_raw_size);
+            if (len > 0) MTT_DIAG_WRITE(STDERR_FILENO, log_buf, (size_t)len);
+        } else if (mode == MTT_POOL_MODE_FALLBACK) {
+            int len = snprintf(log_buf, sizeof(log_buf),
+                "[MTT] pool init: mode=FALLBACK (raw_malloc per-entry)\n");
+            if (len > 0) MTT_DIAG_WRITE(STDERR_FILENO, log_buf, (size_t)len);
+        }
+    }
 
     /* 标记初始化完成（release 确保上述所有初始化对其他线程可见） */
     atomic_store_explicit(&s->initialized, 1, memory_order_release);
@@ -1052,7 +1199,7 @@ void* mtt_malloc(size_t size)
     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
         mtt_stripe_unlock(s, ptr);
-        if (raw_free != NULL) raw_free(e);
+        mtt_entry_discard(s, e);
         return ptr; /* 用户内存已分配，仅跳过追踪 */
     }
 
@@ -1215,7 +1362,7 @@ void* mtt_realloc(void *ptr, size_t size)
                         mtt_entry_add(s, new_e);
                     } else {
                         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
-                        if (raw_free != NULL) raw_free(new_e);
+                        mtt_entry_discard(s, new_e);
                     }
                     mtt_stripe_unlock(s, new_ptr);
                 }
@@ -1260,7 +1407,7 @@ void* mtt_realloc(void *ptr, size_t size)
     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
         mtt_stripe_unlock(s, new_ptr);
-        if (raw_free != NULL) raw_free(new_e);
+        mtt_entry_discard(s, new_e);
         raw_free(ptr);
         return new_ptr;
     }

@@ -263,6 +263,13 @@ void free(void *ptr)
 
     if (ptr == NULL) return;
 
+    /* 池子范围检查：用户进程不应该 free 工具自身的 entry 池内存。
+     * 若误传进来，静默吞掉（不调 raw_free，避免破坏池子结构）。
+     * 真实业务 free 用户内存不会命中此条件，只在用户代码出错时触发。 */
+    if (mtt_pool_contains(ptr)) {
+        return;
+    }
+
     /* 递归保护：栈回溯检测 */
     if (mtt_hook_enter() > 0) {
         mtt_resolve_raw_allocators();

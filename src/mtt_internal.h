@@ -60,8 +60,18 @@
  * ======================================================================== */
 
 #define MTT_BUCKETS             4096    /* 哈希桶数量（必须为 2 的幂，用于位掩码取模） */
-#define MTT_MAX_ENTRIES         65536   /* 分配追踪表最大条目数 */
-#define MTT_STACK_DEPTH         32      /* 调用栈最大深度（满足闭源库穿透场景） */
+#define MTT_MAX_ENTRIES         65536   /* 分配追踪表最大条目数（同时是池子上限） */
+#define MTT_STACK_DEPTH         64      /* 调用栈最大深度（RPC 回调链 + 多层 .so 嵌套场景需要） */
+
+/* entry 池配置 */
+#define MTT_POOL_ENTRIES_DEFAULT 16384  /* 池子默认 entry 数（约 10MB，可被环境变量 MTT_POOL_ENTRIES 覆盖） */
+#define MTT_POOL_ENTRIES_MIN     1024   /* 池子最小 entry 数 */
+#define MTT_POOL_ENTRIES_MAX     65536  /* 池子最大 entry 数（与 MTT_MAX_ENTRIES 一致，避免改 hash 硬上限） */
+
+/* 池子模式标识（atomic_int 存储于 mtt_state_t.pool_mode） */
+#define MTT_POOL_MODE_NONE       0      /* 尚未初始化 */
+#define MTT_POOL_MODE_ACTIVE     1      /* 池子模式：entry 从预申请大块内存复用 */
+#define MTT_POOL_MODE_FALLBACK   2      /* 降级模式：池子申请失败，退回旧 raw_malloc 单条申请 */
 #define MTT_STACK_CACHE_SIZE    4096    /* 栈帧缓存最大条目（去重后） */
 #define MTT_LEAK_DEDUP_SIZE     2048    /* 泄漏去重表最大条目（报告输出上限） */
 #define MTT_SYMBOL_MAX          256     /* 单帧符号字符串最大长度 */
@@ -184,6 +194,20 @@ typedef struct {
     mtt_aligned_mutex_t bucket_locks[MTT_LOCK_STRIPES]; /* 分段锁数组（缓存行对齐） */
     uint64_t            hash_seed;                      /* 哈希随机种子（启动时生成，64-bit） */
 
+    /* entry 池：启动时一次性申请的大块内存，所有 entry 复用槽位。
+     * 设计目标：减少 libc malloc/free 调用频次，工具自身内存占用可视化。
+     * 关键不变量：池子在用数 == entry_count == 桶链表总节点数；
+     *            free list 长度 == pool_capacity - pool_used。
+     * entry->next 在桶链表里指向同桶下一个；在 free list 里指向下一个空闲
+     * （同一时刻 entry 只在其中一个链中，语义复用安全）。 */
+    mtt_entry_t        *pool;                           /* 池子起始地址（raw_malloc 大块） */
+    mtt_entry_t        *pool_free_list;                 /* 空闲 entry 链头（用 entry->next 串） */
+    pthread_mutex_t     pool_lock;                      /* free list 操作互斥锁 */
+    size_t              pool_capacity;                  /* 池子总 entry 数（启动时确定） */
+    size_t              pool_raw_size;                  /* 池子原始字节数 = capacity * sizeof(mtt_entry_t) */
+    _Atomic size_t      pool_used;                      /* 当前在用 entry 数（无锁读取） */
+    _Atomic int         pool_mode;                      /* 模式：MTT_POOL_MODE_* */
+
     /* 统计计数器（全部原子变量，无锁读取） */
     _Atomic int         initialized;                /* 是否已完成初始化（0=未, 1=已） */
     _Atomic int         disabled;                   /* 紧急禁用标志（MTT_DISABLE=1） */
@@ -285,6 +309,7 @@ int          mtt_is_over_capacity(mtt_state_t *s);
 int          mtt_is_startup_phase(mtt_state_t *s);
 int          mtt_is_blacklisted(mtt_state_t *s, const char *symbol);
 void         mtt_capture_stack(mtt_entry_t *entry);
+int          mtt_pool_contains(const void *ptr);   /* 判断 ptr 是否落在 entry 池范围内（防止误 free） */
 
 /* reporter.c */
 void mtt_reporter_start(void);
