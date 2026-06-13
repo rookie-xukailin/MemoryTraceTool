@@ -463,14 +463,16 @@ void* realloc(void *ptr, size_t size)
     ctx->in_hook = saved_hook;
             return ret;
         }
-        /* 无 raw_realloc：malloc+memcpy+free 降级 */
+        /* 无 raw_realloc：malloc + free 模拟(不拷贝,避免越界读)。
+         * 旧 size 未知,若用 size 作为 memcpy 长度,新 size > 旧 size 时
+         * 会越界读 ptr 之后的堆数据。与 tracker.c:mtt_realloc 同路径保持一致。
+         * 此分支仅在初始化失败时走到,正常情况 raw_realloc 始终可用。 */
         void *new_ptr = raw_malloc(size);
         if (new_ptr == NULL) {
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
             return NULL;
         }
-        memcpy(new_ptr, ptr, size);
         if (raw_free != NULL) raw_free(ptr);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
