@@ -216,13 +216,16 @@ void mtt_resolve_raw_allocators(void)
     raw_calloc_fn real_calloc   = (raw_calloc_fn)dlsym(RTLD_NEXT, "calloc");
     raw_realloc_fn real_realloc = (raw_realloc_fn)dlsym(RTLD_NEXT, "realloc");
 
-    /* RTLD_NEXT 在某些 ARM32 系统上可能错误返回 LD_PRELOAD 自身，
-     * 用 dladdr 验证解析到的函数不在 libmemorytracetool 内。 */
+    /* RTLD_NEXT 在某些 ARM32 系统上可能错误返回 LD_PRELOAD 自身,
+     * 用 dladdr 验证解析到的函数不在 libmemorytracetool 内。
+     * 仅在 dladdr 成功且文件名不含 libmemorytracetool 时接受,
+     * dladdr 失败时拒绝(无法证明非 hook 自身,保守丢弃)。 */
     #define RAW_SAFE_SET(fn, val) do { \
         if ((val) != NULL) { \
             Dl_info _info; \
-            if (!dladdr((void*)(val), &_info) \
-                || strstr(_info.dli_fname, "libmemorytracetool") == NULL) { \
+            if (dladdr((void*)(val), &_info) \
+                && (_info.dli_fname == NULL \
+                    || strstr(_info.dli_fname, "libmemorytracetool") == NULL)) { \
                 (fn) = (val); \
             } \
         } \
@@ -325,8 +328,20 @@ void mtt_capture_stack(mtt_entry_t *entry)
     bt_frames = entry->stack_frames;
 #endif
 
-    /* FP chain parallel: take whichever gets more frames */
-    {
+    /* FP chain 兜底:仅当 backtrace 完全失败(0 帧)时启用。
+     *
+     * 崩溃根因(9f2e4ae 引入,本次修复):
+     *   原逻辑无条件运行 FP chain,在 -fomit-frame-pointer 编译的二进制上,
+     *   __builtin_frame_address(0) 返回 SP 而非真 FP,fp[0]/fp[1] 读栈垃圾
+     *   作为 prev_fp,跳到无效地址后下一轮 fp[0] 触发 SIGSEGV。
+     *   demo/test 因带 -fno-omit-frame-pointer 编译而不复现。
+     *
+     * 安全保证:
+     *   1. 仅在 bt_frames == 0 时启动(backtrace 完全失败的兜底场景)
+     *   2. prev_fp 必须严格大于 fp(ARM 栈向低地址增长,父帧地址更高)
+     *   3. prev_fp - fp 不得超过 64KB(防止大跨度跳到未映射区)
+     *   4. 循环上限 MTT_STACK_DEPTH,避免无限循环 */
+    if (bt_frames == 0) {
         void *fp_stack[MTT_STACK_DEPTH];
         int fp_count = 0;
         void **fp = (void**)__builtin_frame_address(0);
@@ -334,34 +349,19 @@ void mtt_capture_stack(mtt_entry_t *entry)
             void *prev_fp = fp[0];
             void *lr      = fp[1];
             if (lr == NULL) break;
+            if (prev_fp == NULL) break;
+            /* 严格校验:父帧地址必须严格递增,且跨度 <= 64KB。
+             * 防止无帧指针二进制上 prev_fp 为栈垃圾导致跳到无效地址。 */
+            uintptr_t prev_addr = (uintptr_t)prev_fp;
+            uintptr_t curr_addr = (uintptr_t)fp;
+            if (prev_addr <= curr_addr) break;
+            if (prev_addr - curr_addr > (UINT64_C(1) << 16)) break;
             fp_stack[fp_count] = MTT_FIX_THUMB_ADDR(lr);
             fp_count++;
-            if (prev_fp == NULL || prev_fp == (void*)fp) break;
+            if (prev_fp == (void*)fp) break;
             fp = (void**)prev_fp;
         }
-        /* 临时诊断:FP chain 帧数大于 backtrace 时输出对比日志。
-         * 怀疑无帧指针二进制上 __builtin_frame_address(0) 返回 SP,
-         * fp[0]/fp[1] 读栈上垃圾数据,采到大量假帧,
-         * 错误地覆盖了 backtrace 的正确结果。
-         * 限频 50 次,避免 stderr 写入拖慢业务。验证后可移除。 */
-        if (fp_count > bt_frames) {
-            static _Atomic int cap_diag_count = 0;
-            int cnt = atomic_fetch_add_explicit(
-                &cap_diag_count, 1, memory_order_relaxed);
-            if (cnt < 50) {
-                char cap_buf[160];
-                int cap_len = snprintf(cap_buf, sizeof(cap_buf),
-                    "[MTT-CAP] #%d backtrace=%d fp_chain=%d (FP wins) "
-                    "fp[0]=%p fp[1]=%p fp[last]=%p\n",
-                    cnt, bt_frames, fp_count,
-                    fp_count > 0 ? fp_stack[0] : NULL,
-                    fp_count > 1 ? fp_stack[1] : NULL,
-                    fp_count > 0 ? fp_stack[fp_count - 1] : NULL);
-                if (cap_len > 0 && cap_len < (int)sizeof(cap_buf))
-                    MTT_DIAG_WRITE(STDERR_FILENO, cap_buf, (size_t)cap_len);
-            }
-        }
-        if (fp_count > entry->stack_frames) {
+        if (fp_count > 0) {
             for (int i = 0; i < fp_count; i++)
                 entry->stack[i] = fp_stack[i];
             entry->stack_frames = fp_count;

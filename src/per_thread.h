@@ -57,11 +57,14 @@ static inline mtt_per_thread_t* mtt_thread_get(void)
         if (atomic_compare_exchange_strong_explicit(
                 &g_threads[i].tid, &zero, tid,
                 memory_order_acq_rel, memory_order_acquire)) {
-            /* CAS 成功：初始化所有字段（release 语义确保可见性） */
+            /* CAS 成功：显式初始化全部字段。
+             * BSS 零初始化虽已兜底,但显式赋值防御未来引入槽位回收时的脏值问题。 */
             g_threads[i].hook_depth    = -1;
             g_threads[i].depth_inited  = -1;
             g_threads[i].in_hook       = 0;
             g_threads[i].tool_internal = 0;
+            g_threads[i].raw_resolving = 0;
+            g_threads[i].in_capture    = 0;
             return &g_threads[i];
         }
     }
