@@ -44,8 +44,10 @@
 #include <stdatomic.h>
 
 /* 全局线程上下文槽位数组（替代 __thread 变量）。
- * 在 tracker.c 中定义，per_thread.h 中 extern 声明 */
-mtt_per_thread_t g_threads[MTT_MAX_THREADS];
+ * 在 tracker.c 中定义，per_thread.h 中 extern 声明。
+ * 64 字节对齐确保首元素落在缓存行边界。 */
+mtt_per_thread_t g_threads[MTT_MAX_THREADS]
+    __attribute__((aligned(64)));
 
 /* ======================================================================== *
  *                    全局单例状态                                             *
@@ -629,16 +631,15 @@ static void get_process_name(char *buf, size_t size)
         return;
     }
 
-    /* /proc 不可用时的备用方案：尝试 prctl（linux 专有，无 malloc） */
+    /* /proc 不可用时的备用方案：用 syscall 直接调 prctl,避免 extern 声明
+     * 与系统头文件冲突,并消除 variadic 参数 ABI 差异风险(ARM32/ARM64) */
 #ifdef __linux__
     {
         char comm[16] = {0};
-        /* 使用 raw syscall 号 15 = PR_GET_NAME（避免引入 <sys/prctl.h> 头文件依赖）。
-         * 注意：prctl 实参类型为 unsigned long，在 ARM64/x86_64 上 sizeof(int) != sizeof(unsigned long)，
-         * 若直接传 0（int）到 variadic 参数中，va_arg(ap, unsigned long) 可能读取未定义字节。
-         * 传递 0UL 确保类型宽度匹配，在 ARM32/ARM64 上均安全。 */
-        extern int prctl(int, ...);
-        if (prctl(15, (unsigned long)comm, 0UL, 0UL, 0UL) == 0 && comm[0] != '\0') {
+        /* raw syscall: prctl(PR_GET_NAME=15, comm, 0, 0, 0)。
+         * 全部参数显式转 unsigned long,匹配 ARM32/ARM64 syscall ABI。 */
+        long rc = syscall(SYS_prctl, (long)15, (long)comm, 0L, 0L, 0L);
+        if (rc == 0 && comm[0] != '\0') {
             size_t n = strlen(comm);
             if (n >= size) n = size - 1;
             memcpy(buf, comm, n);

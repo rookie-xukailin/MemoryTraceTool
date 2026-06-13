@@ -26,6 +26,9 @@ typedef struct {
     int  tool_internal;       /* 工具内部线程标记 (原 __thread g_tool_internal) */
     int  raw_resolving;       /* dlsym 重入保护 (原 __thread g_raw_resolving) */
     int  in_capture;          /* backtrace 重入保护 (原 __thread g_in_capture) */
+    /* 缓存行填充:多核 ARM 上避免相邻槽位 tid 字段落在同一缓存行造成伪共享。
+     * 与 mtt_aligned_mutex_t 设计保持一致。 */
+    char __padding[36];
 } mtt_per_thread_t;
 
 /* 全局槽位数组 — BSS 零初始化。
