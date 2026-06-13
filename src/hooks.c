@@ -209,43 +209,17 @@ void* malloc(size_t size)
     /* 持锁插入哈希表 + 原子更新计数器 */
     mtt_stripe_lock(s, ptr);
 
-    /* 锁内二次检查容量 + LRU 淘汰。
-     * 若已满，尝试淘汰最旧的条目为新分配腾出空间。 */
+    /* 锁内二次检查容量:已达上限则跳过追踪,用户分配已成功。
+     * 原 LRU 淘汰逻辑违反分段锁契约(只持 1/64 锁却遍历全部 4096 桶),
+     * 与其他线程的 free 路径竞争 entry->next 指针,可能 UAF 或双释放。
+     * 与 tracker.c:mtt_malloc 路径保持一致的简单跳过策略。 */
     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
-        /* 尝试淘汰 1 个条目：遍历桶表找到最旧的条目并移除 */
-        mtt_entry_t *oldest = NULL;
-        unsigned oldest_bucket = 0;
-        uint64_t oldest_seq = UINT64_MAX;
-        for (unsigned b = 0; b < (unsigned)s->bucket_count; b++) {
-            for (mtt_entry_t *cur = s->buckets[b]; cur != NULL; cur = cur->next) {
-                if (cur->alloc_num < oldest_seq) {
-                    oldest_seq = cur->alloc_num;
-                    oldest = cur;
-                    oldest_bucket = b;
-                }
-            }
-        }
-        if (oldest != NULL) {
-            /* 从链表中移除 oldest */
-            mtt_entry_t **prev = &s->buckets[oldest_bucket];
-            while (*prev != NULL && *prev != oldest)
-                prev = &(*prev)->next;
-            if (*prev == oldest) {
-                *prev = oldest->next;
-                atomic_fetch_sub_explicit(&s->current_bytes, oldest->size, memory_order_relaxed);
-                atomic_fetch_sub_explicit(&s->entry_count, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
-                if (raw_free != NULL) raw_free(oldest);
-            }
-        } else {
-            /* 没有可淘汰的条目（极少情况） */
-            atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
-            mtt_stripe_unlock(s, ptr);
-            if (raw_free != NULL) raw_free(e);
+        atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
+        mtt_stripe_unlock(s, ptr);
+        if (raw_free != NULL) raw_free(e);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
-            return ptr;
-        }
+        return ptr;
     }
 
     e->alloc_num = atomic_fetch_add_explicit(&s->alloc_seq, 1, memory_order_relaxed) + 1;
