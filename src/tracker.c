@@ -79,6 +79,10 @@ raw_calloc_fn  volatile raw_calloc  = NULL;
 raw_realloc_fn volatile raw_realloc = NULL;
 raw_posix_memalign_fn volatile raw_posix_memalign = NULL;
 
+/* 诊断日志开关(由环境变量 MTT_DEBUG 控制,默认开)。
+ * =0 时屏蔽所有 stderr 诊断,只保留 leak 报告 + heartbeat。 */
+_Atomic int mtt_debug_enabled = MTT_DEBUG_DEFAULT;
+
 /* CAS 保护的一次性解析标志 */
 static atomic_int g_raw_resolved = 0;
 
@@ -812,11 +816,18 @@ void mtt_ensure_init(void)
     time_t   want_leak_threshold = MTT_LEAK_THRESHOLD_DEFAULT;
     time_t   want_skip_startup   = MTT_SKIP_STARTUP_DEFAULT;
     size_t   want_pool_entries   = MTT_POOL_ENTRIES_DEFAULT; /* 池子容量，可被 MTT_POOL_ENTRIES 覆盖 */
+    int      want_debug    = MTT_DEBUG_DEFAULT;
 
     {
         const char *env_disable = getenv("MTT_DISABLE");
         if (env_disable != NULL && strcmp(env_disable, "1") == 0)
             want_disabled = 1;
+
+        const char *env_debug = getenv("MTT_DEBUG");
+        if (env_debug != NULL) {
+            /* MTT_DEBUG=0 关闭诊断日志; 其他值(1/yes/on)打开 */
+            want_debug = (strcmp(env_debug, "0") == 0) ? 0 : 1;
+        }
 
         const char *env_sample = getenv("MTT_SAMPLE");
         if (env_sample != NULL) {
@@ -966,6 +977,7 @@ void mtt_ensure_init(void)
     atomic_store_explicit(&s->temp_alloc_count,   0, memory_order_relaxed);
     atomic_store_explicit(&s->expired_alloc_count, 0, memory_order_relaxed);
     atomic_store_explicit(&s->free_expired_count,  0, memory_order_relaxed);
+    atomic_store_explicit(&mtt_debug_enabled, want_debug, memory_order_relaxed);
 
     /* 设置启动阶段结束时间（0=不跳过） */
     if (want_skip_startup > 0)
@@ -977,7 +989,8 @@ void mtt_ensure_init(void)
     get_process_name(s->proc_name, sizeof(s->proc_name));
     s->proc_name_ready = 1;
 
-    /* 输出 pool 初始化日志（stderr，便于用户观察工具自身内存占用情况） */
+    /* 输出 pool 初始化日志（stderr，便于用户观察工具自身内存占用情况,
+     * 受 MTT_DEBUG 控制,但 init 时 mtt_debug_enabled 已经在阶段2 设置完成） */
     {
         int mode = atomic_load_explicit(&s->pool_mode, memory_order_relaxed);
         char log_buf[160];
@@ -985,11 +998,11 @@ void mtt_ensure_init(void)
             int len = snprintf(log_buf, sizeof(log_buf),
                 "[MTT] pool init: mode=ACTIVE capacity=%zu bytes=%zu\n",
                 s->pool_capacity, s->pool_raw_size);
-            if (len > 0) MTT_DIAG_WRITE(STDERR_FILENO, log_buf, (size_t)len);
+            if (len > 0) MTT_DIAG_LOG(log_buf, (size_t)len);
         } else if (mode == MTT_POOL_MODE_FALLBACK) {
             int len = snprintf(log_buf, sizeof(log_buf),
                 "[MTT] pool init: mode=FALLBACK (raw_malloc per-entry)\n");
-            if (len > 0) MTT_DIAG_WRITE(STDERR_FILENO, log_buf, (size_t)len);
+            if (len > 0) MTT_DIAG_LOG(log_buf, (size_t)len);
         }
     }
 
@@ -1000,12 +1013,20 @@ void mtt_ensure_init(void)
     /* 先初始化时序数据（必须在 reporter 线程启动前完成） */
     mtt_ts_init();
 
-    /* 启动子系统时设置 in_hook=1，防止 pthread_create / socket / bind 等
-     * 内部调用 malloc() 被 hook 拦截并追踪为"疑似泄漏"。
+    /* 启动子系统时设置 in_hook=1 + tool_internal=1,防止 pthread_create / socket
+     * / bind 等内部调用 malloc() 被 hook 拦截并追踪为"疑似泄漏"。
+     * - in_hook=1: 防止 pthread_create 内部 malloc 触发递归 hook
+     * - tool_internal=1: 让 hook 的 tool_internal 检查路径透传 pthread_create
+     *   内部的 _dl_allocate_tls(否则会被记录为泄漏,栈顶 _dl_allocate_tls →
+     *   pthread_create → main)
      * save/restore 防止嵌套 mtt_ensure_init 调用破坏状态。 */
     mtt_per_thread_t *ctx = mtt_thread_get();
     int saved_hook = (ctx != NULL) ? ctx->in_hook : 0;
-    if (ctx != NULL) ctx->in_hook = 1;
+    int saved_tool = (ctx != NULL) ? ctx->tool_internal : 0;
+    if (ctx != NULL) {
+        ctx->in_hook = 1;
+        ctx->tool_internal = 1;
+    }
 
     /* 启动周期报告线程（锁外，避免 pthread_create 内部 malloc → 递归） */
     mtt_reporter_start();
@@ -1027,7 +1048,10 @@ void mtt_ensure_init(void)
     /* 启动信号处理线程（SIGUSR1 触发即时报告） */
     mtt_signal_thread_start();
 
-    if (ctx != NULL) ctx->in_hook = saved_hook;
+    if (ctx != NULL) {
+        ctx->in_hook = saved_hook;
+        ctx->tool_internal = saved_tool;
+    }
 
     /* 注册 fork 安全处理器（仅需注册一次） */
     static pthread_once_t g_fork_init = PTHREAD_ONCE_INIT;
@@ -1101,6 +1125,10 @@ static void* mtt_signal_thread_fn(void *arg)
     (void)arg;
     pthread_detach(pthread_self());
 
+    /* 标记为工具内部线程:本线程的 malloc/free 都透传不追踪 */
+    mtt_per_thread_t *ctx = mtt_thread_get();
+    if (ctx != NULL) ctx->tool_internal = 1;
+
     sigset_t sigset;
     sigemptyset(&sigset);
     sigaddset(&sigset, MTT_SIGNAL_REPORT);
@@ -1149,13 +1177,13 @@ void mtt_signal_thread_start(void)
         return;
     }
 
-    /* 诊断输出 */
+    /* 诊断输出(MTT_DEBUG=0 时屏蔽) */
     char diag[96] = {0};
     int len = snprintf(diag, sizeof(diag),
         "[MTT] Signal thread ready (kill -USR1 %d for instant report)\n",
         (int)getpid());
     if (len > 0 && len < (int)sizeof(diag))
-        MTT_DIAG_WRITE(STDERR_FILENO, diag, (size_t)len);
+        MTT_DIAG_LOG(diag, (size_t)len);
 }
 
 /* ======================================================================== *

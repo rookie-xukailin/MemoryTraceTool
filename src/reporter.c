@@ -26,6 +26,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
 
 /* ---- 报告器全局状态（单例，仅 reporter 线程访问） ---- */
 
@@ -280,14 +281,14 @@ static void scan_and_report_locked(void)
     uint64_t entry_total_orig = atomic_load_explicit(&s->entry_count, memory_order_relaxed);
     uint64_t entry_total = entry_total_orig;
 
-    /* 诊断：记录每次扫描入口 */
+    /* 诊断：记录每次扫描入口(MTT_DEBUG=0 时屏蔽) */
     {
         char dbuf[96];
         int dlen = snprintf(dbuf, sizeof(dbuf),
             "[MTT] scan enter: entry=%llu\n",
             (unsigned long long)entry_total_orig);
         if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+            MTT_DIAG_LOG(dbuf, (size_t)dlen);
     }
 
     /* ---- 阶段 0: 时序数据缓存更新（独立于扫描，始终执行） ----
@@ -378,7 +379,7 @@ static void scan_and_report_locked(void)
             int dlen = snprintf(dbuf, sizeof(dbuf),
                 "[MTT] scan: 10B snaps=%zu / total snaps=%zu\n", n10, snap_count);
             if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+                MTT_DIAG_LOG(dbuf, (size_t)dlen);
         }
     }
 
@@ -489,7 +490,7 @@ static void scan_and_report_locked(void)
             "[MTT] dedup: 10B_sites=%zu 10B_total=%zu  all_sites=%zu  snaps=%zu\n",
             n10_sites, n10_total, leak_table.count, snap_count);
         if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+            MTT_DIAG_LOG(dbuf, (size_t)dlen);
     }
 
     /* ---- 阶段 3: 懒解析栈符号（安全网：补解析阶段 2 遗漏的条目） ----
@@ -924,18 +925,18 @@ cleanup:
         }
     }
 
-    /* 诊断：扫描正常完成 */
+    /* 诊断：扫描正常完成(MTT_DEBUG=0 时屏蔽) */
     {
         char dbuf[64];
         int dlen = snprintf(dbuf, sizeof(dbuf),
             "[MTT] scan done: sites=%zu\n", site_count);
         if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+            MTT_DIAG_LOG(dbuf, (size_t)dlen);
     }
     return;
 
 skip_scan:
-    /* 快照分配失败 — 静默跳过本次扫描 */
+    /* 快照分配失败 — 静默跳过本次扫描(WARNING 始终输出) */
     {
         char err_buf[128] = {0};
         int err_len = snprintf(err_buf, sizeof(err_buf),
@@ -952,6 +953,87 @@ static void scan_and_report(void)
     pthread_mutex_lock(&g_reporter.scan_mutex);
     scan_and_report_locked();
     pthread_mutex_unlock(&g_reporter.scan_mutex);
+}
+
+/**
+ * 60s heartbeat 资源监控:写一行紧凑格式到独立文件。
+ *
+ * 文件路径:/var/log/mtt/<pid>_heartbeat.log(覆盖写,只保留最新一行)
+ * 字段:rss/pool/entries/leaks/siteuniq/skipped
+ *
+ * 性能要点:
+ *   - 单次 read /proc/self/statm(几十字节),单次 open+write+close
+ *   - 所有数据 atomic relaxed read,无锁竞争
+ *   - 失败时静默跳过(下次 60s 再试)
+ *   - 不与 leak 报告共用文件,避免长报告撑大 heartbeat 文件
+ */
+void mtt_heartbeat_write(void)
+{
+    mtt_state_t *s = mtt_state_get();
+    if (s == NULL) return;
+
+    /* 读 RSS(单位:字节) */
+    size_t rss_bytes = 0;
+    int rss_fd = open("/proc/self/statm", O_RDONLY);
+    if (rss_fd >= 0) {
+        char statm_buf[128];
+        ssize_t n = read(rss_fd, statm_buf, sizeof(statm_buf) - 1);
+        close(rss_fd);
+        if (n > 0) {
+            statm_buf[n] = '\0';
+            long rss_pages = 0;
+            /* statm 格式:size resident shared text lib data dt */
+            if (sscanf(statm_buf, "%*s %ld", &rss_pages) == 1 && rss_pages > 0) {
+                rss_bytes = (size_t)rss_pages * (size_t)sysconf(_SC_PAGESIZE);
+            }
+        }
+    }
+
+    /* 收集所有指标(全部 atomic relaxed,无锁) */
+    size_t pool_used   = atomic_load_explicit(&s->pool_used, memory_order_relaxed);
+    size_t pool_cap    = s->pool_capacity;
+    size_t entries     = (size_t)atomic_load_explicit(&s->entry_count, memory_order_relaxed);
+    size_t allocs      = atomic_load_explicit(&s->alloc_count, memory_order_relaxed);
+    size_t frees       = atomic_load_explicit(&s->free_count, memory_order_relaxed);
+    size_t cur_bytes   = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
+    size_t skipped_ovc = atomic_load_explicit(&s->skipped_overcap, memory_order_relaxed);
+    size_t skipped_smp = atomic_load_explicit(&s->skipped_sampled, memory_order_relaxed);
+    size_t leaks_n     = (allocs > frees) ? (allocs - frees) : 0;
+    int    pool_mode   = atomic_load_explicit(&s->pool_mode, memory_order_relaxed);
+
+    /* pool 使用率(0-100) */
+    int pool_pct = (pool_cap > 0) ? (int)((pool_used * 100) / pool_cap) : 0;
+
+    /* 站点数(从 reporter 上次 scan 结果取,缓存字段) */
+    size_t sites_uniq = g_reporter.cached_site_count;
+
+    /* 写文件路径:/var/log/mtt/<pid>_heartbeat.log(覆盖写,只留最新行) */
+    char path[256];
+    int plen = snprintf(path, sizeof(path), "%s/%d_heartbeat.log",
+                        MTT_HEARTBEAT_DIR, (int)getpid());
+    if (plen <= 0 || plen >= (int)sizeof(path)) return;
+
+    /* 不用 O_APPEND,要覆盖(只保留最新一行,避免无限增长) */
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return;
+
+    /* 紧凑格式:rss/pool/entries/leaks/siteuniq/skipped */
+    char line[256];
+    time_t now = time(NULL);
+    int llen = snprintf(line, sizeof(line),
+        "ts=%lld rss=%zukB pool=%zu/%zu(%d%%,mode=%d) entries=%zu "
+        "cur_bytes=%zukB leaks=%zu siteuniq=%zu skipped=%zu/%zu\n",
+        (long long)now,
+        rss_bytes / 1024,
+        pool_used, pool_cap, pool_pct, pool_mode,
+        entries,
+        cur_bytes / 1024,
+        leaks_n, sites_uniq,
+        skipped_ovc, skipped_smp);
+    if (llen > 0) {
+        MTT_DIAG_WRITE(fd, line, (size_t)llen);
+    }
+    close(fd);
 }
 
 /* ======================================================================== *
@@ -986,7 +1068,7 @@ static void* reporter_thread_fn(void *arg)
         int dlen = snprintf(dbuf, sizeof(dbuf),
             "[MTT] reporter: first scan done, entering loop\n");
         if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+            MTT_DIAG_LOG(dbuf, (size_t)dlen);
     }
 
     while (atomic_load_explicit(&g_reporter.running, memory_order_acquire)) {
@@ -998,21 +1080,6 @@ static void* reporter_thread_fn(void *arg)
             sleep(1);
             /* 每秒记录时序数据点 */
             mtt_ts_record_point();
-
-            /* 每10秒输出一次心跳，确认线程存活 + 关键指标 */
-            if (i % 10 == 9) {
-                mtt_state_t *st = mtt_state_get();
-                size_t cur_b = st ? atomic_load(&st->current_bytes) : 0;
-                size_t entry_n = st ? atomic_load(&st->entry_count) : 0;
-                size_t overcap = st ? atomic_load(&st->skipped_overcap) : 0;
-                size_t sampled = st ? atomic_load(&st->skipped_sampled) : 0;
-                char dbuf[128];
-                int dlen = snprintf(dbuf, sizeof(dbuf),
-                    "[MTT] heartbeat %ds: cur_bytes=%zu entry=%zu overcap=%zu sampled=%zu\n",
-                    i + 1, cur_b, entry_n, overcap, sampled);
-                if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                    MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
-            }
 
             /* 检查峰值是否刚被更新（借鉴 jemalloc prof_gdump） */
             mtt_state_t *st = mtt_state_get();
@@ -1029,9 +1096,11 @@ static void* reporter_thread_fn(void *arg)
                 int dlen = snprintf(dbuf, sizeof(dbuf),
                     "[MTT] reporter: periodic scan start\n");
                 if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                    MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+                    MTT_DIAG_LOG(dbuf, (size_t)dlen);
             }
             scan_and_report();
+            /* 每轮 scan 结束后写一次 heartbeat 文件(60s 一次) */
+            mtt_heartbeat_write();
         }
     }
 
@@ -1041,7 +1110,7 @@ static void* reporter_thread_fn(void *arg)
         int dlen = snprintf(dbuf, sizeof(dbuf),
             "[MTT] reporter: final scan before exit\n");
         if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
+            MTT_DIAG_LOG(dbuf, (size_t)dlen);
     }
     scan_and_report();
 
@@ -1119,13 +1188,13 @@ void mtt_reporter_start(void)
         g_atexit_registered = 1;
     }
 
-    /* 首次诊断输出（使用 write 避免 malloc） */
+    /* 首次诊断输出（使用 write 避免 malloc，受 MTT_DEBUG 控制） */
     char diag[256] = {0};
     int len = snprintf(diag, sizeof(diag),
         "[MTT] Reporter thread started (pid=%d, log=%s, interval=%ds)\n",
         (int)getpid(), g_reporter.log_path, MTT_REPORT_INTERVAL_SEC);
     if (len > 0 && len < (int)sizeof(diag))
-        MTT_DIAG_WRITE(STDERR_FILENO, diag, (size_t)len);
+        MTT_DIAG_LOG(diag, (size_t)len);
 }
 
 /**

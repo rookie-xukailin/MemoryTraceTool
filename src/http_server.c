@@ -573,6 +573,10 @@ static void* http_thread_fn(void *arg)
     (void)arg;
     pthread_detach(pthread_self());
 
+    /* 标记为工具内部线程:本线程的 malloc/free 都透传不追踪 */
+    mtt_per_thread_t *ctx = mtt_thread_get();
+    if (ctx != NULL) ctx->tool_internal = 1;
+
     static char req_buf[MTT_HTTP_BUF_SIZE];
     static char path[MTT_HTTP_MAX_PATH];
 
@@ -682,7 +686,7 @@ void mtt_http_server_start(uint16_t port)
     char diag[128];
     int len = snprintf(diag, sizeof(diag), "[MTT] HTTP dashboard: http://0.0.0.0:%u/\n", (unsigned)port);
     if (len > 0 && len < (int)sizeof(diag))
-        MTT_DIAG_WRITE(STDERR_FILENO, diag, (size_t)len);
+        MTT_DIAG_LOG(diag, (size_t)len);
 }
 
 void mtt_http_server_stop(void)

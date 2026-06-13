@@ -98,6 +98,15 @@
 /* SIGUSR1 信号触发即时报告 */
 #define MTT_SIGNAL_REPORT       SIGUSR1 /* 触发即时报告的信号 */
 
+/* 诊断日志开关（MTT_DEBUG=1 开, =0 关）。
+ * 默认打开; 关闭后只保留泄漏报告写到 /var/log/mtt 下、
+ * 60s heartbeat 写到 /var/log/mtt/下 <pid>_heartbeat.log、HTTP API、SIGUSR1 即时报告。
+ * 所有 stderr 诊断(init 状态/scan 进度/heartbeat/线程启动)都被屏蔽。 */
+#define MTT_DEBUG_DEFAULT       1
+
+/* 60s heartbeat 资源监控输出文件 */
+#define MTT_HEARTBEAT_DIR       "/var/log/mtt"
+
 /* 泄漏判定相关常量 */
 #define MTT_LEAK_THRESHOLD_DEFAULT 300  /* 默认泄漏阈值（秒）：存活超过此值→probable leak */
 #define MTT_SKIP_STARTUP_DEFAULT    0   /* 默认不跳过启动阶段 */
@@ -311,8 +320,27 @@ int          mtt_is_blacklisted(mtt_state_t *s, const char *symbol);
 void         mtt_capture_stack(mtt_entry_t *entry);
 int          mtt_pool_contains(const void *ptr);   /* 判断 ptr 是否落在 entry 池范围内（防止误 free） */
 
+/* 诊断日志开关（tracker.c 定义）。
+ * =1: 输出 init 状态/scan 进度等诊断信息到 stderr
+ * =0: 静默运行,只输出 leak 报告 + heartbeat
+ * 由环境变量 MTT_DEBUG 控制,默认开。
+ * 所有非热路径的诊断打印都应判断此标志。 */
+extern _Atomic int mtt_debug_enabled;
+
+/* 工具自身的 stderr 诊断打印宏(仅非热路径用)。
+ * 默认开,关闭时编译期不消除但运行时短路(单次分支判断,可忽略)。
+ * pool init 日志、关键 ERROR/WARNING 不受此开关控制(始终输出)。 */
+#define MTT_DIAG_LOG(buf, len) \
+    do { \
+        if (atomic_load_explicit(&mtt_debug_enabled, memory_order_relaxed)) { \
+            long __mtt_w = (long)write(STDERR_FILENO, (buf), (len)); \
+            (void)__mtt_w; \
+        } \
+    } while (0)
+
 /* reporter.c */
 void mtt_reporter_start(void);
+void mtt_heartbeat_write(void);   /* 60s 资源监控写独立文件 */
 
 /* stack_cache.c */
 uint64_t mtt_stack_hash_compute(void **frames, int frame_count);
