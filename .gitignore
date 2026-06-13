@@ -7,3 +7,7 @@ sysroot/
 *.a
 *.core
 core
+examples/realistic/demo_realistic
+output/sim/
+
+# HDM3-sim 编译产物

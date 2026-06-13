@@ -49,6 +49,42 @@ make clean              # 清理构建产物
 每次编辑源文件后，必须主动跑两个平台的编译+测试+demo验证，不需要等用户提醒。
 两个平台都通过后，直接主动提交并推送到远端，无需询问用户。
 
+## HDM3 build 环境模拟测试(必跑,防"Mac 通过环境崩")
+
+**为什么**:用户的 flasher 是 ARM32 `-fomit-frame-pointer -O2` release 二进制。
+单元测试用 `-fno-omit-frame-pointer` 编译,无法暴露无帧指针二进制上的 bug
+(典型例:FP chain parallel 在 9f2e4ae 引入后崩溃,单元测试全过但环境必崩)。
+
+**模拟环境**:`hdm3-sim:latest` docker image(Ubuntu 24.04 ARM64 + GCC 13.3.0)
+- ARM32:`arm-linux-gnueabi-gcc`(soft-float, 与 HDM3_build 工具链 ABI 完全一致)
+- ARM64:native gcc(host 本身是 ARM64)
+- 跑 ARM32 binary:`qemu-arm-static -L /usr/arm-linux-gnueabi`
+- demo/fakebiz 全部用 `-O2 -fomit-frame-pointer`(匹配 flasher release 选项)
+
+**首次构建 image**:
+```bash
+docker build --platform linux/arm64 -f Dockerfile.hdm3-sim -t hdm3-sim:latest .
+```
+
+**测试流程**(提交前必跑):
+```bash
+./scripts/sim-test.sh           # 编译 + 跑两平台综合测试
+./scripts/sim-test.sh build     # 只编译
+./scripts/sim-test.sh arm32     # 只跑 ARM32
+./scripts/sim-test.sh arm64     # 只跑 ARM64
+```
+
+**验收准则**(任一不满足禁止提交):
+- ARM32:`exit=0` + `entry>0` + `sites>0` + reporter 线程启动
+- ARM64:`exit=0` + `entry>0` + `sites>0` + reporter 线程启动
+
+**测试矩阵覆盖**(`examples/realistic/`):
+- 进程内直接泄漏(模拟 main 业务逻辑)
+- 通过 dlopen 调用业务库 .so,库内部多层调用栈 + 内存泄漏
+- 通过 dlopen 调用业务库 .so 的不规范用法:strdup/asprintf 不 free、
+  realloc 失败丢失指针、全局缓存无限增长
+- 故意 dlopen 不 dlclose(模拟模块未卸载)
+
 ## 编码规范
 
 1. **每个函数都要有函数头（doxygen 风格 `/** ... */`）**，说明用途、参数、返回值
