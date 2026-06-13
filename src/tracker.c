@@ -315,12 +315,14 @@ void mtt_capture_stack(mtt_entry_t *entry)
     int saved = ctx->in_capture;
     ctx->in_capture = 1;
 
+    int bt_frames = 0;
 #if MTT_HAS_BACKTRACE
     entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
     if (entry->stack_frames < 0)
         entry->stack_frames = 0;
     for (int i = 0; i < entry->stack_frames; i++)
         entry->stack[i] = MTT_FIX_THUMB_ADDR(entry->stack[i]);
+    bt_frames = entry->stack_frames;
 #endif
 
     /* FP chain parallel: take whichever gets more frames */
@@ -336,6 +338,28 @@ void mtt_capture_stack(mtt_entry_t *entry)
             fp_count++;
             if (prev_fp == NULL || prev_fp == (void*)fp) break;
             fp = (void**)prev_fp;
+        }
+        /* 临时诊断:FP chain 帧数大于 backtrace 时输出对比日志。
+         * 怀疑无帧指针二进制上 __builtin_frame_address(0) 返回 SP,
+         * fp[0]/fp[1] 读栈上垃圾数据,采到大量假帧,
+         * 错误地覆盖了 backtrace 的正确结果。
+         * 限频 50 次,避免 stderr 写入拖慢业务。验证后可移除。 */
+        if (fp_count > bt_frames) {
+            static _Atomic int cap_diag_count = 0;
+            int cnt = atomic_fetch_add_explicit(
+                &cap_diag_count, 1, memory_order_relaxed);
+            if (cnt < 50) {
+                char cap_buf[160];
+                int cap_len = snprintf(cap_buf, sizeof(cap_buf),
+                    "[MTT-CAP] #%d backtrace=%d fp_chain=%d (FP wins) "
+                    "fp[0]=%p fp[1]=%p fp[last]=%p\n",
+                    cnt, bt_frames, fp_count,
+                    fp_count > 0 ? fp_stack[0] : NULL,
+                    fp_count > 1 ? fp_stack[1] : NULL,
+                    fp_count > 0 ? fp_stack[fp_count - 1] : NULL);
+                if (cap_len > 0 && cap_len < (int)sizeof(cap_buf))
+                    MTT_DIAG_WRITE(STDERR_FILENO, cap_buf, (size_t)cap_len);
+            }
         }
         if (fp_count > entry->stack_frames) {
             for (int i = 0; i < fp_count; i++)
