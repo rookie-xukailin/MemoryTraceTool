@@ -575,7 +575,12 @@ void mtt_entry_remove(mtt_state_t *s, const void *ptr)
 int mtt_pool_contains(const void *ptr)
 {
     mtt_state_t *s = mtt_state_get();
-    if (s == NULL || s->pool == NULL || ptr == NULL) return 0;
+    if (s == NULL || ptr == NULL) return 0;
+    /* 必须先确认 initialized：init_lock 内的 pool/pool_raw_size 写入
+     * 通过 initialized 的 release store 对其他线程可见。否则可能在
+     * init 进行中读到 pool 非空但 pool_raw_size 还是旧值的不一致状态。 */
+    if (!atomic_load_explicit(&s->initialized, memory_order_acquire)) return 0;
+    if (s->pool == NULL) return 0;
     const char *base = (const char*)s->pool;
     const char *end  = base + s->pool_raw_size;
     const char *p    = (const char*)ptr;
