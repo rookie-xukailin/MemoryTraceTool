@@ -666,7 +666,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
         e->timestamp     = time(NULL);
         e->next          = NULL;
         e->stack_frames  = 0;
-        memset(e->stack, 0, sizeof(e->stack));
+        /* e->stack 已被上面 memset(e, 0, sizeof(*e)) 清零，无需重复 memset */
 
         mtt_capture_stack(e);
         return e;
@@ -689,7 +689,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
     e->timestamp     = time(NULL);
     e->next          = NULL;
     e->stack_frames  = 0;
-    memset(e->stack, 0, sizeof(e->stack));
+    /* e->stack 已被上面 memset(e, 0, sizeof(*e)) 清零，无需重复 memset */
 
     /* 捕获调用栈（内部有防重入保护 + Thumb bit 清除） */
     mtt_capture_stack(e);
