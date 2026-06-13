@@ -93,6 +93,16 @@ docker build --platform linux/arm64 -f Dockerfile.hdm3-sim -t hdm3-sim:latest .
 
 每轮:全工程阅读 + 修复 + 两平台编译/测试 + 模拟环境验证 + 单独 commit,不允许失败就退出。
 
+## 静默运行模式(MTT_DEBUG=0)
+
+为降低对被监控进程的性能影响,工具支持 `MTT_DEBUG=0` 静默模式:
+
+- **屏蔽** 所有 stderr 诊断(`hook first call`、`Reporter/HTTP/Signal started`、`scan enter/dedup/done`、`periodic scan start`、`final scan` 等)
+- **保留** 泄漏报告(`/var/log/mtt/<pid>_<name>.log`)、60s heartbeat(`/var/log/mtt/<pid>_heartbeat.log`)、HTTP API、SIGUSR1 即时报告
+- 默认开(`MTT_DEBUG=1`),调试时可观察工具行为;生产部署建议 `MTT_DEBUG=0` 降低开销
+
+heartbeat 文件 60s 覆盖写一次,字段:`ts/rss/pool/entries/cur_bytes/leaks/siteuniq/skipped`。
+
 ## 编码规范
 
 1. **每个函数都要有函数头（doxygen 风格 `/** ... */`）**，说明用途、参数、返回值
