@@ -187,7 +187,7 @@ static const char g_dashboard_html[] =
 "  for(var i=startIdx;i<endIdx;i++){\n"
 "    var l=allLeaks[i],h=l.hash||'',conf=l.is_expired?'probable leak':'possible leak';\n"
 "    var diff=l.diff_size>0?' class=\"diff-high\"':'';\n"
-"    rows+='<tr class=\"leak-row\"'+diff+' onclick=\"(function(){var s=document.getElementById(\\'s'+i+'\\');var opened=s.classList.toggle(\\'open\\');var h=\\''+h+'\\';if(opened)expandedHashes.add(h);else expandedHashes.delete(h);})()\">'+\n"
+"    rows+='<tr class=\"leak-row\"'+diff+' onclick=\"(function(){var s=document.getElementById(\\'s'+i+'\\');if(!s)return;var opened=s.classList.toggle(\\'open\\');var h=\\''+h+'\\';if(opened)expandedHashes.add(h);else expandedHashes.delete(h);})()\">'+\n"
 "      '<td>'+(i+1)+'</td><td>'+l.count.toLocaleString()+'</td>'+\n"
 "      '<td>'+fb(l.per_leak_size)+'</td><td><b>'+fb(l.total_size)+'</b></td>'+\n"
 "      '<td>'+conf+'</td><td>'+ft(l.first_seen)+'</td><td>'+ft(l.last_seen)+'</td></tr>';\n"
@@ -199,6 +199,8 @@ static const char g_dashboard_html[] =
 "        if(cmd)rows+='<div class=\"cmd\">'+cmd+'</div>';\n"
 "      }\n"
 "      rows+='</td></tr>';\n"
+"    } else {\n"
+"      rows+='<tr class=\"stack-row\" id=\"s'+i+'\"><td colspan=\"7\" class=\"stack-cell\"><div style=\"color:#6e7681\">未捕获栈回溯 — hash='+h+' size='+l.per_leak_size+'B count='+l.count+(l.is_expired?' (probable leak)':'')+'</div></td></tr>';\n"
 "    }\n"
 "  }\n"
 "  tbody.innerHTML=rows;\n"
@@ -369,6 +371,43 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
                 } else {
                     MTT_DIAG_WRITE(fd, p, 1);
                 }
+            }
+            MTT_DIAG_WRITE(fd, "\"", 1);
+        }
+    }
+
+    /* 第三级兜底：业务栈完全未捕获，所有帧都是工具内部（mtt_entry_new /
+     * malloc hook 等）。常发生于 ARM32 -fomit-frame-pointer 路径上
+     * backtrace 无法 unwind 业务调用栈，只剩工具自身调用链。
+     * 此时输出全部未过滤帧，加 [INT] 前缀让用户识别为工具内部栈，
+     * 至少能定位 hook 路径，避免页面显示空栈导致 onclick 无响应。
+     * 注意：栈顶 j=0（mtt_capture_stack）始终跳过，无诊断价值。 */
+    if (!wrote_frame && se != NULL && se->frame_count > 1) {
+        for (int j = 1; j < se->frame_count; j++) {
+            const char *raw_sym = se->resolved[j];
+            if (wrote_frame) MTT_DIAG_WRITE(fd, ",", 1);
+            wrote_frame = 1;
+            MTT_DIAG_WRITE(fd, "\"[INT] ", 7);
+            if (raw_sym != NULL && raw_sym[0] != '\0') {
+                for (const char *p = raw_sym; *p != '\0'; p++) {
+                    unsigned char c = (unsigned char)*p;
+                    if (c == '"' || c == '\\') {
+                        MTT_DIAG_WRITE(fd, "\\", 1);
+                        MTT_DIAG_WRITE(fd, p, 1);
+                    } else if (c < 0x20) {
+                        char esc[8];
+                        int n = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+                        if (n > 0) MTT_DIAG_WRITE(fd, esc, (size_t)n);
+                    } else {
+                        MTT_DIAG_WRITE(fd, p, 1);
+                    }
+                }
+            } else {
+                off = snprintf(buf, sizeof(buf), "0x%lx",
+                               (unsigned long)(uintptr_t)se->frames[j]);
+                if (off < 0) off = 0;
+                else if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
+                MTT_DIAG_WRITE(fd, buf, (size_t)off);
             }
             MTT_DIAG_WRITE(fd, "\"", 1);
         }
