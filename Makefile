@@ -59,11 +59,12 @@ SRC_DIR    = src
 BUILD_DIR  = build
 OUTPUT_DIR = output
 
-# 共享库目标文件（8 个模块；addr_validate 为 ARM32 浅栈优化引入）
+# 共享库目标文件（9 个模块；addr_validate + unwind_libunwind 为栈回溯优化引入）
 LIB_OBJS = $(BUILD_DIR)/hooks.o $(BUILD_DIR)/tracker.o \
            $(BUILD_DIR)/stack_cache.o $(BUILD_DIR)/reporter.o \
            $(BUILD_DIR)/time_series.o $(BUILD_DIR)/flamegraph.o \
-           $(BUILD_DIR)/http_server.o $(BUILD_DIR)/addr_validate.o
+           $(BUILD_DIR)/http_server.o $(BUILD_DIR)/addr_validate.o \
+           $(BUILD_DIR)/unwind_libunwind.o
 
 SHARED_LIB = $(OUTPUT_DIR)/libmemorytracetool.so
 
@@ -98,6 +99,9 @@ $(BUILD_DIR)/http_server.o: $(SRC_DIR)/http_server.c $(SRC_DIR)/http_server.h $(
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
 $(BUILD_DIR)/addr_validate.o: $(SRC_DIR)/addr_validate.c $(SRC_DIR)/addr_validate.h $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
+
+$(BUILD_DIR)/unwind_libunwind.o: $(SRC_DIR)/unwind_libunwind.c $(SRC_DIR)/unwind_libunwind.h $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
 $(BUILD_DIR) $(OUTPUT_DIR):

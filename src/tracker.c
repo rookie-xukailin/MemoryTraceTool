@@ -30,6 +30,7 @@
 #include "http_server.h"
 #include "per_thread.h"
 #include "addr_validate.h"
+#include "unwind_libunwind.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -337,6 +338,27 @@ void mtt_capture_stack(mtt_entry_t *entry)
     ctx->in_capture = 1;
 
     int bt_frames = 0;
+
+    /* 优先路径:libunwind(若可用)
+     * libunwind 内建 ARM EHABI + DWARF + FP chain 多策略 unwind,在 ARM32
+     * -O2 -fomit-frame-pointer 二进制上通常能拿到比 glibc backtrace() 更深的栈
+     * (实测 demo_nofp -O2 -fomit-frame-pointer:libunwind 5 帧 vs backtrace 3 帧)。
+     * 软加载失败时自动回退到 glibc backtrace,行为完全等价于无 libunwind 集成。
+     *
+     * 注意:libunwind 仍受目标二进制的 .ARM.exidx 完整性约束 —— 若目标
+     * 编译时未加 -funwind-tables,无 unwind 信息的函数处仍会终止。
+     * 工具检测到此场景会输出 WARNING 提示用户重建(见 reporter.c Phase 1.3)。 */
+    if (mtt_libunwind_available()) {
+        int n = mtt_libunwind_capture(entry->stack, MTT_STACK_DEPTH);
+        if (n >= 2) {
+            entry->stack_frames = n;
+            ctx->in_capture = saved;
+            return;
+        }
+        /* libunwind 拿到 0-1 帧:可能 libunwind 自身出问题或栈太浅,
+         * 落回 glibc backtrace 再试一次 */
+    }
+
 #if MTT_HAS_BACKTRACE
     entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
     if (entry->stack_frames < 0)
