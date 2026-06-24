@@ -63,6 +63,15 @@
 #define MTT_MAX_ENTRIES         65536   /* 分配追踪表最大条目数（同时是池子上限） */
 #define MTT_STACK_DEPTH         64      /* 调用栈最大深度（RPC 回调链 + 多层 .so 嵌套场景需要） */
 
+/* FP chain（帧指针链）兜底触发阈值：
+ *   - backtrace() 返回的帧数 < 此阈值时，启用 FP chain 补全
+ *   - 设为 4：经验值，典型 ARM32 -O2 -fomit-frame-pointer 二进制上
+ *     glibc backtrace 常返回 2-3 帧（含 mtt_capture_stack 自身），
+ *     此阈值确保 2 帧场景也能走 FP chain 兜底
+ *   - 设为 0 等同于禁用 FP chain（旧行为，仅 bt_frames==0 时触发）
+ *   - ARM64 上 bt_frames 通常 >> 4，FP chain 不触发，零开销 */
+#define MTT_FP_FALLBACK_THRESHOLD 4
+
 /* entry 池配置 */
 #define MTT_POOL_ENTRIES_DEFAULT 16384  /* 池子默认 entry 数（约 10MB，可被环境变量 MTT_POOL_ENTRIES 覆盖） */
 #define MTT_POOL_ENTRIES_MIN     1024   /* 池子最小 entry 数 */

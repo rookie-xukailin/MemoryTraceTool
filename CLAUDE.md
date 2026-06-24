@@ -103,6 +103,16 @@ docker build --platform linux/arm64 -f Dockerfile.hdm3-sim -t hdm3-sim:latest .
 
 heartbeat 文件 60s 覆盖写一次,字段:`ts/rss/pool/entries/cur_bytes/leaks/siteuniq/skipped`。
 
+## 栈回溯浅(ARM32 2-3 帧)排查
+
+若用户反馈泄漏点栈太浅无法定位,先看 README「栈回溯深度优化」章节。短路径:
+
+1. **首选**:让用户在目标工程 CFLAGS 加 `-funwind-tables -fno-omit-frame-pointer` 重建,95% 的浅栈问题立刻消失
+2. **次选**:确认工具侧已集成 libunwind(`MTT_UNWINDER=libunwind`,见 src/unwind_libunwind.c)
+3. **观测**:工具检测到 >20% 分配帧数 <4 时,会在 stderr 输出一次性 WARNING(即便 `MTT_DEBUG=0`)
+
+ARM32 Thumb-2 上 `__builtin_frame_address(0)` 返回 r7 而非 r11,{prev_fp,lr} 偏移随 prologue 变化,FP chain 兜底仅在 `bt_frames==0` 时启用且做了可执行段校验。根本性方案是 libunwind。
+
 ## 编码规范
 
 1. **每个函数都要有函数头（doxygen 风格 `/** ... */`）**，说明用途、参数、返回值

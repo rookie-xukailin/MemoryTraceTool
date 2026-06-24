@@ -29,6 +29,7 @@
 #include "time_series.h"
 #include "http_server.h"
 #include "per_thread.h"
+#include "addr_validate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -347,17 +348,23 @@ void mtt_capture_stack(mtt_entry_t *entry)
 
     /* FP chain 兜底:仅当 backtrace 完全失败(0 帧)时启用。
      *
-     * 崩溃根因(9f2e4ae 引入,本次修复):
-     *   原逻辑无条件运行 FP chain,在 -fomit-frame-pointer 编译的二进制上,
-     *   __builtin_frame_address(0) 返回 SP 而非真 FP,fp[0]/fp[1] 读栈垃圾
-     *   作为 prev_fp,跳到无效地址后下一轮 fp[0] 触发 SIGSEGV。
-     *   demo/test 因带 -fno-omit-frame-pointer 编译而不复现。
+     * 历史教训(9f2e4ae 引入后修复):
+     *   - 曾尝试 bt_frames<THRESHOLD 时也启用 FP chain,但 ARM32 Thumb-2 上
+     *     __builtin_frame_address(0) 返回 r7 而非 r11,{prev_fp,lr} 偏移随
+     *     prologue 变化,通用代码无法可靠读取 → 拿到 sl/r11 等垃圾值。
+     *   - 真正可靠的 ARM unwind 需要解析 .ARM.exidx + DWARF,这正是
+     *     libunwind 做的事(见 Phase 2 集成)。
+     *
+     * 当前限制:
+     *   仅 bt_frames==0 触发,用最保守的安全校验。2-3 帧场景由 libunwind
+     *   集成后接管,不再走 FP chain 兜底。
      *
      * 安全保证:
      *   1. 仅在 bt_frames == 0 时启动(backtrace 完全失败的兜底场景)
      *   2. prev_fp 必须严格大于 fp(ARM 栈向低地址增长,父帧地址更高)
      *   3. prev_fp - fp 不得超过 64KB(防止大跨度跳到未映射区)
-     *   4. 循环上限 MTT_STACK_DEPTH,避免无限循环 */
+     *   4. 每个 LR 必须落在可执行段(新增,addr_validate 提供)
+     *   5. 循环上限 MTT_STACK_DEPTH,避免无限循环 */
     if (bt_frames == 0) {
         void *fp_stack[MTT_STACK_DEPTH];
         int fp_count = 0;
@@ -367,6 +374,8 @@ void mtt_capture_stack(mtt_entry_t *entry)
             void *lr      = fp[1];
             if (lr == NULL) break;
             if (prev_fp == NULL) break;
+            /* LR 必须落在可执行段内,过滤栈垃圾误判 */
+            if (!mtt_addr_is_executable(MTT_FIX_THUMB_ADDR(lr))) break;
             /* 严格校验:父帧地址必须严格递增,且跨度 <= 64KB。
              * 防止无帧指针二进制上 prev_fp 为栈垃圾导致跳到无效地址。 */
             uintptr_t prev_addr = (uintptr_t)prev_fp;

@@ -16,6 +16,8 @@
 #include "time_series.h"
 #include "flamegraph.h"
 #include "http_server.h"
+#include "addr_validate.h"
+#include "mtt_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -280,6 +282,12 @@ static void scan_and_report_locked(void)
     time_t now = time(NULL);
     uint64_t entry_total_orig = atomic_load_explicit(&s->entry_count, memory_order_relaxed);
     uint64_t entry_total = entry_total_orig;
+
+    /* 刷新可执行段缓存:目标进程可能在两次扫描之间 dlopen 加载了新 .so，
+     * 新映射的 r-xp 段需进入缓存才能通过 mtt_addr_is_executable 校验，
+     * 让后续 mtt_capture_stack 的 FP chain 兜底能识别新 .so 中的返回地址。
+     * 频率：每次扫描（60s）一次，开销可忽略。 */
+    mtt_addr_validate_refresh();
 
     /* 诊断：记录每次扫描入口(MTT_DEBUG=0 时屏蔽) */
     {
@@ -932,6 +940,41 @@ cleanup:
             "[MTT] scan done: sites=%zu\n", site_count);
         if (dlen > 0 && dlen < (int)sizeof(dbuf))
             MTT_DIAG_LOG(dbuf, (size_t)dlen);
+    }
+
+    /* 浅栈比例监控:统计本次快照中 frame_count < 4 的比例,
+     * 超过 20% 且样本数 > 100 时一次性 stderr 警告。
+     * 触发场景:目标二进制 -O2 -fomit-frame-pointer 且无 -funwind-tables,
+     * glibc backtrace 拿不到完整栈,即使 FP chain 兜底也补不全。
+     * 警告只在首次满足条件时输出(g_shallow_warned 哨兵),
+     * 避免日志噪声。MTT_DEBUG=0 时也输出(WARNING 级,不受静默影响)。 */
+    if (snaps != NULL && snap_count > 100) {
+        size_t shallow = 0;
+        size_t total_with_stack = 0;
+        for (size_t i = 0; i < snap_count; i++) {
+            if (snaps[i].stack_frames > 0) {
+                total_with_stack++;
+                if (snaps[i].stack_frames < 4) shallow++;
+            }
+        }
+        /* 20% 阈值:shallow * 5 > total_with_stack 等价于 shallow/total > 20% */
+        if (total_with_stack > 100 && shallow * 5 > total_with_stack) {
+            static atomic_int g_shallow_warned = 0;
+            int expected = 0;
+            if (atomic_compare_exchange_strong_explicit(&g_shallow_warned,
+                    &expected, 1, memory_order_acq_rel, memory_order_acquire)) {
+                char wbuf[256];
+                int wlen = snprintf(wbuf, sizeof(wbuf),
+                    "[MTT] WARNING: %zu/%zu (%.0f%%) allocations have <4 frames. "
+                    "Backtrace likely truncated by -fomit-frame-pointer. "
+                    "Rebuild target with -funwind-tables -fno-omit-frame-pointer, "
+                    "or set MTT_UNWINDER=libunwind once libunwind integration lands.\n",
+                    shallow, total_with_stack,
+                    (double)shallow * 100.0 / (double)total_with_stack);
+                if (wlen > 0 && wlen < (int)sizeof(wbuf))
+                    MTT_DIAG_WRITE(STDERR_FILENO, wbuf, (size_t)wlen);
+            }
+        }
     }
     return;
 
