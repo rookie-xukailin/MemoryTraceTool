@@ -43,11 +43,16 @@ static _Atomic int g_first_free_diag    = 1;
 static _Atomic int g_first_calloc_diag  = 1;
 static _Atomic int g_first_realloc_diag = 1;
 
-/** 仅在首次调用时输出诊断（确认 hook 被调用） */
+/** 仅在首次调用时输出诊断（确认 hook 被调用，受 MTT_DEBUG 控制）。
+ * 直接读环境变量,不依赖 mtt_debug_enabled(后者在 init 阶段2 才设置,
+ * 而 first_call 通常在 init 之前触发)。 */
 static void first_call_diag(const char *func_name, _Atomic int *flag)
 {
     int expected = 1;
     if (atomic_compare_exchange_strong(flag, &expected, 0)) {
+        const char *env_debug = getenv("MTT_DEBUG");
+        if (env_debug != NULL && strcmp(env_debug, "0") == 0)
+            return;  /* MTT_DEBUG=0:静默,不输出 first call 诊断 */
         char buf[128] = {0};
         int len = snprintf(buf, sizeof(buf),
             "[MTT] hook: %s first call (pid=%d)\n", func_name, (int)getpid());
@@ -70,12 +75,6 @@ static inline int mtt_hook_enter(void)
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get();
     if (ctx == NULL) return -1; /* 降级：无槽位时保守视为递归 */
     if (ctx->depth_inited != 0x2A) {
-        char dbuf[80];
-        int dlen = snprintf(dbuf, sizeof(dbuf),
-            "[MTT] SENTINEL: depth=%d inited=%d tid=%d -> reset\n",
-            ctx->hook_depth, ctx->depth_inited, (int)syscall(SYS_gettid));
-        if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_WRITE(2, dbuf, (size_t)dlen);
         ctx->hook_depth = 0;
         ctx->depth_inited = 0x2A;
     }
@@ -115,15 +114,6 @@ static inline void mtt_hook_dec_depth(void)
  */
 void* malloc(size_t size)
 {
-    /* 最简诊断：直接用write(2)，无snprintf无变量，零失败可能 */
-    if (size <= 128) {
-        char m10[48];
-        int len = snprintf(m10, sizeof(m10),
-            "[MTT] M10 tid=%d\n", (int)syscall(SYS_gettid));
-        if (len > 0 && len < (int)sizeof(m10))
-            MTT_DIAG_WRITE(STDERR_FILENO, m10, (size_t)len);
-    }
-
     /* 首次调用诊断 */
     first_call_diag("malloc", &g_first_malloc_diag);
 
@@ -131,24 +121,9 @@ void* malloc(size_t size)
     {
         int depth = mtt_hook_enter();
         if (depth > 0) {
-            if (size <= 128) {
-                char dbuf[56];
-                int dlen = snprintf(dbuf, sizeof(dbuf),
-                    "[MTT] BYPASS:depth d=%d tid=%d\n",
-                    depth, (int)syscall(SYS_gettid));
-                if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                    MTT_DIAG_WRITE(2, dbuf, (size_t)dlen);
-            }
             mtt_resolve_raw_allocators();
             return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
         }
-    }
-    if (size <= 128) {
-        char m[48];
-        int len = snprintf(m, sizeof(m),
-            "[MTT] M10-ENTER tid=%d\n", (int)syscall(SYS_gettid));
-        if (len > 0 && len < (int)sizeof(m))
-            MTT_DIAG_WRITE(2, m, (size_t)len);
     }
     mtt_per_thread_t *ctx = mtt_thread_get();
     if (ctx == NULL) {
@@ -164,7 +139,6 @@ void* malloc(size_t size)
 
     /* 工具内部线程（reporter/HTTP）：直接透传，不追踪 */
     if (ctx->tool_internal) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:internal\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
@@ -172,7 +146,6 @@ void* malloc(size_t size)
     }
 
     if (raw_malloc == NULL) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:rawmalloc_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
         return NULL;
@@ -191,14 +164,12 @@ void* malloc(size_t size)
 
     /* 启动阶段宽限：跳过追踪，直接透传 */
     if (s != NULL && mtt_is_startup_phase(s)) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:startup\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
         return ret;
     }
     if (s == NULL) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:s_null\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
@@ -207,7 +178,6 @@ void* malloc(size_t size)
 
     /* 紧急禁用：直接透传 */
     if (atomic_load_explicit(&s->disabled, memory_order_acquire)) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:disabled\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
@@ -217,7 +187,6 @@ void* malloc(size_t size)
     /* 先分配用户内存 */
     void *ptr = raw_malloc(size);
     if (ptr == NULL) {
-        if (size <= 128) { static const char m[]="[MTT] BYPASS:malloc_fail\n"; MTT_DIAG_WRITE(2,m,sizeof(m)-1); }
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
         return NULL;
@@ -228,14 +197,6 @@ void* malloc(size_t size)
         int track_ok = mtt_should_track(s, size);
         int over_cap = mtt_is_over_capacity(s);
         if (!track_ok || over_cap) {
-            if (size <= 128) {
-                char dbuf[96];
-                int dlen = snprintf(dbuf, sizeof(dbuf),
-                    "[MTT] hook: malloc(%zu) SKIP track=%d overcap=%d\n",
-                    size, track_ok, over_cap);
-                if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                    MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
-            }
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
             return ptr;
@@ -245,69 +206,25 @@ void* malloc(size_t size)
     /* 创建追踪记录（内部使用 raw_malloc） */
     mtt_entry_t *e = mtt_entry_new(ptr, size);
     if (e == NULL) {
-        if (size <= 128) {
-            char dbuf[64];
-            int dlen = snprintf(dbuf, sizeof(dbuf),
-                "[MTT] hook: malloc(%zu) entry_new FAILED\n", size);
-            if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
-        }
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
         return ptr; /* 追踪失败不阻塞业务 */
     }
 
-    /* 诊断：小分配追踪成功 */
-    if (size <= 128) {
-        char dbuf[64];
-        int dlen = snprintf(dbuf, sizeof(dbuf),
-            "[MTT] hook: malloc(%zu) tracked, entry=%llu\n",
-            size, (unsigned long long)atomic_load_explicit(
-                &s->entry_count, memory_order_relaxed));
-        if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
-    }
-
     /* 持锁插入哈希表 + 原子更新计数器 */
     mtt_stripe_lock(s, ptr);
 
-    /* 锁内二次检查容量 + LRU 淘汰。
-     * 若已满，尝试淘汰最旧的条目为新分配腾出空间。 */
+    /* 锁内二次检查容量:已达上限则跳过追踪,用户分配已成功。
+     * 原 LRU 淘汰逻辑违反分段锁契约(只持 1/64 锁却遍历全部 4096 桶),
+     * 与其他线程的 free 路径竞争 entry->next 指针,可能 UAF 或双释放。
+     * 与 tracker.c:mtt_malloc 路径保持一致的简单跳过策略。 */
     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
-        /* 尝试淘汰 1 个条目：遍历桶表找到最旧的条目并移除 */
-        mtt_entry_t *oldest = NULL;
-        unsigned oldest_bucket = 0;
-        uint64_t oldest_seq = UINT64_MAX;
-        for (unsigned b = 0; b < (unsigned)s->bucket_count; b++) {
-            for (mtt_entry_t *cur = s->buckets[b]; cur != NULL; cur = cur->next) {
-                if (cur->alloc_num < oldest_seq) {
-                    oldest_seq = cur->alloc_num;
-                    oldest = cur;
-                    oldest_bucket = b;
-                }
-            }
-        }
-        if (oldest != NULL) {
-            /* 从链表中移除 oldest */
-            mtt_entry_t **prev = &s->buckets[oldest_bucket];
-            while (*prev != NULL && *prev != oldest)
-                prev = &(*prev)->next;
-            if (*prev == oldest) {
-                *prev = oldest->next;
-                atomic_fetch_sub_explicit(&s->current_bytes, oldest->size, memory_order_relaxed);
-                atomic_fetch_sub_explicit(&s->entry_count, 1, memory_order_relaxed);
-                atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
-                if (raw_free != NULL) raw_free(oldest);
-            }
-        } else {
-            /* 没有可淘汰的条目（极少情况） */
-            atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
-            mtt_stripe_unlock(s, ptr);
-            if (raw_free != NULL) raw_free(e);
+        atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
+        mtt_stripe_unlock(s, ptr);
+        if (raw_free != NULL) raw_free(e);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
-            return ptr;
-        }
+        return ptr;
     }
 
     e->alloc_num = atomic_fetch_add_explicit(&s->alloc_seq, 1, memory_order_relaxed) + 1;
@@ -350,6 +267,13 @@ void free(void *ptr)
     first_call_diag("free", &g_first_free_diag);
 
     if (ptr == NULL) return;
+
+    /* 池子范围检查：用户进程不应该 free 工具自身的 entry 池内存。
+     * 若误传进来，静默吞掉（不调 raw_free，避免破坏池子结构）。
+     * 真实业务 free 用户内存不会命中此条件，只在用户代码出错时触发。 */
+    if (mtt_pool_contains(ptr)) {
+        return;
+    }
 
     /* 递归保护：栈回溯检测 */
     if (mtt_hook_enter() > 0) {
@@ -403,16 +327,6 @@ void free(void *ptr)
     mtt_stripe_lock(s, ptr);
     mtt_entry_t *e = mtt_entry_find(s, ptr);
     if (e != NULL) {
-        /* 诊断：小分配被释放（关键路径） */
-        if (e->size <= 128) {
-            char dbuf[96];
-            int dlen = snprintf(dbuf, sizeof(dbuf),
-                "[MTT] FREE: size=%zu ptr=%p age=%lds tid=%d\n",
-                e->size, ptr, (long)(time(NULL) - e->timestamp),
-                (int)syscall(SYS_gettid));
-            if (dlen > 0 && dlen < (int)sizeof(dbuf))
-                MTT_DIAG_WRITE(STDERR_FILENO, dbuf, (size_t)dlen);
-        }
         if (e->size <= atomic_load_explicit(&s->current_bytes, memory_order_relaxed))
             atomic_fetch_sub_explicit(&s->current_bytes, e->size, memory_order_relaxed);
         else
@@ -561,14 +475,16 @@ void* realloc(void *ptr, size_t size)
     ctx->in_hook = saved_hook;
             return ret;
         }
-        /* 无 raw_realloc：malloc+memcpy+free 降级 */
+        /* 无 raw_realloc：malloc + free 模拟(不拷贝,避免越界读)。
+         * 旧 size 未知,若用 size 作为 memcpy 长度,新 size > 旧 size 时
+         * 会越界读 ptr 之后的堆数据。与 tracker.c:mtt_realloc 同路径保持一致。
+         * 此分支仅在初始化失败时走到,正常情况 raw_realloc 始终可用。 */
         void *new_ptr = raw_malloc(size);
         if (new_ptr == NULL) {
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
             return NULL;
         }
-        memcpy(new_ptr, ptr, size);
         if (raw_free != NULL) raw_free(ptr);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
@@ -734,33 +650,36 @@ void* realloc(void *ptr, size_t size)
 
 /**
  * LD_PRELOAD 拦截的 aligned_alloc (C11)。
- * 手动实现对齐逻辑，通过 raw_malloc 分配，绕过 hook 递归。
- */
+ * 优先用 raw_posix_memalign(若已解析),返回的指针可被 free() 正确释放
+ * (libc free 识别 libc 内部分配的内存,无需追踪表反向查找)。
+ *
+ * 历史:原实现用 raw_malloc + 手动对齐,返回非 chunk-header 起点的 aligned
+ * 指针,free(aligned) 会破坏堆。手动存原始指针到 ((void**)aligned)[-1]
+ * 也是死代码,free 没有反向查找逻辑。
+ *
+ * 注意:aligned_alloc 不进入追踪系统(直接走 raw_posix_memalign)。
+ * 嵌入式场景 aligned_alloc/posix_memalign 调用频率低,接受此折衷。 */
 void* aligned_alloc(size_t alignment, size_t size)
 {
     mtt_resolve_raw_allocators();
-    if (raw_malloc == NULL) return NULL;
 
-    /* 对齐必须为 2 的幂且 >= sizeof(void*) */
+    /* C11 要求 alignment 为 2 的幂且 size 是 alignment 的整数倍;
+     * POSIX/glibc 实现放宽了 size 的倍数要求,只要求 alignment 合法 */
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) return NULL;
     if (alignment < sizeof(void*)) alignment = sizeof(void*);
-    if ((alignment & (alignment - 1)) != 0) return NULL;
-    if (size == 0) size = 1;
-    /* 向上取整为 alignment 倍数 */
-    size = (size + alignment - 1) & ~(alignment - 1);
 
-    /* 多分配 alignment + sizeof(void*) 用于对齐和存储原始指针 */
-    size_t total = size + alignment + sizeof(void*);
-    char *raw = (char*)raw_malloc(total);
-    if (raw == NULL) return NULL;
+    if (raw_posix_memalign != NULL) {
+        void *p = NULL;
+        if (raw_posix_memalign(&p, alignment, size ? size : 1) != 0)
+            return NULL;
+        return p;
+    }
 
-    /* 对齐到 alignment 边界，保留空间存原始指针 */
-    uintptr_t addr = (uintptr_t)(raw + sizeof(void*));
-    addr = (addr + alignment - 1) & ~((uintptr_t)(alignment - 1));
-    void *aligned = (void*)addr;
-    /* 在对齐指针前存储原始 raw 指针，供 aligned_free 使用 */
-    ((void**)aligned)[-1] = raw;
-
-    return aligned;
+    /* raw_posix_memalign 不可用:回退到 raw_malloc。
+     * glibc malloc 默认 16 字节对齐,alignment <= 16 时满足要求;
+     * alignment > 16 时对齐保证被牺牲,但不做手动对齐(否则 free 崩)。 */
+    if (raw_malloc == NULL) return NULL;
+    return raw_malloc(size ? size : 1);
 }
 
 /** LD_PRELOAD 拦截的 posix_memalign (POSIX) */

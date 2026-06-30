@@ -87,6 +87,8 @@ flamegraph.pl /var/log/mtt/<pid>_<name>.folded > flame.svg
 | `MTT_LEAK_THRESHOLD_SEC` | 300 | 存活超过此秒数 → probable leak |
 | `MTT_SKIP_STARTUP_SEC` | 0 | 进程启动后跳过 N 秒不追踪 |
 | `MTT_LIB_BLACKLIST` | 无 | 逗号分隔的库黑名单（如 `libc.so,libfoo.so`） |
+| `MTT_POOL_ENTRIES` | 16384 | 工具自身 entry 池容量（控制预占用内存，[1024, 65536]，约 600B/entry） |
+| `MTT_DEBUG` | 1 | 诊断日志开关（0=静默,屏蔽所有 stderr 诊断,只保留 leak 报告 + heartbeat） |
 
 ## 借鉴的成熟方案
 
@@ -217,6 +219,39 @@ LD_PRELOAD=/tmp/libmemorytracetool.so MTT_HTTP_PORT=8080 ./your_daemon
 - `/proc/self/exe` 不可用时进程名显示 "unknown"（回退到 `prctl(PR_GET_NAME)`）
 - `time_t` 在 ARM32 上为 4 字节（2038 年问题）
 - 运行时注入依赖 GDB（目标需有 gdb/gdbserver）
+
+## 栈回溯深度优化（重要）
+
+若你发现泄漏点的栈回溯只有 2-3 帧、无法定位业务调用方，**99% 是目标二进制的编译选项导致**。按效力排序的解决方案：
+
+### 方案 A（最有效，零工具侧改动）：重建目标二进制
+
+在目标工程的 CFLAGS / LDFLAGS 加上：
+```makefile
+CFLAGS += -funwind-tables -fno-omit-frame-pointer
+```
+
+- `-funwind-tables`：强制为每个函数生成 `.ARM.exidx` unwind 表，glibc `backtrace()` 由此能完整回溯
+- `-fno-omit-frame-pointer`：保留帧指针链作为兜底
+- 体积开销：典型 `.text` 增大 <2%，对 release 二进制几乎无感
+
+### 方案 B（工具侧，无需重建目标）：等 libunwind 集成
+
+工具内嵌 libunwind 后，自动多策略 unwind（`.ARM.exidx` → DWARF → FP chain → stack scan），可在 `-fomit-frame-pointer` 二进制上拿到完整栈。`MTT_UNWINDER=libunwind|backtrace|auto` 环境变量切换。
+
+### 方案 C（运行时观测）：浅栈警告
+
+工具在扫描时若发现 >20% 分配的栈回溯少于 4 帧，会一次性输出 stderr 警告：
+```
+[MTT] WARNING: 120/150 (80%) allocations have <4 frames.
+       Rebuild target with -funwind-tables -fno-omit-frame-pointer,
+       or set MTT_UNWINDER=libunwind once libunwind integration lands.
+```
+即便 `MTT_DEBUG=0` 静默模式也会输出（属于关键诊断信息）。
+
+### 为什么 ARM32 容易出现浅栈
+
+ARM EABI 的 `glibc backtrace()` 依赖 `.ARM.exidx` 段，遇到标记 `CANTUNWIND` 的条目立即终止。`-O2 -fomit-frame-pointer` 配合下，叶子函数常无栈帧、尾调用覆盖 LR、静态函数被内联，三者叠加导致 unwind 表不完整 → 2-3 帧就被截断。ARM64 上 `glibc backtrace()` 用 DWARF，对此类优化更鲁棒。
 
 ## 清理
 

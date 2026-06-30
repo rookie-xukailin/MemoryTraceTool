@@ -1,0 +1,36 @@
+# HDM3 build 环境模拟
+# Host: Ubuntu 24.04 ARM64 (匹配 Colima arch)
+# ARM32: gcc-13-arm-linux-gnueabi cross toolchain (soft-float, 匹配 HDM3)
+# ARM64: native gcc (host 就是 ARM64,直接编)
+# Run ARM32 binary: qemu-arm-static + ARM32 sysroot
+FROM arm64v8/ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    gcc-13-arm-linux-gnueabi \
+    g++-13-arm-linux-gnueabi \
+    binutils-arm-linux-gnueabi \
+    qemu-user-static \
+    qemu-user \
+    make \
+    file \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# 创建无版本号 symlink: arm-linux-gnueabi-gcc-13 → arm-linux-gnueabi-gcc
+RUN for tool in gcc g++ cpp gcc-ar gcc-nm gcc-ranlib; do \
+        if [ -f "/usr/bin/arm-linux-gnueabi-${tool}-13" ] && [ ! -e "/usr/bin/arm-linux-gnueabi-${tool}" ]; then \
+            ln -s "arm-linux-gnueabi-${tool}-13" "/usr/bin/arm-linux-gnueabi-${tool}"; \
+        fi; \
+    done
+
+# 验证
+RUN echo "=== Native ARM64 gcc ===" && gcc --version | head -1 && \
+    echo "=== ARM32 cross gcc ===" && arm-linux-gnueabi-gcc --version | head -1 && \
+    echo "=== qemu-arm-static ===" && qemu-arm-static --version | head -1 && \
+    echo "=== ARM32 sysroot ===" && ls /usr/arm-linux-gnueabi/lib/libc.so.6
+
+WORKDIR /work

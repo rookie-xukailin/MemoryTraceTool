@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <poll.h>
 
 /** HTTP 服务器单例 */
 static mtt_http_server_t g_http_server = {0};
@@ -69,6 +70,7 @@ static const char g_dashboard_html[] =
 ".refresh{font-size:.75rem;color:#6e7681;float:right}\n"
 ".toggle-btn{font-size:.75rem;padding:4px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg2);color:var(--text);cursor:pointer;margin-right:6px}\n"
 ".toggle-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}\n"
+".toggle-btn:disabled{opacity:.4;cursor:not-allowed}\n"
 ".stop-btn{font-size:.75rem;padding:4px 10px;border:1px solid var(--warn);border-radius:4px;background:var(--bg2);color:var(--warn);cursor:pointer}\n"
 "</style>\n"
 "</head>\n"
@@ -83,16 +85,22 @@ static const char g_dashboard_html[] =
 "  <div class=\"tooltip\" id=\"tip\"></div>\n"
 "</div>\n"
 "<div class=\"card\">\n"
-"  <h2>泄漏站点排行（按占用大小降序）</h2>\n"
+"  <h2>泄漏站点排行（按泄漏次数降序）</h2>\n"
 "  <table>\n"
 "    <thead><tr><th>#</th><th>次数</th><th>单次</th><th>总占用</th><th>置信度</th><th>首次</th><th>最后</th></tr></thead>\n"
 "    <tbody id=\"leaks-tbody\"></tbody>\n"
 "  </table>\n"
+"  <div style=\"margin-top:12px;text-align:center;font-size:.85rem;color:#6e7681\">\n"
+"    <button class=\"toggle-btn\" id=\"prevPageBtn\" onclick=\"changePage(-1)\">上一页</button>\n"
+"    <span id=\"pageInfo\" style=\"margin:0 12px\"></span>\n"
+"    <button class=\"toggle-btn\" id=\"nextPageBtn\" onclick=\"changePage(1)\">下一页</button>\n"
+"  </div>\n"
 "</div>\n"
 "</div>\n"
 "<script>\n"
 "var data=null,chartCanvas=document.getElementById('chart'),ctx=chartCanvas.getContext('2d'),tip=document.getElementById('tip');\n"
 "var expandedHashes=new Set(); /* 记录展开的泄漏站点 hash，刷新后恢复 */\n"
+"var curPage=1, PAGE_SIZE=50, allLeaks=[];\n"
 "function fb(b){if(b==null)return'0 B';if(b>=1048576)return(b/1048576).toFixed(2)+' MB';if(b>=1024)return(b/1024).toFixed(2)+' KB';return b+' B'}\n"
 "function ft(t){if(!t||t<=0)return'N/A';return new Date(t*1000).toLocaleTimeString()}\n"
 "function draw(){\n"
@@ -139,23 +147,47 @@ static const char g_dashboard_html[] =
 "}\n"
 "function renderStats(st){\n"
 "  var s=st||{};\n"
+"  var p=(window.__lastData&&window.__lastData.pool)||{};\n"
+"  var modeText = p.mode===1 ? 'POOL' : (p.mode===2 ? 'FALLBACK' : 'N/A');\n"
+"  var modeColor = p.mode===1 ? '#3fb950' : (p.mode===2 ? '#f85149' : '#6e7681');\n"
+"  var poolHtml='';\n"
+"  if(p.mode===1){\n"
+"    var pct = p.bytes_total>0 ? Math.round(p.bytes_used*100/p.bytes_total) : 0;\n"
+"    var barColor = pct<60 ? '#3fb950' : (pct<85 ? '#d29922' : '#f85149');\n"
+"    poolHtml='<div class=\"val\">'+fb(p.bytes_used||0)+' / '+fb(p.bytes_total||0)+'</div>'+\n"
+"      '<div class=\"lbl\">工具内存池 <span style=\"color:'+modeColor+';font-weight:bold\">['+modeText+']</span></div>'+\n"
+"      '<div style=\"margin-top:4px;height:6px;background:#21262d;border-radius:3px;overflow:hidden\"><div style=\"width:'+pct+'%;height:100%;background:'+barColor+'\"></div></div>'+\n"
+"      '<div style=\"margin-top:2px;font-size:11px;color:#6e7681\">'+pct+'% | '+(p.used||0).toLocaleString()+' / '+(p.capacity||0).toLocaleString()+' entries</div>';\n"
+"  } else if(p.mode===2){\n"
+"    poolHtml='<div class=\"val\" style=\"color:'+modeColor+'\">降级模式</div>'+\n"
+"      '<div class=\"lbl\">工具内存池 <span style=\"color:'+modeColor+';font-weight:bold\">['+modeText+']</span></div>'+\n"
+"      '<div style=\"margin-top:4px;font-size:11px;color:#6e7681\">池子申请失败,按需 raw_malloc</div>';\n"
+"  } else {\n"
+"    poolHtml='<div class=\"val\">-</div><div class=\"lbl\">工具内存池</div>';\n"
+"  }\n"
 "  document.getElementById('stats').innerHTML=\n"
 "    '<div class=\"stat\"><div class=\"val\">'+fb(s.current_bytes||0)+'</div><div class=\"lbl\">当前未释放</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+fb(s.peak_bytes||0)+'</div><div class=\"lbl\">历史峰值</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+(s.alloc_count||0).toLocaleString()+'</div><div class=\"lbl\">累计分配</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+(s.free_count||0).toLocaleString()+'</div><div class=\"lbl\">累计释放</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+(s.leak_count||0).toLocaleString()+'</div><div class=\"lbl\">疑似泄漏</div></div>'+\n"
-"    '<div class=\"stat\"><div class=\"val\">'+fb(s.total_allocated||0)+'</div><div class=\"lbl\">累计分配总量</div></div>';\n"
+"    '<div class=\"stat\"><div class=\"val\">'+fb(s.total_allocated||0)+'</div><div class=\"lbl\">累计分配总量</div></div>'+\n"
+"    '<div class=\"stat\">'+poolHtml+'</div>';\n"
 "}\n"
 "function alCmd(frame){var m1=frame.match(/\\((.+)\\)$/);var m2=frame.match(/\\+(0x[0-9a-fA-F]+)/);if(m1&&m2)return'addr2line -e '+m1[1]+' -f -C '+m2[1];return''}\n"
 "function renderLeaks(leaks){\n"
+"  allLeaks=leaks||[];\n"
+"  var total=Math.ceil(allLeaks.length/PAGE_SIZE)||1;\n"
+"  if(curPage>total)curPage=total;\n"
+"  if(curPage<1)curPage=1;\n"
 "  var tbody=document.getElementById('leaks-tbody');\n"
-"  if(!leaks||leaks.length===0){tbody.innerHTML='<tr><td colspan=\"7\" style=\"text-align:center;color:#6e7681\">暂无泄漏数据</td></tr>';return}\n"
+"  if(!allLeaks.length){tbody.innerHTML='<tr><td colspan=\"7\" style=\"text-align:center;color:#6e7681\">暂无泄漏数据</td></tr>';document.getElementById('pageInfo').textContent='';document.getElementById('prevPageBtn').disabled=document.getElementById('nextPageBtn').disabled=true;return}\n"
+"  var startIdx=(curPage-1)*PAGE_SIZE, endIdx=Math.min(startIdx+PAGE_SIZE, allLeaks.length);\n"
 "  var rows='';\n"
-"  for(var i=0;i<leaks.length;i++){\n"
-"    var l=leaks[i],h=l.hash||'',conf=l.is_expired?'probable leak':'possible leak';\n"
+"  for(var i=startIdx;i<endIdx;i++){\n"
+"    var l=allLeaks[i],h=l.hash||'',conf=l.is_expired?'probable leak':'possible leak';\n"
 "    var diff=l.diff_size>0?' class=\"diff-high\"':'';\n"
-"    rows+='<tr class=\"leak-row\"'+diff+' onclick=\"(function(){var s=document.getElementById(\\'s'+i+'\\');var opened=s.classList.toggle(\\'open\\');var h=\\''+h+'\\';if(opened)expandedHashes.add(h);else expandedHashes.delete(h);})()\">'+\n"
+"    rows+='<tr class=\"leak-row\"'+diff+' onclick=\"(function(){var s=document.getElementById(\\'s'+i+'\\');if(!s)return;var opened=s.classList.toggle(\\'open\\');var h=\\''+h+'\\';if(opened)expandedHashes.add(h);else expandedHashes.delete(h);})()\">'+\n"
 "      '<td>'+(i+1)+'</td><td>'+l.count.toLocaleString()+'</td>'+\n"
 "      '<td>'+fb(l.per_leak_size)+'</td><td><b>'+fb(l.total_size)+'</b></td>'+\n"
 "      '<td>'+conf+'</td><td>'+ft(l.first_seen)+'</td><td>'+ft(l.last_seen)+'</td></tr>';\n"
@@ -167,18 +199,25 @@ static const char g_dashboard_html[] =
 "        if(cmd)rows+='<div class=\"cmd\">'+cmd+'</div>';\n"
 "      }\n"
 "      rows+='</td></tr>';\n"
+"    } else {\n"
+"      rows+='<tr class=\"stack-row\" id=\"s'+i+'\"><td colspan=\"7\" class=\"stack-cell\"><div style=\"color:#6e7681\">未捕获栈回溯 — hash='+h+' size='+l.per_leak_size+'B count='+l.count+(l.is_expired?' (probable leak)':'')+'</div></td></tr>';\n"
 "    }\n"
 "  }\n"
 "  tbody.innerHTML=rows;\n"
+"  /* 分页控件 */\n"
+"  document.getElementById('pageInfo').textContent='第 '+curPage+' / '+total+' 页 (共 '+allLeaks.length+' 条,当前 '+(endIdx-startIdx)+' 条)';\n"
+"  document.getElementById('prevPageBtn').disabled=(curPage<=1);\n"
+"  document.getElementById('nextPageBtn').disabled=(curPage>=total);\n"
 "  /* 恢复展开状态 */\n"
 "  var newHashes=new Set();\n"
-"  for(var i=0;i<leaks.length;i++){var lh=leaks[i].hash||'';if(expandedHashes.has(lh)){var sr=document.getElementById('s'+i);if(sr){sr.classList.add('open');newHashes.add(lh);}}}\n"
-"  expandedHashes=newHashes; /* 清理已不存在的泄漏项 */\n"
+"  for(var i=startIdx;i<endIdx;i++){var lh=allLeaks[i].hash||'';if(expandedHashes.has(lh)){var sr=document.getElementById('s'+i);if(sr){sr.classList.add('open');newHashes.add(lh);}}}\n"
+"  expandedHashes=newHashes;\n"
 "}\n"
+"function changePage(delta){var total=Math.ceil(allLeaks.length/PAGE_SIZE)||1;var np=curPage+delta;if(np<1||np>total)return;curPage=np;renderLeaks(allLeaks);}\n"
 "function refresh(){\n"
 "  document.getElementById('refreshLabel').textContent='刷新中...';\n"
 "  fetch('/api/data').then(function(r){return r.json()}).then(function(d){\n"
-"    data=d;\n"
+"    data=d;window.__lastData=d;\n"
 "    document.getElementById('info').textContent='PID: '+d.pid+' | '+d.proc_name+' | 会话: '+ft(d.session_start)+' | 上次扫描: '+ft(d.last_scan);\n"
 "    renderStats(d.stats);draw();renderLeaks(d.leaks);\n"
 "    document.getElementById('refreshLabel').textContent='已刷新 — '+new Date().toLocaleTimeString();\n"
@@ -302,33 +341,55 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
         }
     }
 
-    /* 兜底：当所有已解析帧均被内部帧过滤器拦截时（常见于
-     * pthread_create 等初始化阶段的工具内部分配），回退为输出
-     * 已解析的符号字符串（不过滤），确保 ARM32 QEMU 等环境下
-     * 第二泄漏站点不会只显示原始 hex 地址，提升诊断可读性。
-     * 仅跳过第 0 帧（mtt_capture_stack），保留其余所有帧的符号。 */
+    /* 兜底：当所有已解析帧均被内部帧过滤器拦截时，回退输出不过滤的帧。
+     * 同样跳过内部帧（mtt_/libmemorytracetool/capture_stack/backtrace），
+     * 避免工具内部函数出现在页面。未解析帧降级为 hex 地址。 */
     if (!wrote_frame && se != NULL && se->frame_count > 0) {
         for (int j = 0; j < se->frame_count; j++) {
             if (j == 0) continue; /* 跳过 mtt_capture_stack 自身 */
-
-            if (wrote_frame) {
-                MTT_DIAG_WRITE(fd, ",", 1);
-            }
-            wrote_frame = 1;
-
             const char *fallback_sym = se->resolved[j];
-            if (fallback_sym == NULL || fallback_sym[0] == '\0') {
-                /* 符号未解析时才降级为 hex 地址 */
-                off = snprintf(buf, sizeof(buf), "\"0x%lx\"",
-                               (unsigned long)(uintptr_t)se->frames[j]);
-                if (off < 0) off = 0;
-                else if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
-                MTT_DIAG_WRITE(fd, buf, (size_t)off);
-            } else {
-                /* 输出已解析符号（不过滤内部帧，与主循环保持一致
-                 * 的 JSON 转义逻辑，处理 \" \\ 和控制字符） */
-                MTT_DIAG_WRITE(fd, "\"", 1);
-                for (const char *p = fallback_sym; *p != '\0'; p++) {
+            /* 过滤内部帧和未解析帧 */
+            if (fallback_sym == NULL || fallback_sym[0] == '\0'
+                || strstr(fallback_sym, "libmemorytracetool") != NULL
+                || strstr(fallback_sym, "mtt_") == fallback_sym
+                || strstr(fallback_sym, "capture_stack") != NULL
+                || strstr(fallback_sym, "backtrace") != NULL)
+                continue;
+            if (wrote_frame) MTT_DIAG_WRITE(fd, ",", 1);
+            wrote_frame = 1;
+            /* 输出已解析符号，JSON 转义 */
+            MTT_DIAG_WRITE(fd, "\"", 1);
+            for (const char *p = fallback_sym; *p != '\0'; p++) {
+                unsigned char c = (unsigned char)*p;
+                if (c == '"' || c == '\\') {
+                    MTT_DIAG_WRITE(fd, "\\", 1);
+                    MTT_DIAG_WRITE(fd, p, 1);
+                } else if (c < 0x20) {
+                    char esc[8];
+                    int n = snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)c);
+                    if (n > 0) MTT_DIAG_WRITE(fd, esc, (size_t)n);
+                } else {
+                    MTT_DIAG_WRITE(fd, p, 1);
+                }
+            }
+            MTT_DIAG_WRITE(fd, "\"", 1);
+        }
+    }
+
+    /* 第三级兜底：业务栈完全未捕获，所有帧都是工具内部（mtt_entry_new /
+     * malloc hook 等）。常发生于 ARM32 -fomit-frame-pointer 路径上
+     * backtrace 无法 unwind 业务调用栈，只剩工具自身调用链。
+     * 此时输出全部未过滤帧，加 [INT] 前缀让用户识别为工具内部栈，
+     * 至少能定位 hook 路径，避免页面显示空栈导致 onclick 无响应。
+     * 注意：栈顶 j=0（mtt_capture_stack）始终跳过，无诊断价值。 */
+    if (!wrote_frame && se != NULL && se->frame_count > 1) {
+        for (int j = 1; j < se->frame_count; j++) {
+            const char *raw_sym = se->resolved[j];
+            if (wrote_frame) MTT_DIAG_WRITE(fd, ",", 1);
+            wrote_frame = 1;
+            MTT_DIAG_WRITE(fd, "\"[INT] ", 7);
+            if (raw_sym != NULL && raw_sym[0] != '\0') {
+                for (const char *p = raw_sym; *p != '\0'; p++) {
                     unsigned char c = (unsigned char)*p;
                     if (c == '"' || c == '\\') {
                         MTT_DIAG_WRITE(fd, "\\", 1);
@@ -341,8 +402,14 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
                         MTT_DIAG_WRITE(fd, p, 1);
                     }
                 }
-                MTT_DIAG_WRITE(fd, "\"", 1);
+            } else {
+                off = snprintf(buf, sizeof(buf), "0x%lx",
+                               (unsigned long)(uintptr_t)se->frames[j]);
+                if (off < 0) off = 0;
+                else if (off >= (int)sizeof(buf)) off = (int)sizeof(buf) - 1;
+                MTT_DIAG_WRITE(fd, buf, (size_t)off);
             }
+            MTT_DIAG_WRITE(fd, "\"", 1);
         }
     }
 
@@ -369,6 +436,13 @@ static void handle_api_data(int client_fd)
     size_t frees      = (s != NULL) ? atomic_load_explicit(&s->free_count, memory_order_relaxed) : 0;
     size_t total_alloc = (s != NULL) ? atomic_load_explicit(&s->total_bytes, memory_order_relaxed) : 0;
     size_t leak_count = (allocs > frees) ? (allocs - frees) : 0;
+
+    /* entry 池指标（工具自身内存占用可视化） */
+    size_t pool_used      = (s != NULL) ? atomic_load_explicit(&s->pool_used, memory_order_relaxed) : 0;
+    size_t pool_capacity  = (s != NULL) ? s->pool_capacity : 0;
+    size_t pool_bytes_total = (s != NULL) ? s->pool_raw_size : 0;
+    size_t pool_bytes_used  = pool_used * sizeof(mtt_entry_t);
+    int    pool_mode      = (s != NULL) ? atomic_load_explicit(&s->pool_mode, memory_order_relaxed) : MTT_POOL_MODE_NONE;
     /* 读取当前 RSS（近似值）。
      * fopen/fclose 内部触发 libc malloc，设 in_hook 防止被追踪为虚假泄漏。 */
     size_t rss_bytes = 0;
@@ -404,9 +478,11 @@ static void handle_api_data(int client_fd)
     len = snprintf(buf, sizeof(buf),
         ",\"session_start\":%lld,\"last_scan\":%lld,"
         "\"stats\":{\"current_bytes\":%zu,\"peak_bytes\":%zu,\"alloc_count\":%zu,"
-        "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu,\"rss_bytes\":%zu}",
+        "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu,\"rss_bytes\":%zu},"
+        "\"pool\":{\"used\":%zu,\"capacity\":%zu,\"bytes_used\":%zu,\"bytes_total\":%zu,\"mode\":%d}",
         (long long)session_ts, (long long)time(NULL),
-        cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc, rss_bytes);
+        cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc, rss_bytes,
+        pool_used, pool_capacity, pool_bytes_used, pool_bytes_total, pool_mode);
     if (len < 0) len = 0;
     else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
     MTT_DIAG_WRITE(client_fd, buf, (size_t)len);
@@ -439,14 +515,12 @@ static void handle_api_data(int client_fd)
     }
     MTT_DIAG_WRITE(client_fd, "]", 1);
 
-    /* 泄漏站点 */
+    /* 泄漏站点 — 返回全量(前端做分页,每页 50) */
     MTT_DIAG_WRITE(client_fd, ",\"leaks\":[", 10);
     pthread_mutex_lock(&rep->cache_lock);
     if (rep->cached_sites != NULL && rep->cached_site_count > 0) {
-        size_t show = rep->cached_site_count;
-        if (show > 50) show = 50;
         int wrote_leak = 0;
-        for (size_t i = 0; i < show; i++) {
+        for (size_t i = 0; i < rep->cached_site_count; i++) {
             if (rep->cached_sites[i] == NULL) continue;
             if (wrote_leak) MTT_DIAG_WRITE(client_fd, ",", 1);
             wrote_leak = 1;
@@ -538,21 +612,27 @@ static void* http_thread_fn(void *arg)
     (void)arg;
     pthread_detach(pthread_self());
 
+    /* 标记为工具内部线程:本线程的 malloc/free 都透传不追踪 */
+    mtt_per_thread_t *ctx = mtt_thread_get();
+    if (ctx != NULL) ctx->tool_internal = 1;
+
     static char req_buf[MTT_HTTP_BUF_SIZE];
     static char path[MTT_HTTP_MAX_PATH];
 
     while (atomic_load_explicit(&g_http_server.running, memory_order_acquire)) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(g_http_server.listen_fd, &rfds);
-        struct timeval tv = {1, 0};
-        int ready = select(g_http_server.listen_fd + 1, &rfds, NULL, NULL, &tv);
+        /* 用 poll 替代 select:无 FD_SETSIZE 上限,glibc _FORTIFY_SOURCE 不会
+         * 因 fd_set 越界 abort。某些 LD_PRELOAD 场景下 select 会触发
+         * "bit out of range 0 - FD_SETSIZE" 误报,poll 完全规避。 */
+        struct pollfd pfd;
+        pfd.fd = g_http_server.listen_fd;
+        pfd.events = POLLIN;
+        int ready = poll(&pfd, 1, 1000); /* 1 秒超时 */
         if (ready < 0) {
             if (errno == EINTR || errno == EAGAIN) continue;
             break;
         }
         if (ready == 0) continue;
-        if (!FD_ISSET(g_http_server.listen_fd, &rfds)) continue;
+        if (!(pfd.revents & POLLIN)) continue;
 
         struct sockaddr_in client_addr;
         socklen_t addr_len = sizeof(client_addr);
@@ -645,7 +725,7 @@ void mtt_http_server_start(uint16_t port)
     char diag[128];
     int len = snprintf(diag, sizeof(diag), "[MTT] HTTP dashboard: http://0.0.0.0:%u/\n", (unsigned)port);
     if (len > 0 && len < (int)sizeof(diag))
-        MTT_DIAG_WRITE(STDERR_FILENO, diag, (size_t)len);
+        MTT_DIAG_LOG(diag, (size_t)len);
 }
 
 void mtt_http_server_stop(void)

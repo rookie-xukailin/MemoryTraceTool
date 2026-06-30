@@ -60,8 +60,27 @@
  * ======================================================================== */
 
 #define MTT_BUCKETS             4096    /* 哈希桶数量（必须为 2 的幂，用于位掩码取模） */
-#define MTT_MAX_ENTRIES         65536   /* 分配追踪表最大条目数 */
-#define MTT_STACK_DEPTH         32      /* 调用栈最大深度（满足闭源库穿透场景） */
+#define MTT_MAX_ENTRIES         65536   /* 分配追踪表最大条目数（同时是池子上限） */
+#define MTT_STACK_DEPTH         64      /* 调用栈最大深度（RPC 回调链 + 多层 .so 嵌套场景需要） */
+
+/* FP chain（帧指针链）兜底触发阈值：
+ *   - backtrace() 返回的帧数 < 此阈值时，启用 FP chain 补全
+ *   - 设为 4：经验值，典型 ARM32 -O2 -fomit-frame-pointer 二进制上
+ *     glibc backtrace 常返回 2-3 帧（含 mtt_capture_stack 自身），
+ *     此阈值确保 2 帧场景也能走 FP chain 兜底
+ *   - 设为 0 等同于禁用 FP chain（旧行为，仅 bt_frames==0 时触发）
+ *   - ARM64 上 bt_frames 通常 >> 4，FP chain 不触发，零开销 */
+#define MTT_FP_FALLBACK_THRESHOLD 4
+
+/* entry 池配置 */
+#define MTT_POOL_ENTRIES_DEFAULT 16384  /* 池子默认 entry 数（约 10MB，可被环境变量 MTT_POOL_ENTRIES 覆盖） */
+#define MTT_POOL_ENTRIES_MIN     1024   /* 池子最小 entry 数 */
+#define MTT_POOL_ENTRIES_MAX     65536  /* 池子最大 entry 数（与 MTT_MAX_ENTRIES 一致，避免改 hash 硬上限） */
+
+/* 池子模式标识（atomic_int 存储于 mtt_state_t.pool_mode） */
+#define MTT_POOL_MODE_NONE       0      /* 尚未初始化 */
+#define MTT_POOL_MODE_ACTIVE     1      /* 池子模式：entry 从预申请大块内存复用 */
+#define MTT_POOL_MODE_FALLBACK   2      /* 降级模式：池子申请失败，退回旧 raw_malloc 单条申请 */
 #define MTT_STACK_CACHE_SIZE    4096    /* 栈帧缓存最大条目（去重后） */
 #define MTT_LEAK_DEDUP_SIZE     2048    /* 泄漏去重表最大条目（报告输出上限） */
 #define MTT_SYMBOL_MAX          256     /* 单帧符号字符串最大长度 */
@@ -88,6 +107,15 @@
 /* SIGUSR1 信号触发即时报告 */
 #define MTT_SIGNAL_REPORT       SIGUSR1 /* 触发即时报告的信号 */
 
+/* 诊断日志开关（MTT_DEBUG=1 开, =0 关）。
+ * 默认打开; 关闭后只保留泄漏报告写到 /var/log/mtt 下、
+ * 60s heartbeat 写到 /var/log/mtt/下 <pid>_heartbeat.log、HTTP API、SIGUSR1 即时报告。
+ * 所有 stderr 诊断(init 状态/scan 进度/heartbeat/线程启动)都被屏蔽。 */
+#define MTT_DEBUG_DEFAULT       1
+
+/* 60s heartbeat 资源监控输出文件 */
+#define MTT_HEARTBEAT_DIR       "/var/log/mtt"
+
 /* 泄漏判定相关常量 */
 #define MTT_LEAK_THRESHOLD_DEFAULT 300  /* 默认泄漏阈值（秒）：存活超过此值→probable leak */
 #define MTT_SKIP_STARTUP_DEFAULT    0   /* 默认不跳过启动阶段 */
@@ -112,6 +140,7 @@ typedef void* (*raw_malloc_fn)(size_t);
 typedef void  (*raw_free_fn)(void*);
 typedef void* (*raw_calloc_fn)(size_t, size_t);
 typedef void* (*raw_realloc_fn)(void*, size_t);
+typedef int   (*raw_posix_memalign_fn)(void**, size_t, size_t);
 
 /* 全局原始分配器指针（在 tracker.c 中定义）。
  * volatile 限定符：防止编译器将跨函数调用的读取优化为寄存器缓存，
@@ -121,6 +150,7 @@ extern raw_malloc_fn  volatile raw_malloc;
 extern raw_free_fn    volatile raw_free;
 extern raw_calloc_fn  volatile raw_calloc;
 extern raw_realloc_fn volatile raw_realloc;
+extern raw_posix_memalign_fn volatile raw_posix_memalign;
 
 /* 每线程上下文：替代 __thread，通过 TID 索引槽位数组管理。
  * 见 src/per_thread.h — mtt_thread_get() 获取当前线程上下文 */
@@ -181,6 +211,20 @@ typedef struct {
     unsigned            bucket_count;                   /* 桶数量（= MTT_BUCKETS） */
     mtt_aligned_mutex_t bucket_locks[MTT_LOCK_STRIPES]; /* 分段锁数组（缓存行对齐） */
     uint64_t            hash_seed;                      /* 哈希随机种子（启动时生成，64-bit） */
+
+    /* entry 池：启动时一次性申请的大块内存，所有 entry 复用槽位。
+     * 设计目标：减少 libc malloc/free 调用频次，工具自身内存占用可视化。
+     * 关键不变量：池子在用数 == entry_count == 桶链表总节点数；
+     *            free list 长度 == pool_capacity - pool_used。
+     * entry->next 在桶链表里指向同桶下一个；在 free list 里指向下一个空闲
+     * （同一时刻 entry 只在其中一个链中，语义复用安全）。 */
+    mtt_entry_t        *pool;                           /* 池子起始地址（raw_malloc 大块） */
+    mtt_entry_t        *pool_free_list;                 /* 空闲 entry 链头（用 entry->next 串） */
+    pthread_mutex_t     pool_lock;                      /* free list 操作互斥锁 */
+    size_t              pool_capacity;                  /* 池子总 entry 数（启动时确定） */
+    size_t              pool_raw_size;                  /* 池子原始字节数 = capacity * sizeof(mtt_entry_t) */
+    _Atomic size_t      pool_used;                      /* 当前在用 entry 数（无锁读取） */
+    _Atomic int         pool_mode;                      /* 模式：MTT_POOL_MODE_* */
 
     /* 统计计数器（全部原子变量，无锁读取） */
     _Atomic int         initialized;                /* 是否已完成初始化（0=未, 1=已） */
@@ -283,9 +327,29 @@ int          mtt_is_over_capacity(mtt_state_t *s);
 int          mtt_is_startup_phase(mtt_state_t *s);
 int          mtt_is_blacklisted(mtt_state_t *s, const char *symbol);
 void         mtt_capture_stack(mtt_entry_t *entry);
+int          mtt_pool_contains(const void *ptr);   /* 判断 ptr 是否落在 entry 池范围内（防止误 free） */
+
+/* 诊断日志开关（tracker.c 定义）。
+ * =1: 输出 init 状态/scan 进度等诊断信息到 stderr
+ * =0: 静默运行,只输出 leak 报告 + heartbeat
+ * 由环境变量 MTT_DEBUG 控制,默认开。
+ * 所有非热路径的诊断打印都应判断此标志。 */
+extern _Atomic int mtt_debug_enabled;
+
+/* 工具自身的 stderr 诊断打印宏(仅非热路径用)。
+ * 默认开,关闭时编译期不消除但运行时短路(单次分支判断,可忽略)。
+ * pool init 日志、关键 ERROR/WARNING 不受此开关控制(始终输出)。 */
+#define MTT_DIAG_LOG(buf, len) \
+    do { \
+        if (atomic_load_explicit(&mtt_debug_enabled, memory_order_relaxed)) { \
+            long __mtt_w = (long)write(STDERR_FILENO, (buf), (len)); \
+            (void)__mtt_w; \
+        } \
+    } while (0)
 
 /* reporter.c */
 void mtt_reporter_start(void);
+void mtt_heartbeat_write(void);   /* 60s 资源监控写独立文件 */
 
 /* stack_cache.c */
 uint64_t mtt_stack_hash_compute(void **frames, int frame_count);

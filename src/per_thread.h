@@ -26,6 +26,9 @@ typedef struct {
     int  tool_internal;       /* 工具内部线程标记 (原 __thread g_tool_internal) */
     int  raw_resolving;       /* dlsym 重入保护 (原 __thread g_raw_resolving) */
     int  in_capture;          /* backtrace 重入保护 (原 __thread g_in_capture) */
+    /* 缓存行填充:多核 ARM 上避免相邻槽位 tid 字段落在同一缓存行造成伪共享。
+     * 与 mtt_aligned_mutex_t 设计保持一致。 */
+    char __padding[36];
 } mtt_per_thread_t;
 
 /* 全局槽位数组 — BSS 零初始化。
@@ -57,11 +60,14 @@ static inline mtt_per_thread_t* mtt_thread_get(void)
         if (atomic_compare_exchange_strong_explicit(
                 &g_threads[i].tid, &zero, tid,
                 memory_order_acq_rel, memory_order_acquire)) {
-            /* CAS 成功：初始化所有字段（release 语义确保可见性） */
+            /* CAS 成功：显式初始化全部字段。
+             * BSS 零初始化虽已兜底,但显式赋值防御未来引入槽位回收时的脏值问题。 */
             g_threads[i].hook_depth    = -1;
             g_threads[i].depth_inited  = -1;
             g_threads[i].in_hook       = 0;
             g_threads[i].tool_internal = 0;
+            g_threads[i].raw_resolving = 0;
+            g_threads[i].in_capture    = 0;
             return &g_threads[i];
         }
     }

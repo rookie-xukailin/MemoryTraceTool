@@ -29,6 +29,8 @@
 #include "time_series.h"
 #include "http_server.h"
 #include "per_thread.h"
+#include "addr_validate.h"
+#include "unwind_libunwind.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,8 +46,10 @@
 #include <stdatomic.h>
 
 /* 全局线程上下文槽位数组（替代 __thread 变量）。
- * 在 tracker.c 中定义，per_thread.h 中 extern 声明 */
-mtt_per_thread_t g_threads[MTT_MAX_THREADS];
+ * 在 tracker.c 中定义，per_thread.h 中 extern 声明。
+ * 64 字节对齐确保首元素落在缓存行边界。 */
+mtt_per_thread_t g_threads[MTT_MAX_THREADS]
+    __attribute__((aligned(64)));
 
 /* ======================================================================== *
  *                    全局单例状态                                             *
@@ -75,6 +79,11 @@ raw_malloc_fn  volatile raw_malloc  = NULL;
 raw_free_fn    volatile raw_free    = NULL;
 raw_calloc_fn  volatile raw_calloc  = NULL;
 raw_realloc_fn volatile raw_realloc = NULL;
+raw_posix_memalign_fn volatile raw_posix_memalign = NULL;
+
+/* 诊断日志开关(由环境变量 MTT_DEBUG 控制,默认开)。
+ * =0 时屏蔽所有 stderr 诊断,只保留 leak 报告 + heartbeat。 */
+_Atomic int mtt_debug_enabled = MTT_DEBUG_DEFAULT;
 
 /* CAS 保护的一次性解析标志 */
 static atomic_int g_raw_resolved = 0;
@@ -127,6 +136,9 @@ static void bootstrap_free(void *ptr)
 
 static void* bootstrap_calloc(size_t count, size_t size)
 {
+    /* 整数溢出检查:与 hooks.c calloc 保持一致 */
+    if (count > 0 && size > 0 && count > SIZE_MAX / size)
+        return NULL;
     size_t total = count * size;
     void *p = bootstrap_malloc(total);
     if (p != NULL) {
@@ -215,11 +227,28 @@ void mtt_resolve_raw_allocators(void)
     raw_free_fn   real_free     = (raw_free_fn)dlsym(RTLD_NEXT, "free");
     raw_calloc_fn real_calloc   = (raw_calloc_fn)dlsym(RTLD_NEXT, "calloc");
     raw_realloc_fn real_realloc = (raw_realloc_fn)dlsym(RTLD_NEXT, "realloc");
+    raw_posix_memalign_fn real_pma = (raw_posix_memalign_fn)dlsym(RTLD_NEXT, "posix_memalign");
 
-    if (real_malloc  != NULL) raw_malloc  = real_malloc;
-    if (real_free    != NULL) raw_free    = real_free;
-    if (real_calloc  != NULL) raw_calloc  = real_calloc;
-    if (real_realloc != NULL) raw_realloc = real_realloc;
+    /* RTLD_NEXT 在某些 ARM32 系统上可能错误返回 LD_PRELOAD 自身,
+     * 用 dladdr 验证解析到的函数不在 libmemorytracetool 内。
+     * 仅在 dladdr 成功且文件名不含 libmemorytracetool 时接受,
+     * dladdr 失败时拒绝(无法证明非 hook 自身,保守丢弃)。 */
+    #define RAW_SAFE_SET(fn, val) do { \
+        if ((val) != NULL) { \
+            Dl_info _info; \
+            if (dladdr((void*)(val), &_info) \
+                && (_info.dli_fname == NULL \
+                    || strstr(_info.dli_fname, "libmemorytracetool") == NULL)) { \
+                (fn) = (val); \
+            } \
+        } \
+    } while(0)
+    RAW_SAFE_SET(raw_malloc,  real_malloc);
+    RAW_SAFE_SET(raw_free,    real_free);
+    RAW_SAFE_SET(raw_calloc,  real_calloc);
+    RAW_SAFE_SET(raw_realloc, real_realloc);
+    RAW_SAFE_SET(raw_posix_memalign, real_pma);
+    #undef RAW_SAFE_SET
 
     /* RTLD_NEXT 失败时遍历 libc 候选库列表（dlopen/ptrace 注入路径）。
      * 通过检查 raw_* 是否仍为 bootstrap 函数来判断 RTLD_NEXT 是否成功，
@@ -247,6 +276,11 @@ void mtt_resolve_raw_allocators(void)
             if (raw_realloc == bootstrap_realloc) {
                 raw_realloc_fn fn = (raw_realloc_fn)dlsym(libc_handle, "realloc");
                 if (fn != NULL) raw_realloc = fn;
+            }
+            if (raw_posix_memalign == NULL) {
+                raw_posix_memalign_fn fn =
+                    (raw_posix_memalign_fn)dlsym(libc_handle, "posix_memalign");
+                if (fn != NULL) raw_posix_memalign = fn;
             }
 
             /* 不 dlclose：避免 raw_* 悬空。
@@ -303,40 +337,83 @@ void mtt_capture_stack(mtt_entry_t *entry)
     int saved = ctx->in_capture;
     ctx->in_capture = 1;
 
+    int bt_frames = 0;
+
+    /* 优先路径:libunwind(若可用)
+     * libunwind 内建 ARM EHABI + DWARF + FP chain 多策略 unwind,在 ARM32
+     * -O2 -fomit-frame-pointer 二进制上通常能拿到比 glibc backtrace() 更深的栈
+     * (实测 demo_nofp -O2 -fomit-frame-pointer:libunwind 5 帧 vs backtrace 3 帧)。
+     * 软加载失败时自动回退到 glibc backtrace,行为完全等价于无 libunwind 集成。
+     *
+     * 注意:libunwind 仍受目标二进制的 .ARM.exidx 完整性约束 —— 若目标
+     * 编译时未加 -funwind-tables,无 unwind 信息的函数处仍会终止。
+     * 工具检测到此场景会输出 WARNING 提示用户重建(见 reporter.c Phase 1.3)。 */
+    if (mtt_libunwind_available()) {
+        int n = mtt_libunwind_capture(entry->stack, MTT_STACK_DEPTH);
+        if (n >= 2) {
+            entry->stack_frames = n;
+            ctx->in_capture = saved;
+            return;
+        }
+        /* libunwind 拿到 0-1 帧:可能 libunwind 自身出问题或栈太浅,
+         * 落回 glibc backtrace 再试一次 */
+    }
+
 #if MTT_HAS_BACKTRACE
     entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
     if (entry->stack_frames < 0)
         entry->stack_frames = 0;
-
-    /* æ¸é¤ ARM32 Thumb æ¨¡å¼çå°å LSB (bit 0)ï¼
-     * ç¡®ä¿åç»­åå¸è®¡ç®å dladdr() ç¬¦å·è§£ææ­£ç¡®ã
-     * å¨ ARM (é Thumb) / ARM64 / x86 ä¸æ­¤æä½ä¸ºç©ºæä½ï¼bit 0 æ¬å°±æ¯ 0ï¼ã */
-    for (int i = 0; i < entry->stack_frames; i++) {
+    for (int i = 0; i < entry->stack_frames; i++)
         entry->stack[i] = MTT_FIX_THUMB_ADDR(entry->stack[i]);
-    }
+    bt_frames = entry->stack_frames;
 #endif
 
-    /* è¿è¡æ¶ååºï¼è¥ backtrace() è¿å 0 å¸§ï¼glibc ä¸æäºç¯å¢å¯è½å¤±è´¥ï¼ï¼
-     * æ¹ç¨å¸§æéé¾éåè·åè°ç¨æ ã
-     * -fno-omit-frame-pointer å·²ç¡®ä¿å½æ°ä¿çäºå¸§æéå¯å­å¨ã
-     * ARM32(r11) / ARM64(x29) / x86_64(rbp) å¸§å¸å±ä¸è´ï¼
-     *   *fp = ä¸ä¸ä¸ªå¸§æé, *(fp+1) = è¿åå°å(LR)
-     * void** ç´¢å¼èªå¨å¤ç sizeof(void*) çå¹³å°å·®å¼ï¼4 vs 8å­èï¼ï¼
-     * æ éæ¶æç¸å³ç #ifdefã */
-    if (entry->stack_frames == 0) {
+    /* FP chain 兜底:仅当 backtrace 完全失败(0 帧)时启用。
+     *
+     * 历史教训(9f2e4ae 引入后修复):
+     *   - 曾尝试 bt_frames<THRESHOLD 时也启用 FP chain,但 ARM32 Thumb-2 上
+     *     __builtin_frame_address(0) 返回 r7 而非 r11,{prev_fp,lr} 偏移随
+     *     prologue 变化,通用代码无法可靠读取 → 拿到 sl/r11 等垃圾值。
+     *   - 真正可靠的 ARM unwind 需要解析 .ARM.exidx + DWARF,这正是
+     *     libunwind 做的事(见 Phase 2 集成)。
+     *
+     * 当前限制:
+     *   仅 bt_frames==0 触发,用最保守的安全校验。2-3 帧场景由 libunwind
+     *   集成后接管,不再走 FP chain 兜底。
+     *
+     * 安全保证:
+     *   1. 仅在 bt_frames == 0 时启动(backtrace 完全失败的兜底场景)
+     *   2. prev_fp 必须严格大于 fp(ARM 栈向低地址增长,父帧地址更高)
+     *   3. prev_fp - fp 不得超过 64KB(防止大跨度跳到未映射区)
+     *   4. 每个 LR 必须落在可执行段(新增,addr_validate 提供)
+     *   5. 循环上限 MTT_STACK_DEPTH,避免无限循环 */
+    if (bt_frames == 0) {
+        void *fp_stack[MTT_STACK_DEPTH];
+        int fp_count = 0;
         void **fp = (void**)__builtin_frame_address(0);
-        int count = 0;
-        while (fp != NULL && count < MTT_STACK_DEPTH) {
-            void *prev_fp = fp[0];   /* åä¸ä¸ªå¸§æé */
-            void *lr      = fp[1];   /* å½åå¸§çè¿åå°å */
+        while (fp != NULL && fp_count < MTT_STACK_DEPTH) {
+            void *prev_fp = fp[0];
+            void *lr      = fp[1];
             if (lr == NULL) break;
-            entry->stack[count] = MTT_FIX_THUMB_ADDR(lr);
-            count++;
-            /* é¾å°¾ï¼NULLï¼æèªæï¼å¾ªç¯æ£æµï¼ç»æ­¢éå */
-            if (prev_fp == NULL || prev_fp == (void*)fp) break;
+            if (prev_fp == NULL) break;
+            /* LR 必须落在可执行段内,过滤栈垃圾误判 */
+            if (!mtt_addr_is_executable(MTT_FIX_THUMB_ADDR(lr))) break;
+            /* 严格校验:父帧地址必须严格递增,且跨度 <= 64KB。
+             * 防止无帧指针二进制上 prev_fp 为栈垃圾导致跳到无效地址。 */
+            uintptr_t prev_addr = (uintptr_t)prev_fp;
+            uintptr_t curr_addr = (uintptr_t)fp;
+            if (prev_addr <= curr_addr) break;
+            if (prev_addr - curr_addr > (UINT64_C(1) << 16)) break;
+            fp_stack[fp_count] = MTT_FIX_THUMB_ADDR(lr);
+            fp_count++;
+            if (prev_fp == (void*)fp) break;
             fp = (void**)prev_fp;
         }
-        entry->stack_frames = count;
+        if (fp_count > 0) {
+            for (int i = 0; i < fp_count; i++)
+                entry->stack[i] = fp_stack[i];
+            entry->stack_frames = fp_count;
+        }
     }
 
     ctx->in_capture = saved;
@@ -488,6 +565,9 @@ mtt_entry_t* mtt_entry_find(mtt_state_t *s, const void *ptr)
 /**
  * 从哈希桶中删除指定指针的分配记录。
  *
+ * 池子模式（ACTIVE）：从桶链表摘下后清空关键字段，归还 free list 复用。
+ * Fallback 模式：直接 raw_free 单条释放。
+ *
  * @param s    全局状态指针
  * @param ptr  内存指针
  */
@@ -501,12 +581,48 @@ void mtt_entry_remove(mtt_state_t *s, const void *ptr)
         if ((*pp)->ptr == ptr) {
             mtt_entry_t *dead = *pp;
             *pp = dead->next;
-            if (raw_free != NULL) raw_free(dead);
             atomic_fetch_sub_explicit(&s->entry_count, 1, memory_order_relaxed);
+
+            /* 池子模式：清空关键字段后归还 free list */
+            if (s->pool != NULL) {
+                memset(dead, 0, sizeof(*dead));
+                pthread_mutex_lock(&s->pool_lock);
+                dead->next = s->pool_free_list;
+                s->pool_free_list = dead;
+                pthread_mutex_unlock(&s->pool_lock);
+                atomic_fetch_sub_explicit(&s->pool_used, 1, memory_order_relaxed);
+            } else if (raw_free != NULL) {
+                /* Fallback：直接 raw_free */
+                raw_free(dead);
+            }
             return;
         }
         pp = &(*pp)->next;
     }
+}
+
+/**
+ * 判断指针是否落在 entry 池范围内。
+ *
+ * 用户进程不应该 free 工具池子里的内存（池子由工具自申请、自管理）。
+ * 若误传给 free()，应直接透传到 raw_free 之外，避免破坏池子结构。
+ *
+ * @param ptr  待检测指针
+ * @return     1=落在池子内（不应被业务 free），0=不在池子内
+ */
+int mtt_pool_contains(const void *ptr)
+{
+    mtt_state_t *s = mtt_state_get();
+    if (s == NULL || ptr == NULL) return 0;
+    /* 必须先确认 initialized：init_lock 内的 pool/pool_raw_size 写入
+     * 通过 initialized 的 release store 对其他线程可见。否则可能在
+     * init 进行中读到 pool 非空但 pool_raw_size 还是旧值的不一致状态。 */
+    if (!atomic_load_explicit(&s->initialized, memory_order_acquire)) return 0;
+    if (s->pool == NULL) return 0;
+    const char *base = (const char*)s->pool;
+    const char *end  = base + s->pool_raw_size;
+    const char *p    = (const char*)ptr;
+    return (p >= base && p < end) ? 1 : 0;
 }
 
 /**
@@ -526,17 +642,76 @@ void mtt_entry_add(mtt_state_t *s, mtt_entry_t *entry)
 }
 
 /**
+ * 归还/释放一个已分配但未插入桶链表的 entry。
+ *
+ * 用于 entry_new 成功后、未走到 entry_add 就因容量上限需要回滚的场景。
+ * 池子模式下归还 free list；Fallback 模式下走 raw_free。
+ *
+ * @param s  全局状态指针（NULL 安全，函数立即返回）
+ * @param e  待归还的 entry（NULL 安全，函数立即返回）
+ */
+static void mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e)
+{
+    if (s == NULL || e == NULL) return;
+
+    if (s->pool != NULL) {
+        memset(e, 0, sizeof(*e));
+        pthread_mutex_lock(&s->pool_lock);
+        e->next = s->pool_free_list;
+        s->pool_free_list = e;
+        pthread_mutex_unlock(&s->pool_lock);
+        atomic_fetch_sub_explicit(&s->pool_used, 1, memory_order_relaxed);
+    } else if (raw_free != NULL) {
+        raw_free(e);
+    }
+}
+
+/**
  * 创建新的分配追踪记录。
  *
- * 使用 raw_malloc 分配（不触发 hook），捕获调用栈和分配时间。
- * 仅在 raw_malloc 已解析完成后调用，否则需通过 bootstrap 路径。
+ * 优先走 entry 池模式（ACTIVE）：从 free list 取头，无 libc 调用。
+ * 池子未就绪或申请失败时降级为 Fallback 模式：raw_malloc 单条申请。
+ * 捕获调用栈和分配时间，调用方负责后续 entry_add 插入桶链表。
  *
  * @param ptr   分配的用户内存指针（可为 NULL，由调用者后设）
  * @param size  分配字节数
- * @return      新条目指针，raw_malloc 失败时返回 NULL
+ * @return      新条目指针，池子满或 raw_malloc 失败时返回 NULL
  */
 mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
 {
+    mtt_state_t *s = mtt_state_get();
+
+    /* 池子模式：从 free list 取头，无 libc 调用 */
+    if (s != NULL && s->pool != NULL) {
+        pthread_mutex_lock(&s->pool_lock);
+        mtt_entry_t *e = s->pool_free_list;
+        if (e != NULL) {
+            s->pool_free_list = e->next;
+            atomic_fetch_add_explicit(&s->pool_used, 1, memory_order_relaxed);
+        }
+        pthread_mutex_unlock(&s->pool_lock);
+
+        if (e == NULL) {
+            /* 池子满：跳过本次记录，调用方会更新 skipped_overcap */
+            return NULL;
+        }
+
+        /* 清零整个结构体（同原 raw_malloc 路径，防止上次使用残留泄漏到栈缓存） */
+        memset(e, 0, sizeof(*e));
+
+        e->ptr           = ptr;
+        e->size          = size;
+        e->alloc_num     = 0;
+        e->timestamp     = time(NULL);
+        e->next          = NULL;
+        e->stack_frames  = 0;
+        /* e->stack 已被上面 memset(e, 0, sizeof(*e)) 清零，无需重复 memset */
+
+        mtt_capture_stack(e);
+        return e;
+    }
+
+    /* Fallback：池子未就绪或申请失败，走旧 raw_malloc 路径 */
     if (raw_malloc == NULL) return NULL;
 
     mtt_entry_t *e = (mtt_entry_t*)raw_malloc(sizeof(mtt_entry_t));
@@ -553,7 +728,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
     e->timestamp     = time(NULL);
     e->next          = NULL;
     e->stack_frames  = 0;
-    memset(e->stack, 0, sizeof(e->stack));
+    /* e->stack 已被上面 memset(e, 0, sizeof(*e)) 清零，无需重复 memset */
 
     /* 捕获调用栈（内部有防重入保护 + Thumb bit 清除） */
     mtt_capture_stack(e);
@@ -600,16 +775,15 @@ static void get_process_name(char *buf, size_t size)
         return;
     }
 
-    /* /proc 不可用时的备用方案：尝试 prctl（linux 专有，无 malloc） */
+    /* /proc 不可用时的备用方案：用 syscall 直接调 prctl,避免 extern 声明
+     * 与系统头文件冲突,并消除 variadic 参数 ABI 差异风险(ARM32/ARM64) */
 #ifdef __linux__
     {
         char comm[16] = {0};
-        /* 使用 raw syscall 号 15 = PR_GET_NAME（避免引入 <sys/prctl.h> 头文件依赖）。
-         * 注意：prctl 实参类型为 unsigned long，在 ARM64/x86_64 上 sizeof(int) != sizeof(unsigned long)，
-         * 若直接传 0（int）到 variadic 参数中，va_arg(ap, unsigned long) 可能读取未定义字节。
-         * 传递 0UL 确保类型宽度匹配，在 ARM32/ARM64 上均安全。 */
-        extern int prctl(int, ...);
-        if (prctl(15, (unsigned long)comm, 0UL, 0UL, 0UL) == 0 && comm[0] != '\0') {
+        /* raw syscall: prctl(PR_GET_NAME=15, comm, 0, 0, 0)。
+         * 全部参数显式转 unsigned long,匹配 ARM32/ARM64 syscall ABI。 */
+        long rc = syscall(SYS_prctl, (long)15, (long)comm, 0L, 0L, 0L);
+        if (rc == 0 && comm[0] != '\0') {
             size_t n = strlen(comm);
             if (n >= size) n = size - 1;
             memcpy(buf, comm, n);
@@ -672,11 +846,19 @@ void mtt_ensure_init(void)
     size_t   want_srate    = MTT_SAMPLE_RATE_DEFAULT; /* 默认使用字节统计采样 */
     time_t   want_leak_threshold = MTT_LEAK_THRESHOLD_DEFAULT;
     time_t   want_skip_startup   = MTT_SKIP_STARTUP_DEFAULT;
+    size_t   want_pool_entries   = MTT_POOL_ENTRIES_DEFAULT; /* 池子容量，可被 MTT_POOL_ENTRIES 覆盖 */
+    int      want_debug    = MTT_DEBUG_DEFAULT;
 
     {
         const char *env_disable = getenv("MTT_DISABLE");
         if (env_disable != NULL && strcmp(env_disable, "1") == 0)
             want_disabled = 1;
+
+        const char *env_debug = getenv("MTT_DEBUG");
+        if (env_debug != NULL) {
+            /* MTT_DEBUG=0 关闭诊断日志; 其他值(1/yes/on)打开 */
+            want_debug = (strcmp(env_debug, "0") == 0) ? 0 : 1;
+        }
 
         const char *env_sample = getenv("MTT_SAMPLE");
         if (env_sample != NULL) {
@@ -693,6 +875,14 @@ void mtt_ensure_init(void)
             int sr = atoi(env_srate);
             if (sr >= 0 && sr <= MTT_SAMPLE_RATE_MAX)
                 want_srate = (size_t)sr;
+        }
+
+        /* entry 池容量（MTT_POOL_ENTRIES=N，控制工具自身预占用内存大小） */
+        const char *env_pool = getenv("MTT_POOL_ENTRIES");
+        if (env_pool != NULL) {
+            long pe = atol(env_pool);
+            if (pe >= (long)MTT_POOL_ENTRIES_MIN && pe <= (long)MTT_POOL_ENTRIES_MAX)
+                want_pool_entries = (size_t)pe;
         }
 
         /* 泄漏判定阈值（MTT_LEAK_THRESHOLD_SEC=N，存活超过 N 秒→probable leak） */
@@ -765,6 +955,39 @@ void mtt_ensure_init(void)
     for (int i = 0; i < MTT_LOCK_STRIPES; i++)
         pthread_mutex_init(&s->bucket_locks[i].lock, NULL);
 
+    /* 申请 entry 池：一次性大块 raw_malloc，entry 复用槽位。
+     * 失败时降级为 Fallback 模式（entry_new/remove 走旧 raw_malloc 路径）。
+     * 工具自身这次大申请不进 hook（raw_malloc 直调 libc），天然豁免。 */
+    pthread_mutex_init(&s->pool_lock, NULL);
+    s->pool_capacity = want_pool_entries;
+    s->pool_raw_size = want_pool_entries * sizeof(mtt_entry_t);
+    s->pool = NULL;
+    s->pool_free_list = NULL;
+    atomic_store_explicit(&s->pool_used, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->pool_mode, MTT_POOL_MODE_NONE, memory_order_relaxed);
+
+    if (raw_malloc != NULL) {
+        s->pool = (mtt_entry_t*)raw_malloc(s->pool_raw_size);
+    }
+    if (s->pool == NULL && raw_calloc != NULL) {
+        /* raw_malloc 失败时尝试 raw_calloc 兜底（同时完成清零） */
+        s->pool = (mtt_entry_t*)raw_calloc(s->pool_capacity, sizeof(mtt_entry_t));
+    }
+
+    if (s->pool != NULL) {
+        /* 串起 free list：所有 entry 空闲 */
+        for (size_t i = 0; i < s->pool_capacity; i++) {
+            s->pool[i].next = (i + 1 < s->pool_capacity) ? &s->pool[i + 1] : NULL;
+        }
+        s->pool_free_list = &s->pool[0];
+        atomic_store_explicit(&s->pool_mode, MTT_POOL_MODE_ACTIVE, memory_order_relaxed);
+    } else {
+        /* 池子申请失败：降级为旧模式，工具功能不丢，仅性能下降 */
+        s->pool_capacity = 0;
+        s->pool_raw_size = 0;
+        atomic_store_explicit(&s->pool_mode, MTT_POOL_MODE_FALLBACK, memory_order_relaxed);
+    }
+
     /* 初始化原子计数器（relaxed：此时仅有当前线程可见，release store 最后做） */
     atomic_store_explicit(&s->alloc_seq,       0, memory_order_relaxed);
     atomic_store_explicit(&s->alloc_count,     0, memory_order_relaxed);
@@ -785,6 +1008,7 @@ void mtt_ensure_init(void)
     atomic_store_explicit(&s->temp_alloc_count,   0, memory_order_relaxed);
     atomic_store_explicit(&s->expired_alloc_count, 0, memory_order_relaxed);
     atomic_store_explicit(&s->free_expired_count,  0, memory_order_relaxed);
+    atomic_store_explicit(&mtt_debug_enabled, want_debug, memory_order_relaxed);
 
     /* 设置启动阶段结束时间（0=不跳过） */
     if (want_skip_startup > 0)
@@ -796,6 +1020,23 @@ void mtt_ensure_init(void)
     get_process_name(s->proc_name, sizeof(s->proc_name));
     s->proc_name_ready = 1;
 
+    /* 输出 pool 初始化日志（stderr，便于用户观察工具自身内存占用情况,
+     * 受 MTT_DEBUG 控制,但 init 时 mtt_debug_enabled 已经在阶段2 设置完成） */
+    {
+        int mode = atomic_load_explicit(&s->pool_mode, memory_order_relaxed);
+        char log_buf[160];
+        if (mode == MTT_POOL_MODE_ACTIVE) {
+            int len = snprintf(log_buf, sizeof(log_buf),
+                "[MTT] pool init: mode=ACTIVE capacity=%zu bytes=%zu\n",
+                s->pool_capacity, s->pool_raw_size);
+            if (len > 0) MTT_DIAG_LOG(log_buf, (size_t)len);
+        } else if (mode == MTT_POOL_MODE_FALLBACK) {
+            int len = snprintf(log_buf, sizeof(log_buf),
+                "[MTT] pool init: mode=FALLBACK (raw_malloc per-entry)\n");
+            if (len > 0) MTT_DIAG_LOG(log_buf, (size_t)len);
+        }
+    }
+
     /* 标记初始化完成（release 确保上述所有初始化对其他线程可见） */
     atomic_store_explicit(&s->initialized, 1, memory_order_release);
     pthread_mutex_unlock(&init_lock);
@@ -803,12 +1044,20 @@ void mtt_ensure_init(void)
     /* 先初始化时序数据（必须在 reporter 线程启动前完成） */
     mtt_ts_init();
 
-    /* 启动子系统时设置 in_hook=1，防止 pthread_create / socket / bind 等
-     * 内部调用 malloc() 被 hook 拦截并追踪为"疑似泄漏"。
+    /* 启动子系统时设置 in_hook=1 + tool_internal=1,防止 pthread_create / socket
+     * / bind 等内部调用 malloc() 被 hook 拦截并追踪为"疑似泄漏"。
+     * - in_hook=1: 防止 pthread_create 内部 malloc 触发递归 hook
+     * - tool_internal=1: 让 hook 的 tool_internal 检查路径透传 pthread_create
+     *   内部的 _dl_allocate_tls(否则会被记录为泄漏,栈顶 _dl_allocate_tls →
+     *   pthread_create → main)
      * save/restore 防止嵌套 mtt_ensure_init 调用破坏状态。 */
     mtt_per_thread_t *ctx = mtt_thread_get();
     int saved_hook = (ctx != NULL) ? ctx->in_hook : 0;
-    if (ctx != NULL) ctx->in_hook = 1;
+    int saved_tool = (ctx != NULL) ? ctx->tool_internal : 0;
+    if (ctx != NULL) {
+        ctx->in_hook = 1;
+        ctx->tool_internal = 1;
+    }
 
     /* 启动周期报告线程（锁外，避免 pthread_create 内部 malloc → 递归） */
     mtt_reporter_start();
@@ -830,7 +1079,10 @@ void mtt_ensure_init(void)
     /* 启动信号处理线程（SIGUSR1 触发即时报告） */
     mtt_signal_thread_start();
 
-    if (ctx != NULL) ctx->in_hook = saved_hook;
+    if (ctx != NULL) {
+        ctx->in_hook = saved_hook;
+        ctx->tool_internal = saved_tool;
+    }
 
     /* 注册 fork 安全处理器（仅需注册一次） */
     static pthread_once_t g_fork_init = PTHREAD_ONCE_INIT;
@@ -904,6 +1156,10 @@ static void* mtt_signal_thread_fn(void *arg)
     (void)arg;
     pthread_detach(pthread_self());
 
+    /* 标记为工具内部线程:本线程的 malloc/free 都透传不追踪 */
+    mtt_per_thread_t *ctx = mtt_thread_get();
+    if (ctx != NULL) ctx->tool_internal = 1;
+
     sigset_t sigset;
     sigemptyset(&sigset);
     sigaddset(&sigset, MTT_SIGNAL_REPORT);
@@ -952,13 +1208,13 @@ void mtt_signal_thread_start(void)
         return;
     }
 
-    /* 诊断输出 */
+    /* 诊断输出(MTT_DEBUG=0 时屏蔽) */
     char diag[96] = {0};
     int len = snprintf(diag, sizeof(diag),
         "[MTT] Signal thread ready (kill -USR1 %d for instant report)\n",
         (int)getpid());
     if (len > 0 && len < (int)sizeof(diag))
-        MTT_DIAG_WRITE(STDERR_FILENO, diag, (size_t)len);
+        MTT_DIAG_LOG(diag, (size_t)len);
 }
 
 /* ======================================================================== *
@@ -1011,7 +1267,7 @@ void* mtt_malloc(size_t size)
     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
         mtt_stripe_unlock(s, ptr);
-        if (raw_free != NULL) raw_free(e);
+        mtt_entry_discard(s, e);
         return ptr; /* 用户内存已分配，仅跳过追踪 */
     }
 
@@ -1174,7 +1430,7 @@ void* mtt_realloc(void *ptr, size_t size)
                         mtt_entry_add(s, new_e);
                     } else {
                         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
-                        if (raw_free != NULL) raw_free(new_e);
+                        mtt_entry_discard(s, new_e);
                     }
                     mtt_stripe_unlock(s, new_ptr);
                 }
@@ -1219,7 +1475,7 @@ void* mtt_realloc(void *ptr, size_t size)
     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
         mtt_stripe_unlock(s, new_ptr);
-        if (raw_free != NULL) raw_free(new_e);
+        mtt_entry_discard(s, new_e);
         raw_free(ptr);
         return new_ptr;
     }

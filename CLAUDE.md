@@ -49,6 +49,70 @@ make clean              # 清理构建产物
 每次编辑源文件后，必须主动跑两个平台的编译+测试+demo验证，不需要等用户提醒。
 两个平台都通过后，直接主动提交并推送到远端，无需询问用户。
 
+## HDM3 build 环境模拟测试(必跑,防"Mac 通过环境崩")
+
+**为什么**:用户的 flasher 是 ARM32 `-fomit-frame-pointer -O2` release 二进制。
+单元测试用 `-fno-omit-frame-pointer` 编译,无法暴露无帧指针二进制上的 bug
+(典型例:FP chain parallel 在 9f2e4ae 引入后崩溃,单元测试全过但环境必崩)。
+
+**模拟环境**:`hdm3-sim:latest` docker image(Ubuntu 24.04 ARM64 + GCC 13.3.0)
+- ARM32:`arm-linux-gnueabi-gcc`(soft-float, 与 HDM3_build 工具链 ABI 完全一致)
+- ARM64:native gcc(host 本身是 ARM64)
+- 跑 ARM32 binary:`qemu-arm-static -L /usr/arm-linux-gnueabi`
+- demo/fakebiz 全部用 `-O2 -fomit-frame-pointer`(匹配 flasher release 选项)
+
+**首次构建 image**:
+```bash
+docker build --platform linux/arm64 -f Dockerfile.hdm3-sim -t hdm3-sim:latest .
+```
+
+**测试流程**(提交前必跑):
+```bash
+./scripts/sim-test.sh           # 编译 + 跑两平台综合测试
+./scripts/sim-test.sh build     # 只编译
+./scripts/sim-test.sh arm32     # 只跑 ARM32
+./scripts/sim-test.sh arm64     # 只跑 ARM64
+```
+
+**验收准则**(任一不满足禁止提交):
+- ARM32:`exit=0` + `entry>0` + `sites>0` + reporter 线程启动
+- ARM64:`exit=0` + `entry>0` + `sites>0` + reporter 线程启动
+
+**测试矩阵覆盖**(`examples/realistic/`):
+- 进程内直接泄漏(模拟 main 业务逻辑)
+- 通过 dlopen 调用业务库 .so,库内部多层调用栈 + 内存泄漏
+- 通过 dlopen 调用业务库 .so 的不规范用法:strdup/asprintf 不 free、
+  realloc 失败丢失指针、全局缓存无限增长
+- 故意 dlopen 不 dlclose(模拟模块未卸载)
+
+## 代码走读 Skill
+
+详见 `skills/code-review.md`。触发条件:用户说「执行代码走读 skill」「代码走读」「执行 N 轮代码走读」。
+
+10 轮 5 维度循环:并发 → 正确性 → 跨平台 → 性能 → 可维护 → (深度二轮重复)。
+
+每轮:全工程阅读 + 修复 + 两平台编译/测试 + 模拟环境验证 + 单独 commit,不允许失败就退出。
+
+## 静默运行模式(MTT_DEBUG=0)
+
+为降低对被监控进程的性能影响,工具支持 `MTT_DEBUG=0` 静默模式:
+
+- **屏蔽** 所有 stderr 诊断(`hook first call`、`Reporter/HTTP/Signal started`、`scan enter/dedup/done`、`periodic scan start`、`final scan` 等)
+- **保留** 泄漏报告(`/var/log/mtt/<pid>_<name>.log`)、60s heartbeat(`/var/log/mtt/<pid>_heartbeat.log`)、HTTP API、SIGUSR1 即时报告
+- 默认开(`MTT_DEBUG=1`),调试时可观察工具行为;生产部署建议 `MTT_DEBUG=0` 降低开销
+
+heartbeat 文件 60s 覆盖写一次,字段:`ts/rss/pool/entries/cur_bytes/leaks/siteuniq/skipped`。
+
+## 栈回溯浅(ARM32 2-3 帧)排查
+
+若用户反馈泄漏点栈太浅无法定位,先看 README「栈回溯深度优化」章节。短路径:
+
+1. **首选**:让用户在目标工程 CFLAGS 加 `-funwind-tables -fno-omit-frame-pointer` 重建,95% 的浅栈问题立刻消失
+2. **次选**:确认工具侧已集成 libunwind(`MTT_UNWINDER=libunwind`,见 src/unwind_libunwind.c)
+3. **观测**:工具检测到 >20% 分配帧数 <4 时,会在 stderr 输出一次性 WARNING(即便 `MTT_DEBUG=0`)
+
+ARM32 Thumb-2 上 `__builtin_frame_address(0)` 返回 r7 而非 r11,{prev_fp,lr} 偏移随 prologue 变化,FP chain 兜底仅在 `bt_frames==0` 时启用且做了可执行段校验。根本性方案是 libunwind。
+
 ## 编码规范
 
 1. **每个函数都要有函数头（doxygen 风格 `/** ... */`）**，说明用途、参数、返回值
