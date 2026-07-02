@@ -117,9 +117,23 @@ flamegraph.pl /var/log/mtt/<pid>_<name>.folded > flame.svg
 ## 测试
 
 ```bash
-make PLATFORM=arm32 test             # test_basic (36 用例)
-make PLATFORM=arm32 test_stability   # test_stability (17 用例，含并发、竞态、边界)
-make PLATFORM=arm32 test_all         # test_basic + test_stability
+# 基础功能(36 个):alloc/free 统计、栈回溯、计数原子性
+make test
+./scripts/compile-arm64.sh clean test   # ARM64 Docker
+./scripts/compile-arm32.sh clean test   # ARM32 Docker
+
+# 并发压力(18 个):60s 长稳 + pool_lock per-stripe + 各种 race
+make test_stability
+
+# 综合场景:HDM3 build 模拟环境(ARM32 soft-float + ARM64 + C++ 异常)
+./scripts/sim-test.sh
+
+# 静默模式回归:验证 MTT_DEBUG=0 下 stderr 完全静默但 leak 报告正常
+./scripts/test_silent_mode.sh
+
+# 栈深度回归:验证 libunwind 静态链接在 -O2 -fomit-frame-pointer 上能拿到业务帧
+./scripts/test_stack_depth.sh arm32     # ARM32 主场景
+./scripts/test_stack_depth.sh arm64     # ARM64 对比
 
 # 前端测试（需先启动 HTTP 服务器）
 python3 tests/test_frontend_json.py    # JSON 结构和语义验证

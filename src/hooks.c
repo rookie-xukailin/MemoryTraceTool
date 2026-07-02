@@ -221,7 +221,7 @@ void* malloc(size_t size)
     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
         mtt_stripe_unlock(s, ptr);
-        if (raw_free != NULL) raw_free(e);
+        mtt_entry_discard(s, e);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
         return ptr;
@@ -550,7 +550,7 @@ void* realloc(void *ptr, size_t size)
                         mtt_entry_add(s, new_e);
                     } else {
                         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
-                        if (raw_free != NULL) raw_free(new_e);
+                        mtt_entry_discard(s, new_e);
                     }
                     mtt_stripe_unlock(s, new_ptr);
                 }
@@ -608,7 +608,7 @@ void* realloc(void *ptr, size_t size)
     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
         mtt_stripe_unlock(s, new_ptr);
-        if (raw_free != NULL) raw_free(new_e);
+        mtt_entry_discard(s, new_e);
         raw_free(ptr);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;

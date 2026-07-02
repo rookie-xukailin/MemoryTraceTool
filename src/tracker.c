@@ -651,7 +651,7 @@ void mtt_entry_add(mtt_state_t *s, mtt_entry_t *entry)
  * @param s  全局状态指针（NULL 安全，函数立即返回）
  * @param e  待归还的 entry（NULL 安全，函数立即返回）
  */
-static void mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e)
+void mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e)
 {
     if (s == NULL || e == NULL) return;
 

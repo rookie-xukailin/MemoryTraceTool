@@ -353,6 +353,7 @@ void         mtt_ensure_init(void);
 void         mtt_resolve_raw_allocators(void);
 mtt_entry_t* mtt_entry_new(void *ptr, size_t size);
 void         mtt_entry_add(mtt_state_t *s, mtt_entry_t *e);
+void         mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e);   /* 归还未入表的 entry(pool 模式回 free_list,raw 模式 raw_free) */
 mtt_entry_t* mtt_entry_find(mtt_state_t *s, const void *ptr);
 void         mtt_entry_remove(mtt_state_t *s, const void *ptr);
 int          mtt_should_track(mtt_state_t *s, size_t size);

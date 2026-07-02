@@ -917,6 +917,42 @@ static void scan_and_report_locked(void)
         pthread_mutex_unlock(&g_reporter.cache_lock);
     }
 
+    /* 浅栈比例监控:统计本次快照中 frame_count < 4 的比例,
+     * 超过 20% 且样本数 > 100 时一次性 stderr 警告。
+     * 触发场景:目标二进制 -O2 -fomit-frame-pointer 且无 -funwind-tables,
+     * glibc backtrace 拿不到完整栈,即使 FP chain 兜底也补不全。
+     * 警告只在首次满足条件时输出(g_shallow_warned 哨兵),
+     * 避免日志噪声。MTT_DEBUG=0 时也输出(WARNING 级,不受静默影响)。
+     *
+     * 注意:必须在 cleanup: 释放 snaps 之前访问,否则 use-after-free。 */
+    if (snaps != NULL && snap_count > 100) {
+        size_t shallow = 0;
+        size_t total_with_stack = 0;
+        for (size_t i = 0; i < snap_count; i++) {
+            if (snaps[i].stack_frames > 0) {
+                total_with_stack++;
+                if (snaps[i].stack_frames < 4) shallow++;
+            }
+        }
+        /* 20% 阈值:shallow * 5 > total_with_stack 等价于 shallow/total > 20% */
+        if (total_with_stack > 100 && shallow * 5 > total_with_stack) {
+            static atomic_int g_shallow_warned = 0;
+            int expected = 0;
+            if (atomic_compare_exchange_strong_explicit(&g_shallow_warned,
+                    &expected, 1, memory_order_acq_rel, memory_order_acquire)) {
+                char wbuf[256];
+                int wlen = snprintf(wbuf, sizeof(wbuf),
+                    "[MTT] WARNING: %zu/%zu (%.0f%%) allocations have <4 frames. "
+                    "Backtrace likely truncated by -fomit-frame-pointer. "
+                    "Rebuild target with -funwind-tables -fno-omit-frame-pointer.\n",
+                    shallow, total_with_stack,
+                    (double)shallow * 100.0 / (double)total_with_stack);
+                if (wlen > 0 && wlen < (int)sizeof(wbuf))
+                    MTT_DIAG_WRITE(STDERR_FILENO, wbuf, (size_t)wlen);
+            }
+        }
+    }
+
 cleanup:
     /* 释放快照数组（raw_free 非 NULL 检查，防御性编程） */
     if (snaps != NULL && raw_free != NULL) raw_free(snaps);
@@ -940,41 +976,6 @@ cleanup:
             "[MTT] scan done: sites=%zu\n", site_count);
         if (dlen > 0 && dlen < (int)sizeof(dbuf))
             MTT_DIAG_LOG(dbuf, (size_t)dlen);
-    }
-
-    /* 浅栈比例监控:统计本次快照中 frame_count < 4 的比例,
-     * 超过 20% 且样本数 > 100 时一次性 stderr 警告。
-     * 触发场景:目标二进制 -O2 -fomit-frame-pointer 且无 -funwind-tables,
-     * glibc backtrace 拿不到完整栈,即使 FP chain 兜底也补不全。
-     * 警告只在首次满足条件时输出(g_shallow_warned 哨兵),
-     * 避免日志噪声。MTT_DEBUG=0 时也输出(WARNING 级,不受静默影响)。 */
-    if (snaps != NULL && snap_count > 100) {
-        size_t shallow = 0;
-        size_t total_with_stack = 0;
-        for (size_t i = 0; i < snap_count; i++) {
-            if (snaps[i].stack_frames > 0) {
-                total_with_stack++;
-                if (snaps[i].stack_frames < 4) shallow++;
-            }
-        }
-        /* 20% 阈值:shallow * 5 > total_with_stack 等价于 shallow/total > 20% */
-        if (total_with_stack > 100 && shallow * 5 > total_with_stack) {
-            static atomic_int g_shallow_warned = 0;
-            int expected = 0;
-            if (atomic_compare_exchange_strong_explicit(&g_shallow_warned,
-                    &expected, 1, memory_order_acq_rel, memory_order_acquire)) {
-                char wbuf[256];
-                int wlen = snprintf(wbuf, sizeof(wbuf),
-                    "[MTT] WARNING: %zu/%zu (%.0f%%) allocations have <4 frames. "
-                    "Backtrace likely truncated by -fomit-frame-pointer. "
-                    "Rebuild target with -funwind-tables -fno-omit-frame-pointer, "
-                    "or set MTT_UNWINDER=libunwind once libunwind integration lands.\n",
-                    shallow, total_with_stack,
-                    (double)shallow * 100.0 / (double)total_with_stack);
-                if (wlen > 0 && wlen < (int)sizeof(wbuf))
-                    MTT_DIAG_WRITE(STDERR_FILENO, wbuf, (size_t)wlen);
-            }
-        }
     }
     return;
 
