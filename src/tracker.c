@@ -583,13 +583,14 @@ void mtt_entry_remove(mtt_state_t *s, const void *ptr)
             *pp = dead->next;
             atomic_fetch_sub_explicit(&s->entry_count, 1, memory_order_relaxed);
 
-            /* 池子模式：清空关键字段后归还 free list */
+            /* 池子模式：清空关键字段后按 entry 地址算 stripe 归还对应桶 */
             if (s->pool != NULL) {
                 memset(dead, 0, sizeof(*dead));
-                pthread_mutex_lock(&s->pool_lock);
-                dead->next = s->pool_free_list;
-                s->pool_free_list = dead;
-                pthread_mutex_unlock(&s->pool_lock);
+                unsigned idx = mtt_stripe_of(dead, s->bucket_count, s->hash_seed);
+                pthread_mutex_lock(&s->pool_locks[idx].lock);
+                dead->next = s->pool_free_lists[idx];
+                s->pool_free_lists[idx] = dead;
+                pthread_mutex_unlock(&s->pool_locks[idx].lock);
                 atomic_fetch_sub_explicit(&s->pool_used, 1, memory_order_relaxed);
             } else if (raw_free != NULL) {
                 /* Fallback：直接 raw_free */
@@ -656,10 +657,11 @@ static void mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e)
 
     if (s->pool != NULL) {
         memset(e, 0, sizeof(*e));
-        pthread_mutex_lock(&s->pool_lock);
-        e->next = s->pool_free_list;
-        s->pool_free_list = e;
-        pthread_mutex_unlock(&s->pool_lock);
+        unsigned idx = mtt_stripe_of(e, s->bucket_count, s->hash_seed);
+        pthread_mutex_lock(&s->pool_locks[idx].lock);
+        e->next = s->pool_free_lists[idx];
+        s->pool_free_lists[idx] = e;
+        pthread_mutex_unlock(&s->pool_locks[idx].lock);
         atomic_fetch_sub_explicit(&s->pool_used, 1, memory_order_relaxed);
     } else if (raw_free != NULL) {
         raw_free(e);
@@ -681,18 +683,38 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
 {
     mtt_state_t *s = mtt_state_get();
 
-    /* 池子模式：从 free list 取头，无 libc 调用 */
+    /* 池子模式：按 ptr 算 stripe 从对应桶取头,本桶空 → trylock 扫邻居桶 */
     if (s != NULL && s->pool != NULL) {
-        pthread_mutex_lock(&s->pool_lock);
-        mtt_entry_t *e = s->pool_free_list;
+        unsigned idx = mtt_stripe_of(ptr, s->bucket_count, s->hash_seed);
+        mtt_entry_t *e = NULL;
+
+        /* 首选:锁本桶取头 */
+        pthread_mutex_lock(&s->pool_locks[idx].lock);
+        e = s->pool_free_lists[idx];
         if (e != NULL) {
-            s->pool_free_list = e->next;
+            s->pool_free_lists[idx] = e->next;
             atomic_fetch_add_explicit(&s->pool_used, 1, memory_order_relaxed);
         }
-        pthread_mutex_unlock(&s->pool_lock);
+        pthread_mutex_unlock(&s->pool_locks[idx].lock);
+
+        /* 本桶空 → trylock 顺序扫邻居桶,持一把锁,无 AB-BA 死锁风险 */
+        if (e == NULL) {
+            for (int k = 1; k < MTT_LOCK_STRIPES; k++) {
+                unsigned try_idx = (unsigned)((idx + k) & (MTT_LOCK_STRIPES - 1));
+                if (pthread_mutex_trylock(&s->pool_locks[try_idx].lock) != 0)
+                    continue;
+                e = s->pool_free_lists[try_idx];
+                if (e != NULL) {
+                    s->pool_free_lists[try_idx] = e->next;
+                    atomic_fetch_add_explicit(&s->pool_used, 1, memory_order_relaxed);
+                }
+                pthread_mutex_unlock(&s->pool_locks[try_idx].lock);
+                if (e != NULL) break;
+            }
+        }
 
         if (e == NULL) {
-            /* 池子满：跳过本次记录，调用方会更新 skipped_overcap */
+            /* 所有桶都空：跳过本次记录，调用方会更新 skipped_overcap */
             return NULL;
         }
 
@@ -958,13 +980,18 @@ void mtt_ensure_init(void)
     /* 申请 entry 池：一次性大块 raw_malloc，entry 复用槽位。
      * 失败时降级为 Fallback 模式（entry_new/remove 走旧 raw_malloc 路径）。
      * 工具自身这次大申请不进 hook（raw_malloc 直调 libc），天然豁免。 */
-    pthread_mutex_init(&s->pool_lock, NULL);
     s->pool_capacity = want_pool_entries;
     s->pool_raw_size = want_pool_entries * sizeof(mtt_entry_t);
     s->pool = NULL;
-    s->pool_free_list = NULL;
     atomic_store_explicit(&s->pool_used, 0, memory_order_relaxed);
     atomic_store_explicit(&s->pool_mode, MTT_POOL_MODE_NONE, memory_order_relaxed);
+
+    /* per-stripe pool: 64 把独立锁 + 64 桶 free_list,均分 entry 降竞争
+     * pool_locks 复用 mtt_aligned_mutex_t 缓存行对齐,避免多核伪共享 */
+    for (int i = 0; i < MTT_LOCK_STRIPES; i++) {
+        pthread_mutex_init(&s->pool_locks[i].lock, NULL);
+        s->pool_free_lists[i] = NULL;
+    }
 
     if (raw_malloc != NULL) {
         s->pool = (mtt_entry_t*)raw_malloc(s->pool_raw_size);
@@ -975,11 +1002,13 @@ void mtt_ensure_init(void)
     }
 
     if (s->pool != NULL) {
-        /* 串起 free list：所有 entry 空闲 */
+        /* 均匀散到 64 桶:pool[i] 进 free_lists[i % MTT_LOCK_STRIPES]
+         * 每桶 entry 数量差不超过 1,保证负载均衡 */
         for (size_t i = 0; i < s->pool_capacity; i++) {
-            s->pool[i].next = (i + 1 < s->pool_capacity) ? &s->pool[i + 1] : NULL;
+            unsigned idx = (unsigned)(i % MTT_LOCK_STRIPES);
+            s->pool[i].next = s->pool_free_lists[idx];
+            s->pool_free_lists[idx] = &s->pool[i];
         }
-        s->pool_free_list = &s->pool[0];
         atomic_store_explicit(&s->pool_mode, MTT_POOL_MODE_ACTIVE, memory_order_relaxed);
     } else {
         /* 池子申请失败：降级为旧模式，工具功能不丢，仅性能下降 */

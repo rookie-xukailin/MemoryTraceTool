@@ -215,12 +215,17 @@ typedef struct {
     /* entry 池：启动时一次性申请的大块内存，所有 entry 复用槽位。
      * 设计目标：减少 libc malloc/free 调用频次，工具自身内存占用可视化。
      * 关键不变量：池子在用数 == entry_count == 桶链表总节点数；
-     *            free list 长度 == pool_capacity - pool_used。
+     *            free list 总长(64 桶求和) == pool_capacity - pool_used。
      * entry->next 在桶链表里指向同桶下一个；在 free list 里指向下一个空闲
-     * （同一时刻 entry 只在其中一个链中，语义复用安全）。 */
+     * （同一时刻 entry 只在其中一个链中，语义复用安全）。
+     *
+     * 锁分散(per-stripe free list):
+     *   原 pool_lock 单锁在多线程高频 alloc 下成为串行瓶颈,改 64 桶独立
+     *   free_list + 64 把独立锁(缓存行对齐防伪共享)。归还按 entry 地址算
+     *   stripe idx,取用按 ptr 算 idx,平均分布到 64 桶降低竞争 64x。 */
     mtt_entry_t        *pool;                           /* 池子起始地址（raw_malloc 大块） */
-    mtt_entry_t        *pool_free_list;                 /* 空闲 entry 链头（用 entry->next 串） */
-    pthread_mutex_t     pool_lock;                      /* free list 操作互斥锁 */
+    mtt_entry_t        *pool_free_lists[MTT_LOCK_STRIPES]; /* 空闲 entry 链头数组(用 entry->next 串) */
+    mtt_aligned_mutex_t pool_locks[MTT_LOCK_STRIPES];   /* free list 分段锁数组(缓存行对齐) */
     size_t              pool_capacity;                  /* 池子总 entry 数（启动时确定） */
     size_t              pool_raw_size;                  /* 池子原始字节数 = capacity * sizeof(mtt_entry_t) */
     _Atomic size_t      pool_used;                      /* 当前在用 entry 数（无锁读取） */
