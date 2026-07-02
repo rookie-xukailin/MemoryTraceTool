@@ -78,10 +78,11 @@ SHARED_LIB = $(OUTPUT_DIR)/libmemorytracetool.so
 all: $(SHARED_LIB)
 
 # ---- libunwind 静态库构建 ----
-# vendor/libunwind 是 git submodule(v1.8.2, MIT)。autotools bootstrap +
-# configure + make 产出 src/.libs/libunwind.a,直接链进我们的 .so,
-# 目标机无需预装 libunwind8。
-LIBUNWIND_SRC    := vendor/libunwind
+# open/libunwind 是 vendored libunwind v1.8.2 源码(MIT 许可,随项目分发)。
+# configure 等脚本已预生成并 commit,运行时无需 autotools。
+# 在独立 build 目录跑 configure + make,产出 libunwind.a 链入我们的 .so。
+# 目标机零依赖:不需要预装 libunwind8,内网编译无需联网。
+LIBUNWIND_SRC    := open/libunwind
 LIBUNWIND_BUILD  := $(BUILD_DIR)/libunwind-$(or $(ARCH),host)
 LIBUNWIND_STATIC := $(LIBUNWIND_BUILD)/src/.libs/libunwind.a
 # --host 三元组从 CROSS_COMPILE 推导:arm-linux-gnueabihf- → arm-linux-gnueabihf
@@ -89,12 +90,11 @@ LIBUNWIND_STATIC := $(LIBUNWIND_BUILD)/src/.libs/libunwind.a
 LIBUNWIND_HOST   := $(patsubst %-,%,$(CROSS_COMPILE))
 
 # libunwind 静态库构建目标:
-# 1. configure 不存在则 autoreconf -i 生成(autotools bootstrap)
-# 2. 在独立 build 目录跑 configure(--host 交叉编译 / --enable-static / --disable-shared)
-# 3. make 产出 libunwind.a
+#   在独立 build 目录跑 configure(--host 交叉编译 / --enable-static / --disable-shared)
+#   + make 产出 libunwind.a。
 # 注意:cd 进入 build 目录后,$(LIBUNWIND_SRC)/configure 相对路径会失效,
 # 必须用 $(CURDIR) 锚定到项目根。
-$(LIBUNWIND_STATIC): | $(LIBUNWIND_SRC)/configure
+$(LIBUNWIND_STATIC): $(LIBUNWIND_SRC)/configure
 	@mkdir -p $(LIBUNWIND_BUILD)
 	cd $(LIBUNWIND_BUILD) && \
 	    $(CURDIR)/$(LIBUNWIND_SRC)/configure \
@@ -104,10 +104,6 @@ $(LIBUNWIND_STATIC): | $(LIBUNWIND_SRC)/configure
 	        --disable-tests \
 	        CC="$(CC)" CFLAGS="$(ARCH_FLAGS) -O2 -fPIC -fno-omit-frame-pointer"
 	$(MAKE) -C $(LIBUNWIND_BUILD) -j4 V=0
-
-# autotools bootstrap:首次 checkout submodule 后需 autoreconf 生成 configure
-$(LIBUNWIND_SRC)/configure:
-	cd $(LIBUNWIND_SRC) && autoreconf -i
 
 $(SHARED_LIB): $(LIB_OBJS) $(LIBUNWIND_STATIC) | $(OUTPUT_DIR)
 	$(CC) -shared -o $@ $(LIB_OBJS) $(LIBUNWIND_STATIC) \

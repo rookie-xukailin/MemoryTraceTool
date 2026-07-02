@@ -18,10 +18,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     make \
     file \
     ca-certificates \
-    autoconf \
-    automake \
-    libtool \
-    texinfo \
     && rm -rf /var/lib/apt/lists/*
 
 # 创建无版本号 symlink: arm-linux-gnueabi-gcc-13 → arm-linux-gnueabi-gcc

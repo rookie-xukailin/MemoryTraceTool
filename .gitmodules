@@ -1,3 +1,0 @@
-[submodule "vendor/libunwind"]
-	path = vendor/libunwind
-	url = https://github.com/libunwind/libunwind.git
