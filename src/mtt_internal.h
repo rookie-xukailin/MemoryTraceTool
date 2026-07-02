@@ -312,6 +312,34 @@ static inline void mtt_stripe_unlock(mtt_state_t *s, const void *ptr)
 }
 
 /* ======================================================================== *
+ *                  时间戳获取(VDSO 优化,规避 time(NULL) 系统调用)             *
+ * ======================================================================== */
+
+#ifndef CLOCK_REALTIME_COARSE
+#define CLOCK_REALTIME_COARSE 5
+#endif
+
+/**
+ * 获取当前 wall-clock 秒数(语义等价 time(NULL))。
+ *
+ * 走 CLOCK_REALTIME_COARSE:Linux VDSO 实现,无 syscall 切换,
+ * ARM32 上较 time(NULL) 省约 1-2μs/次。多线程高频 alloc/free 路径
+ * 每次都要打时间戳(entry->timestamp、临时分配寿命判定),开销显著。
+ *
+ * 内核粗粒度:HZ=1000 → 1ms;HZ=100 → 10ms。对 entry->timestamp /
+ * first_seen / last_seen / 临时分配寿命(<=1s)判定均足够。
+ *
+ * 兼容性:失败回退 time(NULL),保证语义不变。
+ */
+static inline time_t mtt_now_sec(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME_COARSE, &ts) == 0)
+        return ts.tv_sec;
+    return time(NULL);
+}
+
+/* ======================================================================== *
  *                  共享函数声明（跨模块调用）                                  *
  * ======================================================================== */
 

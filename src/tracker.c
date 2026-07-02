@@ -702,7 +702,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
         e->ptr           = ptr;
         e->size          = size;
         e->alloc_num     = 0;
-        e->timestamp     = time(NULL);
+        e->timestamp     = mtt_now_sec();
         e->next          = NULL;
         e->stack_frames  = 0;
         /* e->stack 已被上面 memset(e, 0, sizeof(*e)) 清零，无需重复 memset */
@@ -725,7 +725,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
     e->ptr           = ptr;
     e->size          = size;
     e->alloc_num     = 0;
-    e->timestamp     = time(NULL);
+    e->timestamp     = mtt_now_sec();
     e->next          = NULL;
     e->stack_frames  = 0;
     /* e->stack 已被上面 memset(e, 0, sizeof(*e)) 清零，无需重复 memset */
