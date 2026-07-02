@@ -7,11 +7,11 @@
 ## 30 秒上手
 
 ```bash
-# 1. 编译（ARM32）
-make PLATFORM=arm32
+# 1. 编译（ARM32，Docker 交叉编译，已含 libunwind 静态链接）
+./scripts/compile-arm32.sh
 
 # 2. 编译 demo + 启动监控
-make PLATFORM=arm32 demo_controlled_leak
+make demo_controlled_leak
 LD_PRELOAD=./output/libmemorytracetool.so MTT_HTTP_PORT=8080 ./output/demo_controlled_leak &
 
 # 3. 浏览器打开 http://localhost:8080
@@ -20,11 +20,19 @@ LD_PRELOAD=./output/libmemorytracetool.so MTT_HTTP_PORT=8080 ./output/demo_contr
 ## 多平台编译
 
 ```bash
-make                    # x86_64 原生编译
-make PLATFORM=arm32     # ARM32 (arm-linux-gnueabihf)
-make PLATFORM=arm64     # ARM64 (aarch64-linux-gnu)
-make PLATFORM=x86       # x86_64（等于默认）
+make                    # 本机架构原生编译
+make ARCH=arm32         # ARM32 (arm-linux-gnueabihf)
+make ARCH=arm64         # ARM64 (aarch64-linux-gnu)
 ```
+
+Docker 一键编译（推荐，免装交叉工具链）：
+```bash
+./scripts/compile-arm32.sh           # ARM32 编译
+./scripts/compile-arm64.sh           # ARM64 编译
+./scripts/compile-arm32.sh clean test  # 清理 + 编译 + 跑测试
+```
+
+工具已**内置 libunwind**（vendored 在 `open/libunwind/`），单 `.so` 交付，目标机无需 `apt install libunwind8`，内网编译无需联网。
 
 产物在 `output/` 目录下（`.o` 中间文件自动清理于 `build/`）。
 
@@ -142,6 +150,7 @@ python3 tests/test_frontend_html.py    # HTML/JS/CSS 结构验证
 | M7 | `e004c6a` | test_stability 7→17 用例：并发配对/同桶竞争/读写并发/竞态初始化/realloc 压力 |
 | M8 | `e7d14fe` | 产物分离：output/ 最终产物 + build/ 中间 .o |
 | M9 | `c0bb2c4` | **栈深度 16→32** + RSS 进程内存跟踪 + GDB 运行时注入 + ARM32 栈溢出修复 |
+| M10 | `32aec7f` | **libunwind v1.8.2 vendored 静态链接** + 性能优化(pool_lock per-stripe + CLOCK_REALTIME_COARSE),单 .so 内置 unwind,目标机零依赖 |
 
 ## 验证状态
 
@@ -161,7 +170,7 @@ ARM32 验证环境：QEMU user 模式 (`qemu-arm-static -L /usr/arm-linux-gnueab
 
 ```bash
 # 1. 开发机交叉编译
-make clean PLATFORM=arm32 && make PLATFORM=arm32
+./scripts/compile-arm32.sh clean
 scp output/libmemorytracetool.so root@<bmc>:/tmp/
 
 # 2. BMC 上重启守护进程 + 注入监控
@@ -201,8 +210,8 @@ addr2line -e /path/to/daemon.debug -f -C 0x460
 ## 部署到 ARM 设备
 
 ```bash
-# 1. 编译（本机 WSL）
-make PLATFORM=arm32
+# 1. 编译（本机 WSL / Docker）
+./scripts/compile-arm32.sh
 
 # 2. 复制到设备
 scp output/libmemorytracetool.so root@<device>:/tmp/
@@ -213,7 +222,7 @@ LD_PRELOAD=/tmp/libmemorytracetool.so MTT_HTTP_PORT=8080 ./your_daemon
 
 ## 已知限制
 
-- `backtrace()` 是 glibc 扩展，musl / bionic 上栈回溯不可用（仍按大小统计）
+- 内置 libunwind 仍受目标二进制 unwind 信息约束：业务用 `-O2 -fomit-frame-pointer` 但**未加** `-funwind-tables` 时，ARM32 上仍只能拿到 1-2 帧（vs 5+ 帧需要 `-funwind-tables`）
 - 哈希表最大 65536 条活跃分配，超出静默跳过（可通过修改 `MTT_MAX_ENTRIES` 调整）
 - ARM32 需链接 `-latomic`（64-bit 原子操作依赖）
 - `/proc/self/exe` 不可用时进程名显示 "unknown"（回退到 `prctl(PR_GET_NAME)`）
@@ -235,17 +244,22 @@ CFLAGS += -funwind-tables -fno-omit-frame-pointer
 - `-fno-omit-frame-pointer`：保留帧指针链作为兜底
 - 体积开销：典型 `.text` 增大 <2%，对 release 二进制几乎无感
 
-### 方案 B（工具侧，无需重建目标）：等 libunwind 集成
+### 方案 B（工具侧，已内置）：libunwind 静态链接
 
-工具内嵌 libunwind 后，自动多策略 unwind（`.ARM.exidx` → DWARF → FP chain → stack scan），可在 `-fomit-frame-pointer` 二进制上拿到完整栈。`MTT_UNWINDER=libunwind|backtrace|auto` 环境变量切换。
+工具已**内置 libunwind v1.8.2**（vendored 在 `open/libunwind/`，静态链入 `.so`），自动多策略 unwind（`.ARM.exidx` → DWARF → FP chain → stack scan），在 `-fomit-frame-pointer` 二进制上能拿到比 glibc `backtrace()` 更深的栈。
+
+实测效果（ARM32 demo_nofp `-O2 -fomit-frame-pointer`）：
+- 仅 glibc `backtrace()`：0-2 帧，业务栈基本丢失
+- 内置 libunwind：业务栈能拿到至少 1 帧定位（如 `flasher+0x654`，可用 `addr2line` 精确定位）；目标加 `-funwind-tables` 后可达 5+ 帧
+
+目标机**无需 `apt install libunwind8`**，部署就跟之前一样：单 `.so` 文件 + `LD_PRELOAD`。
 
 ### 方案 C（运行时观测）：浅栈警告
 
 工具在扫描时若发现 >20% 分配的栈回溯少于 4 帧，会一次性输出 stderr 警告：
 ```
 [MTT] WARNING: 120/150 (80%) allocations have <4 frames.
-       Rebuild target with -funwind-tables -fno-omit-frame-pointer,
-       or set MTT_UNWINDER=libunwind once libunwind integration lands.
+       Rebuild target with -funwind-tables -fno-omit-frame-pointer
 ```
 即便 `MTT_DEBUG=0` 静默模式也会输出（属于关键诊断信息）。
 
@@ -253,8 +267,27 @@ CFLAGS += -funwind-tables -fno-omit-frame-pointer
 
 ARM EABI 的 `glibc backtrace()` 依赖 `.ARM.exidx` 段，遇到标记 `CANTUNWIND` 的条目立即终止。`-O2 -fomit-frame-pointer` 配合下，叶子函数常无栈帧、尾调用覆盖 LR、静态函数被内联，三者叠加导致 unwind 表不完整 → 2-3 帧就被截断。ARM64 上 `glibc backtrace()` 用 DWARF，对此类优化更鲁棒。
 
+## 性能优化（已落地，对业务透明）
+
+工具通过 `LD_PRELOAD` 拦截 malloc/free，每次 hook 都要打时间戳、操作 entry 池、回溯栈。多线程高频 alloc 场景下，热路径任何一处锁竞争或系统调用都会被放大。已落地的优化：
+
+| 优化点 | 改动 | 效果 |
+|--------|------|------|
+| **pool_lock per-stripe** | 单锁 → 64 把独立锁 + 64 桶 free_list，按 ptr/entry 地址分散 | 多线程高频 alloc 锁竞争降低 ~64x |
+| **CLOCK_REALTIME_COARSE** | `time(NULL)` 系统调用 → VDSO 无 syscall 实现 | 每次时间戳开销 ~1-2μs → 接近 0 |
+| **延迟符号解析** | dladdr/backtrace_symbols 移到 reporter 后台线程 | 热路径不做符号解析 |
+| **entry 对象池** | 启动时一次性 raw_malloc 大块,entry 复用槽位 | 热路径不调 libc malloc |
+| **64 段 stripe_lock** | 哈希桶链表 64 分段锁,缓存行对齐 | 多线程并发读写无伪共享 |
+
+业务接口变慢时的排查路径：
+1. 先 `MTT_DEBUG=0 MTT_HTTP_PORT=0` 关诊断 + Web 仪表盘,排除 IO 开销
+2. 仍慢 → 业务二进制加 `-funwind-tables -fno-omit-frame-pointer` 重编(降低 unwind 复杂度)
+3. 极端场景 → 启用采样 `MTT_SAMPLE_RATE=15`(约每 32KB 采一次,跳过 99% 小分配的栈回溯)
+
 ## 清理
 
 ```bash
-make clean    # 清除 build/ + output/
+make clean         # 清除 build/ + output/
+make vendor-clean  # 单独清 libunwind 构建产物(build/libunwind-*)
+make distclean     # clean + 清 sysroot/
 ```
