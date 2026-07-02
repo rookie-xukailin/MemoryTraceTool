@@ -1,14 +1,18 @@
 /*
- * MemoryTraceTool — libunwind 软依赖栈回溯。
+ * MemoryTraceTool — libunwind 栈回溯(静态链接 + dlopen 软依赖双模式)。
  *
- * 通过 dlopen 运行时加载 libunwind.so.8,失败时自动回退到 glibc backtrace()。
- * 避免对目标设备/构建工具链的硬依赖:libunwind 缺失不影响工具运行。
+ * 两种集成模式:
  *
- * 工作原理:
- *   1. 首次 mtt_libunwind_capture() 触发 pthread_once → try_load_libunwind()
- *   2. dlopen 尝试多个 soname(libunwind.so.8 / libunwind-aarch64.so.8 等)
- *   3. dlsym 解析 unw_backtrace 符号(可能名为 unw_backtrace 或 _UL_backtrace)
- *   4. 成功 → 后续调用直接走函数指针;失败 → 永久标记不可用,零开销短路
+ * 1. MTT_STATIC_LIBUNWIND (推荐,生产部署):
+ *    libunwind 源码作为 git submodule 编译进我们的 .so,-l:libunwind.a 静态链接。
+ *    优势:目标机零依赖,unw_backtrace 符号在链接期解析,运行时无 dlopen 开销。
+ *    详见 Makefile vendor/libunwind 构建目标。
+ *
+ * 2. dlopen 软依赖 (开发/CI 默认):
+ *    运行时 dlopen libunwind.so.8,缺失时自动回退到 glibc backtrace()。
+ *    适合开发机/CI 不愿引入 libunwind 源码的场景。
+ *
+ * 公共 API (mtt_libunwind_available / mtt_libunwind_capture) 两种模式下行为一致。
  *
  * 为什么选 unw_backtrace 而非 unw_init_local+step:
  *   - unw_backtrace 是 libunwind 提供的高层 API,内部自管理 cursor(可达 4KB)
@@ -24,7 +28,10 @@
 #define MTT_UNWIND_LIBUNWIND_H
 
 /**
- * 探测 libunwind 是否可用(懒加载 + 缓存结果)。
+ * 探测 libunwind 是否可用。
+ *
+ * 静态链接模式(MTT_STATIC_LIBUNWIND):始终返回 1(编译期已链入)。
+ * dlopen 模式:懒加载 + 缓存结果,首次调用触发探测。
  *
  * @return 1=可用,0=不可用
  */

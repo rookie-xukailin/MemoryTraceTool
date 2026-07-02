@@ -1,27 +1,64 @@
 /*
- * MemoryTraceTool — libunwind 软依赖栈回溯实现。
+ * MemoryTraceTool — libunwind 栈回溯实现(静态链接 + dlopen 软依赖双模式)。
  *
- * dlopen 加载 libunwind,dlsym 解析 unw_backtrace,函数指针缓存。
- * 失败时永久标记不可用,后续调用零开销短路(atomic load)。
+ * 详见 unwind_libunwind.h 头部说明。
  *
- * 多线程安全:
- *   - pthread_once 保证 try_load 只执行一次(跨所有线程)
- *   - 函数指针写入在 pthread_once 串行化区间,读取无锁
+ * 静态模式(MTT_STATIC_LIBUNWIND):
+ *   - unw_backtrace 在链接期解析到静态库符号,无 dlopen/dlsym/pthread_once 开销
+ *   - mtt_libunwind_available() 恒为 1
+ *
+ * dlopen 模式(默认):
+ *   - pthread_once 串行化首次加载,dlsym 解析 unw_backtrace
+ *   - 失败时永久标记不可用,后续调用零开销短路(atomic load)
  *   - dlsym/dlopen 本身线程安全(POSIX 保证)
  *
- * ARM32 Thumb bit 处理:
+ * ARM32 Thumb bit 处理(两种模式一致):
  *   libunwind 返回的地址在 Thumb 模式下 LSB=1,统一清除。
  *   复用 MTT_FIX_THUMB_ADDR 宏(mtt_internal.h)。
  */
 #define _GNU_SOURCE
 #include "unwind_libunwind.h"
 
-#include <dlfcn.h>
 #include <stddef.h>
 #include <stdatomic.h>
 #include <pthread.h>
 
 #include "mtt_internal.h"   /* MTT_FIX_THUMB_ADDR */
+
+/* ======================================================================== *
+ *                  模式 1: 静态链接(MTT_STATIC_LIBUNWIND)                    *
+ * ======================================================================== */
+
+#ifdef MTT_STATIC_LIBUNWIND
+
+#include <libunwind.h>   /* unw_backtrace 声明 */
+
+int mtt_libunwind_available(void)
+{
+    return 1;   /* 链接期已链入 unw_backtrace,始终可用 */
+}
+
+int mtt_libunwind_capture(void **frames, int max_frames)
+{
+    if (frames == NULL || max_frames <= 0) return -1;
+
+    int n = unw_backtrace(frames, max_frames);
+    if (n < 0) n = 0;
+
+    /* 清除 ARM32 Thumb bit(LSB=1),与 dlopen 路径后处理保持一致,
+     * 让下游 hash/dladdr 不受 Thumb 状态干扰 */
+    for (int i = 0; i < n; i++)
+        frames[i] = MTT_FIX_THUMB_ADDR(frames[i]);
+
+    return n;
+}
+
+#else
+/* ======================================================================== *
+ *                  模式 2: dlopen 软依赖(开发/CI 默认)                       *
+ * ======================================================================== */
+
+#include <dlfcn.h>
 
 /* libunwind unw_backtrace 函数指针类型
  * 原型: int unw_backtrace(void **buffer, int size);
@@ -130,3 +167,5 @@ int mtt_libunwind_capture(void **frames, int max_frames)
 
     return n;
 }
+
+#endif /* MTT_STATIC_LIBUNWIND */

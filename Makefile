@@ -28,7 +28,9 @@ ifneq ($(MTT_EMBEDDED),)
 endif
 
 CORE_CFLAGS = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
-CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS) $(EMBEDDED_DEFS)
+# MTT_STATIC_LIBUNWIND: 启用静态链接 libunwind(随产物发布,目标机无需预装)
+# 在 src/unwind_libunwind.c 切换为编译期直连 unw_backtrace,跳过 dlopen 探测
+CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS) $(EMBEDDED_DEFS) -DMTT_STATIC_LIBUNWIND
 
 CC       = $(CROSS_COMPILE)gcc
 
@@ -69,12 +71,47 @@ LIB_OBJS = $(BUILD_DIR)/hooks.o $(BUILD_DIR)/tracker.o \
 SHARED_LIB = $(OUTPUT_DIR)/libmemorytracetool.so
 
 .PHONY: all clean distclean demo demo_preload demo_long_running demo_controlled_leak \
-        test test_stability test_all sysroot-arm32
+        test test_stability test_all sysroot-arm32 vendor-clean
 
+# 默认目标必须出现在所有 .o/.a 构建规则之前,否则 make 无参数时
+# 会把第一个非 .PHONY 文件目标当作默认
 all: $(SHARED_LIB)
 
-$(SHARED_LIB): $(LIB_OBJS) | $(OUTPUT_DIR)
-	$(CC) -shared -o $@ $^ $(LDFLAGS)
+# ---- libunwind 静态库构建 ----
+# vendor/libunwind 是 git submodule(v1.8.2, MIT)。autotools bootstrap +
+# configure + make 产出 src/.libs/libunwind.a,直接链进我们的 .so,
+# 目标机无需预装 libunwind8。
+LIBUNWIND_SRC    := vendor/libunwind
+LIBUNWIND_BUILD  := $(BUILD_DIR)/libunwind-$(or $(ARCH),host)
+LIBUNWIND_STATIC := $(LIBUNWIND_BUILD)/src/.libs/libunwind.a
+# --host 三元组从 CROSS_COMPILE 推导:arm-linux-gnueabihf- → arm-linux-gnueabihf
+# 本机编译时 CROSS_COMPILE 为空,--host 留空,configure 自动检测
+LIBUNWIND_HOST   := $(patsubst %-,%,$(CROSS_COMPILE))
+
+# libunwind 静态库构建目标:
+# 1. configure 不存在则 autoreconf -i 生成(autotools bootstrap)
+# 2. 在独立 build 目录跑 configure(--host 交叉编译 / --enable-static / --disable-shared)
+# 3. make 产出 libunwind.a
+# 注意:cd 进入 build 目录后,$(LIBUNWIND_SRC)/configure 相对路径会失效,
+# 必须用 $(CURDIR) 锚定到项目根。
+$(LIBUNWIND_STATIC): | $(LIBUNWIND_SRC)/configure
+	@mkdir -p $(LIBUNWIND_BUILD)
+	cd $(LIBUNWIND_BUILD) && \
+	    $(CURDIR)/$(LIBUNWIND_SRC)/configure \
+	        $(if $(LIBUNWIND_HOST),--host=$(LIBUNWIND_HOST)) \
+	        --enable-static --disable-shared \
+	        --disable-min-unwind-check \
+	        --disable-tests \
+	        CC="$(CC)" CFLAGS="$(ARCH_FLAGS) -O2 -fPIC -fno-omit-frame-pointer"
+	$(MAKE) -C $(LIBUNWIND_BUILD) -j4 V=0
+
+# autotools bootstrap:首次 checkout submodule 后需 autoreconf 生成 configure
+$(LIBUNWIND_SRC)/configure:
+	cd $(LIBUNWIND_SRC) && autoreconf -i
+
+$(SHARED_LIB): $(LIB_OBJS) $(LIBUNWIND_STATIC) | $(OUTPUT_DIR)
+	$(CC) -shared -o $@ $(LIB_OBJS) $(LIBUNWIND_STATIC) \
+	    -Wl,--exclude-libs,ALL $(LDFLAGS)
 	@rm -f $(BUILD_DIR)/*.o
 
 $(BUILD_DIR)/hooks.o: $(SRC_DIR)/hooks.c $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
@@ -101,8 +138,8 @@ $(BUILD_DIR)/http_server.o: $(SRC_DIR)/http_server.c $(SRC_DIR)/http_server.h $(
 $(BUILD_DIR)/addr_validate.o: $(SRC_DIR)/addr_validate.c $(SRC_DIR)/addr_validate.h $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
-$(BUILD_DIR)/unwind_libunwind.o: $(SRC_DIR)/unwind_libunwind.c $(SRC_DIR)/unwind_libunwind.h $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
+$(BUILD_DIR)/unwind_libunwind.o: $(SRC_DIR)/unwind_libunwind.c $(SRC_DIR)/unwind_libunwind.h $(SRC_DIR)/mtt_internal.h $(LIBUNWIND_STATIC) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INC_SHARED) $(if $(filter -DMTT_STATIC_LIBUNWIND,$(CFLAGS)),-I$(LIBUNWIND_BUILD)/include -I$(LIBUNWIND_SRC)/include) -c -o $@ $<
 
 $(BUILD_DIR) $(OUTPUT_DIR):
 	mkdir -p $@
@@ -137,6 +174,11 @@ clean:
 
 distclean: clean
 	rm -rf sysroot/
+
+# 清理 libunwind 构建产物(独立于 clean,避免普通 clean 触发完整 rebuild)
+vendor-clean:
+	rm -rf $(BUILD_DIR)/libunwind-*
+	@cd $(LIBUNWIND_SRC) && git clean -fdx 2>/dev/null || true
 
 sysroot-arm32:
 	@echo "正在从 Docker 提取 ARM32 sysroot..."
