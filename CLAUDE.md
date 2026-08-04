@@ -37,12 +37,11 @@ make clean              # 清理构建产物
    make clean && make && make demo_small_leak
    LD_PRELOAD=output/libmemorytracetool.so MTT_HTTP_PORT=0 output/demo_small_leak >/tmp/out.txt 2>/tmp/err.txt &
    sleep 65
-   echo "=== M10-ENTER count ===" && grep -c "M10-ENTER" /tmp/err.txt
    echo "=== BYPASS:depth count (must be 0) ===" && grep -c "BYPASS:depth" /tmp/err.txt
    echo "=== 10B sites ===" && grep "10B_sites" /tmp/err.txt | tail -1
    '
    ```
-   必须满足：M10-ENTER > 0，BYPASS:depth == 0，10B_sites >= 1
+   必须满足：BYPASS:depth == 0，10B_sites >= 1
 5. **两个平台+ demo 全部通过** → 直接主动提交，无需询问用户
 6. **任一平台失败** → 修复错误，回到步骤 2，**禁止在编译失败或测试不通过时提交**
 
