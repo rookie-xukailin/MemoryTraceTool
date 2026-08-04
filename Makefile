@@ -86,8 +86,11 @@ LIBUNWIND_SRC    := open/libunwind
 LIBUNWIND_BUILD  := $(BUILD_DIR)/libunwind-$(or $(ARCH),host)
 LIBUNWIND_STATIC := $(LIBUNWIND_BUILD)/src/.libs/libunwind.a
 # --host 三元组从 CROSS_COMPILE 推导:arm-linux-gnueabihf- → arm-linux-gnueabihf
+# 必须用 $(notdir ...) 剥掉目录前缀,否则 CROSS_COMPILE 是全路径时
+# (如 /home1/x/.../bin/arm-gcc13-linux-gnueabi-)
+# --host 会收到整条路径,config.sub 报 "more than four components"。
 # 本机编译时 CROSS_COMPILE 为空,--host 留空,configure 自动检测
-LIBUNWIND_HOST   := $(patsubst %-,%,$(CROSS_COMPILE))
+LIBUNWIND_HOST   := $(patsubst %-,%,$(notdir $(CROSS_COMPILE)))
 
 # libunwind 静态库构建目标:
 #   在独立 build 目录跑 configure(--host 交叉编译 / --enable-static / --disable-shared)
@@ -109,7 +112,6 @@ $(LIBUNWIND_STATIC): $(LIBUNWIND_SRC)/configure
 	    $(CURDIR)/$(LIBUNWIND_SRC)/configure \
 	        $(if $(LIBUNWIND_HOST),--host=$(LIBUNWIND_HOST)) \
 	        --enable-static --disable-shared \
-	        --disable-min-unwind-check \
 	        --disable-tests \
 	        CC="$(CC)" CFLAGS="$(ARCH_FLAGS) -O2 -fPIC -fno-omit-frame-pointer"
 	$(MAKE) -C $(LIBUNWIND_BUILD) -j4 V=0
