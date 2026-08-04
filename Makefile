@@ -96,6 +96,15 @@ LIBUNWIND_HOST   := $(patsubst %-,%,$(CROSS_COMPILE))
 # 必须用 $(CURDIR) 锚定到项目根。
 $(LIBUNWIND_STATIC): $(LIBUNWIND_SRC)/configure
 	@mkdir -p $(LIBUNWIND_BUILD)
+	@# 暴力自愈: core.autocrlf=true 的环境会把 configure 检出成 CRLF,
+	@# 导致 "/bin/sh^M: bad interpreter"。检测到就 strip,无需用户手动 sed。
+	@if file $(LIBUNWIND_SRC)/configure | grep -q 'CRLF'; then \
+	    echo "[MTT] libunwind autotools 文件含 CRLF,暴力 strip..."; \
+	    find $(LIBUNWIND_SRC) -type f \
+	        \( -name 'configure' -o -name '*.in' -o -name '*.m4' -o -name 'aclocal.m4' \) \
+	        -exec perl -i -pe 's/\r$$//' {} +; \
+	    find $(LIBUNWIND_SRC)/config -type f -exec perl -i -pe 's/\r$$//' {} +; \
+	fi
 	cd $(LIBUNWIND_BUILD) && \
 	    $(CURDIR)/$(LIBUNWIND_SRC)/configure \
 	        $(if $(LIBUNWIND_HOST),--host=$(LIBUNWIND_HOST)) \
