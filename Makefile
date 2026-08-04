@@ -113,6 +113,14 @@ $(LIBUNWIND_STATIC): $(LIBUNWIND_SRC)/configure
 	        $(if $(LIBUNWIND_HOST),--host=$(LIBUNWIND_HOST)) \
 	        --enable-static --disable-shared \
 	        --disable-tests \
+	        --disable-coredump \
+	        --disable-ptrace \
+	        --disable-setjmp \
+	        --disable-nto \
+	        --disable-cxx-exceptions \
+	        --disable-minidebuginfo \
+	        --disable-zlibdebuginfo \
+	        --disable-documentation \
 	        CC="$(CC)" CFLAGS="$(ARCH_FLAGS) -O2 -fPIC -fno-omit-frame-pointer"
 	$(MAKE) -C $(LIBUNWIND_BUILD) -j4 V=0
 
