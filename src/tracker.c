@@ -757,6 +757,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
 
         /* 清零整个结构体（同原 raw_malloc 路径，防止上次使用残留泄漏到栈缓存） */
         memset(e, 0, sizeof(*e));
+        mtt_log_stage(40, "entry_new pool took e=%p", (void*)e);
 
         e->ptr           = ptr;
         e->size          = size;
@@ -767,6 +768,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
         /* e->stack 已被上面 memset(e, 0, sizeof(*e)) 清零，无需重复 memset */
 
         mtt_capture_stack(e);
+        mtt_log_stage(41, "entry_new capture_stack done frames=%d", e->stack_frames);
         return e;
     }
 

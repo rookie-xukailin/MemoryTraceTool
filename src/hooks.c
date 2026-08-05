@@ -194,6 +194,7 @@ void* malloc(size_t size)
     ctx->in_hook = saved_hook;
         return NULL;
     }
+    mtt_log_stage(26, "malloc raw_malloc done ptr=%p size=%zu", ptr, size);
 
     /* 采样与容量检查（不满足条件则放行不追踪） */
     {
@@ -205,6 +206,7 @@ void* malloc(size_t size)
             return ptr;
         }
     }
+    mtt_log_stage(27, "malloc past track/cap checks, calling entry_new");
 
     /* 创建追踪记录（内部使用 raw_malloc） */
     mtt_entry_t *e = mtt_entry_new(ptr, size);
@@ -213,6 +215,7 @@ void* malloc(size_t size)
     ctx->in_hook = saved_hook;
         return ptr; /* 追踪失败不阻塞业务 */
     }
+    mtt_log_stage(28, "malloc entry_new done e=%p frames=%d", (void*)e, e->stack_frames);
 
     /* 持锁插入哈希表 + 原子更新计数器 */
     mtt_stripe_lock(s, ptr);
@@ -256,6 +259,7 @@ void* malloc(size_t size)
 
     mtt_entry_add(s, e);
     mtt_stripe_unlock(s, ptr);
+    mtt_log_stage(29, "malloc entry_add done, returning ptr=%p", ptr);
 
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
