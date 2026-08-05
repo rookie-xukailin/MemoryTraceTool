@@ -86,6 +86,12 @@ raw_posix_memalign_fn volatile raw_posix_memalign = NULL;
  * =0 时屏蔽所有 stderr 诊断,只保留 leak 报告 + heartbeat。 */
 _Atomic int mtt_debug_enabled = MTT_DEBUG_DEFAULT;
 
+/* 栈回溯模式(由环境变量 MTT_UNWINDER 控制):
+ * 0 = auto(libunwind 优先,失败 fallback backtrace)
+ * 1 = libunwind only
+ * 2 = glibc backtrace only(绕过 libunwind,HDM3 等环境崩溃时的 workaround) */
+int g_unwinder_mode = 0;
+
 /* ======================================================================== *
  *                    阶段标记日志(MTT_DEBUG=1 时定位崩溃用)                  *
  * ======================================================================== */
@@ -369,19 +375,22 @@ void mtt_resolve_raw_allocators(void)
 void mtt_capture_stack(mtt_entry_t *entry)
 {
     if (entry == NULL) return;
+    mtt_log_stage(60, "capture_stack enter entry=%p", (void*)entry);
 
     mtt_per_thread_t *ctx = mtt_thread_get();
     if (ctx == NULL || ctx->in_capture) {
         entry->stack_frames = 0;
+        mtt_log_stage(61, "capture_stack skip (ctx null or in_capture)");
         return;
     }
+    mtt_log_stage(62, "capture_stack ctx ok, in_capture=%d", ctx->in_capture);
 
     int saved = ctx->in_capture;
     ctx->in_capture = 1;
 
     int bt_frames = 0;
 
-    /* 优先路径:libunwind(若可用)
+    /* 优先路径:libunwind(若可用且未被 MTT_UNWINDER=backtrace 禁用)
      * libunwind 内建 ARM EHABI + DWARF + FP chain 多策略 unwind,在 ARM32
      * -O2 -fomit-frame-pointer 二进制上通常能拿到比 glibc backtrace() 更深的栈
      * (实测 demo_nofp -O2 -fomit-frame-pointer:libunwind 5 帧 vs backtrace 3 帧)。
@@ -390,15 +399,22 @@ void mtt_capture_stack(mtt_entry_t *entry)
      * 注意:libunwind 仍受目标二进制的 .ARM.exidx 完整性约束 —— 若目标
      * 编译时未加 -funwind-tables,无 unwind 信息的函数处仍会终止。
      * 工具检测到此场景会输出 WARNING 提示用户重建(见 reporter.c Phase 1.3)。 */
-    if (mtt_libunwind_available()) {
+    int use_libunwind = (g_unwinder_mode != 2);
+    mtt_log_stage(63, "capture_stack use_libunwind=%d (mode=%d)",
+                  use_libunwind, g_unwinder_mode);
+    if (use_libunwind && mtt_libunwind_available()) {
+        mtt_log_stage(70, "capture_stack calling mtt_libunwind_capture");
         int n = mtt_libunwind_capture(entry->stack, MTT_STACK_DEPTH);
+        mtt_log_stage(71, "capture_stack libunwind returned n=%d", n);
         if (n >= 2) {
             entry->stack_frames = n;
             ctx->in_capture = saved;
+            mtt_log_stage(72, "capture_stack done via libunwind frames=%d", n);
             return;
         }
         /* libunwind 拿到 0-1 帧:可能 libunwind 自身出问题或栈太浅,
          * 落回 glibc backtrace 再试一次 */
+        mtt_log_stage(73, "capture_stack libunwind weak (%d<2), falling back", n);
     }
 
 #if MTT_HAS_BACKTRACE
@@ -688,7 +704,7 @@ void mtt_entry_add(mtt_state_t *s, mtt_entry_t *entry)
     atomic_fetch_add_explicit(&s->entry_count, 1, memory_order_relaxed);
     mtt_log_stage(50, "entry_add bucket=%u entry=%p ptr=%p count=%zu",
                   bucket, (void*)entry, (void*)entry->ptr,
-                  atomic_load_explicit(&s->entry_count, memory_order_relaxed));
+                  (size_t)atomic_load_explicit(&s->entry_count, memory_order_relaxed));
 }
 
 /**
@@ -1008,6 +1024,15 @@ void mtt_ensure_init(void)
         } else {
             s->lib_blacklist[0] = '\0';
             s->lib_blacklist_ready = 0;
+        }
+
+        /* 栈回溯选择（MTT_UNWINDER=auto|libunwind|backtrace）
+         * HDM3 等环境如果 libunwind 崩,设 MTT_UNWINDER=backtrace 绕过 */
+        const char *env_unw = getenv("MTT_UNWINDER");
+        if (env_unw != NULL) {
+            if (strcmp(env_unw, "libunwind") == 0) g_unwinder_mode = 1;
+            else if (strcmp(env_unw, "backtrace") == 0) g_unwinder_mode = 2;
+            else g_unwinder_mode = 0;  /* auto */
         }
     }
 
