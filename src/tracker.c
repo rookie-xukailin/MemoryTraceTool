@@ -432,17 +432,31 @@ void mtt_capture_stack(mtt_entry_t *entry)
         }
     }
 
-    /* backtrace 路径:降级线程跳过(同栈 libunwind 崩过,_Unwind_Backtrace 必崩) */
-    if (!disabled) {
+    /* backtrace 路径:
+     *   - !disabled:正常线程,backtrace 直接调(无保护,默认栈不会崩)
+     *   - disabled :libunwind 在本线程崩过,后续 capture 的栈不一定都坏,
+     *                仍要尝试 backtrace 拿浅栈。但 backtrace 内部走
+     *                _Unwind_Backtrace 也可能踩同一个雷,用 mtt_safe_backtrace
+     *                包信号保护,崩了返回 0 走 FP chain 兜底。
+     *                之前 v1 实现错误地完全跳过 backtrace,导致长期持有的
+     *                内存(leak 表里大部分 entry)全部丢失栈信息 */
 #if MTT_HAS_BACKTRACE
+    if (!disabled) {
         entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
         if (entry->stack_frames < 0)
             entry->stack_frames = 0;
         for (int i = 0; i < entry->stack_frames; i++)
             entry->stack[i] = MTT_FIX_THUMB_ADDR(entry->stack[i]);
         bt_frames = entry->stack_frames;
-#endif
+    } else {
+        entry->stack_frames = mtt_safe_backtrace(entry->stack, MTT_STACK_DEPTH);
+        if (entry->stack_frames < 0)
+            entry->stack_frames = 0;
+        for (int i = 0; i < entry->stack_frames; i++)
+            entry->stack[i] = MTT_FIX_THUMB_ADDR(entry->stack[i]);
+        bt_frames = entry->stack_frames;
     }
+#endif
 
     /* FP chain 兜底:仅当 backtrace 完全失败(0 帧)时启用。
      *

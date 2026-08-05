@@ -61,4 +61,23 @@ int mtt_libunwind_capture(void **frames, int max_frames);
  */
 int mtt_libunwind_thread_disabled(void);
 
+/**
+ * 调用 glibc backtrace(),带 SIGSEGV/SIGBUS 信号保护。
+ *
+ * 用途:libunwind 被本线程降级(thread_disabled)后的兜底栈回溯。
+ * glibc backtrace 内部走 libgcc _Unwind_Backtrace,在缺 .ARM.exidx
+ * 的栈上同样会崩。本函数包信号保护,崩了 siglongjmp 跳回,返回 0,
+ * 让上层走 FP chain 兜底,不 core dump。
+ *
+ * 注意:per-thread 降级后**不应完全跳过 backtrace**——只有 libunwind
+ * 踩雷的那次 capture 的栈是坏栈,后续 capture 栈不同(不同 malloc
+ * 调用点),backtrace 大概率正常。直接跳过会让长期持有的内存全部
+ * 丢失栈信息(leak 表全是空栈)。
+ *
+ * @param frames      输出帧数组
+ * @param max_frames  数组容量
+ * @return            ≥0=帧数,踩雷或调用失败返回 0
+ */
+int mtt_safe_backtrace(void **frames, int max_frames);
+
 #endif /* MTT_UNWIND_LIBUNWIND_H */

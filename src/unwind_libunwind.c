@@ -429,3 +429,73 @@ int mtt_libunwind_capture(void **frames, int max_frames)
 }
 
 #endif /* MTT_STATIC_LIBUNWIND */
+
+/* ======================================================================== *
+ *        共享:glibc backtrace 信号保护(thread_disabled 后兜底)              *
+ * ======================================================================== */
+
+#if MTT_HAS_BACKTRACE
+#include <execinfo.h>
+
+/**
+ * 调用 glibc backtrace(),复用 libunwind 路径已有的 SIGSEGV/SIGBUS 保护框架。
+ *
+ * 设计:与 mtt_libunwind_capture 共享 g_unwind_mutex / g_unwind_jmp / handler。
+ * backtrace 内部走 libgcc _Unwind_Backtrace,在缺 .ARM.exidx 的栈上会崩,
+ * 信号保护让它跳回返回 0,让上层走 FP chain 兜底,不 core dump。
+ *
+ * 何时用:libunwind 本线程被降级后(thread_disabled),仍需尝试 backtrace
+ * 拿浅栈——后续 capture 栈不同(不同 malloc 调用点),backtrace 大概率正常。
+ * 直接跳过 backtrace 会让长期持有的内存全无栈信息(leak 表全是空栈)。
+ */
+int mtt_safe_backtrace(void **frames, int max_frames)
+{
+    if (frames == NULL || max_frames <= 0) return 0;
+
+    struct sigaction old_segv, old_bus;
+    struct sigaction sa;
+    sa.sa_sigaction = mtt_unwind_crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+
+    pthread_mutex_lock(&g_unwind_mutex);
+
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS,  &sa, &old_bus);
+
+    g_in_unwind_call = 1;
+    int sig = sigsetjmp(g_unwind_jmp, 1);
+
+    int n = 0;
+    int crashed = (sig != 0);
+    if (!crashed) {
+        n = backtrace(frames, max_frames);
+        if (n < 0) n = 0;
+    }
+    g_in_unwind_call = 0;
+
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS,  &old_bus, NULL);
+
+    pthread_mutex_unlock(&g_unwind_mutex);
+
+    if (crashed) {
+        /* backtrace 踩雷(同一栈上 _Unwind_Backtrace 也踩):返回 0,
+         * 上层走 FP chain 兜底。不 mark thread_disabled——下次 capture
+         * 栈不同,backtrace 大概率正常 */
+        mtt_log_stage(35, "backtrace crashed (signal %d), skip to FP chain", sig);
+        return 0;
+    }
+    return n;
+}
+
+#else /* !MTT_HAS_BACKTRACE */
+
+/* 非 glibc 平台(musl/bionic):backtrace 不存在,直接返回 0 */
+int mtt_safe_backtrace(void **frames, int max_frames)
+{
+    (void)frames; (void)max_frames;
+    return 0;
+}
+
+#endif /* MTT_HAS_BACKTRACE */
