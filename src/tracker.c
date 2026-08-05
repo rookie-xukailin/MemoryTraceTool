@@ -107,8 +107,13 @@ void mtt_log_stage(int stage_id, const char *fmt, ...)
     if (!atomic_load_explicit(&mtt_debug_enabled, memory_order_relaxed))
         return;
 
+    /* 取低 12 位作为线程短 ID(够区分线程,不暴露真实 tid 隐私),
+     * 方便区分日志是同一线程顺序产生还是多线程交错产生 */
+    unsigned long tid_short = (unsigned long)pthread_self() & 0xFFF;
+
     char buf[256];
-    int off = snprintf(buf, sizeof(buf), "[MTT] S%d: ", stage_id);
+    int off = snprintf(buf, sizeof(buf), "[MTT] S%d [t=%03lx]: ",
+                       stage_id, tid_short);
     if (off <= 0 || off >= (int)sizeof(buf)) return;
 
     va_list ap;
@@ -619,6 +624,8 @@ void mtt_entry_remove(mtt_state_t *s, const void *ptr)
             mtt_entry_t *dead = *pp;
             *pp = dead->next;
             atomic_fetch_sub_explicit(&s->entry_count, 1, memory_order_relaxed);
+            mtt_log_stage(51, "entry_remove bucket=%u entry=%p ptr=%p",
+                          bucket, (void*)dead, (void*)ptr);
 
             /* 池子模式：清空关键字段后按 entry 地址算 stripe 归还对应桶 */
             if (s->pool != NULL) {
@@ -629,6 +636,8 @@ void mtt_entry_remove(mtt_state_t *s, const void *ptr)
                 s->pool_free_lists[idx] = dead;
                 pthread_mutex_unlock(&s->pool_locks[idx].lock);
                 atomic_fetch_sub_explicit(&s->pool_used, 1, memory_order_relaxed);
+                mtt_log_stage(52, "entry_remove returned to pool stripe=%u entry=%p",
+                              idx, (void*)dead);
             } else if (raw_free != NULL) {
                 /* Fallback：直接 raw_free */
                 raw_free(dead);
@@ -677,6 +686,9 @@ void mtt_entry_add(mtt_state_t *s, mtt_entry_t *entry)
     entry->next = s->buckets[bucket];
     s->buckets[bucket] = entry;
     atomic_fetch_add_explicit(&s->entry_count, 1, memory_order_relaxed);
+    mtt_log_stage(50, "entry_add bucket=%u entry=%p ptr=%p count=%zu",
+                  bucket, (void*)entry, (void*)entry->ptr,
+                  atomic_load_explicit(&s->entry_count, memory_order_relaxed));
 }
 
 /**
@@ -691,6 +703,7 @@ void mtt_entry_add(mtt_state_t *s, mtt_entry_t *entry)
 void mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e)
 {
     if (s == NULL || e == NULL) return;
+    mtt_log_stage(53, "entry_discard entry=%p", (void*)e);
 
     if (s->pool != NULL) {
         memset(e, 0, sizeof(*e));
@@ -700,6 +713,8 @@ void mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e)
         s->pool_free_lists[idx] = e;
         pthread_mutex_unlock(&s->pool_locks[idx].lock);
         atomic_fetch_sub_explicit(&s->pool_used, 1, memory_order_relaxed);
+        mtt_log_stage(54, "entry_discard returned to pool stripe=%u entry=%p",
+                      idx, (void*)e);
     } else if (raw_free != NULL) {
         raw_free(e);
     }
