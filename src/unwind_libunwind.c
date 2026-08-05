@@ -5,12 +5,23 @@
  *
  * 静态模式(MTT_STATIC_LIBUNWIND):
  *   - unw_backtrace 在链接期解析到静态库符号,无 dlopen/dlsym/pthread_once 开销
- *   - mtt_libunwind_available() 恒为 1
+ *   - mtt_libunwind_available() 恒为 1(除非运行时崩溃被永久禁用)
  *
  * dlopen 模式(默认):
  *   - pthread_once 串行化首次加载,dlsym 解析 unw_backtrace
  *   - 失败时永久标记不可用,后续调用零开销短路(atomic load)
  *   - dlsym/dlopen 本身线程安全(POSIX 保证)
+ *
+ * SIGSEGV/SIGBUS 信号保护(双模式共有):
+ *   背景:libunwind 1.8.2 在 ARM32 上走到某些缺 .ARM.exidx 的 .so 内部
+ *   时,unw_step 可能解引用无效指针触发 SIGSEGV,整个被监控进程崩溃。
+ *   典型场景:HDM3 storageManager 进程加载闭源厂商库,libunwind 走进去就崩。
+ *
+ *   方案:
+ *   - 全局 mutex 串行化 capture 调用
+ *   - sigaction 临时注册 SIGSEGV/SIGBUS handler
+ *   - sigsetjmp 保存上下文,handler 用 siglongjmp 跳回
+ *   - 崩过一次永久标记 libunwind 不可用,后续零开销走 backtrace fallback
  *
  * ARM32 Thumb bit 处理(两种模式一致):
  *   libunwind 返回的地址在 Thumb 模式下 LSB=1,统一清除。
@@ -22,8 +33,109 @@
 #include <stddef.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <unistd.h>
 
-#include "mtt_internal.h"   /* MTT_FIX_THUMB_ADDR */
+#include "mtt_internal.h"   /* MTT_FIX_THUMB_ADDR, mtt_log_stage */
+
+/* ======================================================================== *
+ *                  共享:SIGSEGV/SIGBUS 信号保护                             *
+ * ======================================================================== */
+
+/* 永久禁用标志:运行时崩溃后置 1,后续所有 capture 走 backtrace fallback。
+ * 用 atomic 保证多线程可见性,崩溃后所有线程立即停止使用 libunwind */
+static _Atomic int g_libunwind_disabled = 0;
+
+/* 串行化 mutex:同一时刻只有一个线程在 unw_backtrace 调用中,
+ * 防止多线程同时触发 handler 时跳错 sigjmp_buf */
+static pthread_mutex_t g_unwind_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* sigsetjmp 缓冲区 + 进入标志。
+ * mutex 保证单线程独占,这两个变量无需 thread_local */
+static sigjmp_buf          g_unwind_jmp;
+static volatile sig_atomic_t g_in_unwind_call = 0;
+
+/**
+ * SIGSEGV/SIGBUS 临时 handler:libunwind 崩溃时跳回 capture 调用点。
+ *
+ * 设计要点:
+ *   - 仅在 g_in_unwind_call=1 时拦截,其余场景恢复 SIG_DFL 并 raise,
+ *     不影响进程原有信号处理(被监控业务可能依赖 SIGSEGV 跑 core dump)
+ *   - siglongjmp 是 async-signal-safe(POSIX 明确保证)
+ *   - 不持有任何锁,跳回后由 mtt_safe_unw_backtrace 继续清理 */
+static void mtt_unwind_crash_handler(int sig, siginfo_t *info, void *uctx)
+{
+    (void)info; (void)uctx;
+    if (g_in_unwind_call) {
+        /* 在 libunwind 调用中触发信号:跳回 sigsetjmp 调用点,
+         * siglongjmp 第二参数传 sig(非零),sigsetjmp 返回 sig */
+        g_in_unwind_call = 0;
+        siglongjmp(g_unwind_jmp, sig);
+    }
+    /* 不在 libunwind 调用中:恢复默认处理,重新 raise 让进程走原 core dump 流程 */
+    struct sigaction dfl;
+    dfl.sa_handler = SIG_DFL;
+    dfl.sa_flags = 0;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, NULL);
+    raise(sig);
+}
+
+/**
+ * 调用 unw_backtrace,带 SIGSEGV/SIGBUS 信号保护。
+ *
+ * 流程:
+ *   1. 加锁串行化
+ *   2. 临时安装 SIGSEGV/SIGBUS handler
+ *   3. sigsetjmp 保存上下文
+ *   4. 调用 unw_backtrace
+ *   5. 恢复原 handler,解锁
+ *   6. 若崩溃:永久禁用 libunwind,返回 -1
+ *
+ * @param fn         unw_backtrace 函数指针(静态模式直接取 &unw_backtrace)
+ * @param frames     输出帧数组
+ * @param max_frames 数组容量
+ * @return           ≥0=帧数,-1=libunwind 崩溃或调用失败 */
+static int mtt_safe_unw_backtrace(int (*fn)(void **, int),
+                                  void **frames, int max_frames)
+{
+    struct sigaction old_segv, old_bus;
+    struct sigaction sa;
+    sa.sa_sigaction = mtt_unwind_crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+
+    pthread_mutex_lock(&g_unwind_mutex);
+
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS,  &sa, &old_bus);
+
+    g_in_unwind_call = 1;
+    int sig = sigsetjmp(g_unwind_jmp, 1);
+
+    int n = 0;
+    int crashed = (sig != 0);
+    if (!crashed) {
+        n = fn(frames, max_frames);
+        if (n < 0) n = 0;
+    }
+    g_in_unwind_call = 0;
+
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS,  &old_bus, NULL);
+
+    pthread_mutex_unlock(&g_unwind_mutex);
+
+    if (crashed) {
+        /* 永久禁用 libunwind:所有线程后续直接走 backtrace fallback,
+         * atomic_store 保证其他线程立即可见 */
+        atomic_store_explicit(&g_libunwind_disabled, 1, memory_order_release);
+        mtt_log_stage(31, "unw_backtrace crashed (signal %d), libunwind disabled permanently", sig);
+        return -1;
+    }
+    return n;
+}
 
 /* ======================================================================== *
  *                  模式 1: 静态链接(MTT_STATIC_LIBUNWIND)                    *
@@ -35,20 +147,33 @@
 
 int mtt_libunwind_available(void)
 {
-    return 1;   /* 链接期已链入 unw_backtrace,始终可用 */
+    /* 静态链接:符号已链入,但运行时崩溃后被永久禁用则返回 0 */
+    if (atomic_load_explicit(&g_libunwind_disabled, memory_order_acquire))
+        return 0;
+    return 1;
 }
 
 int mtt_libunwind_capture(void **frames, int max_frames)
 {
     if (frames == NULL || max_frames <= 0) return -1;
 
+    /* 运行时崩溃后永久短路,零开销 */
+    if (atomic_load_explicit(&g_libunwind_disabled, memory_order_acquire))
+        return -1;
+
     /* 第一次调用时输出阶段日志,定位 libunwind 是否触发 */
     static _Atomic int g_first_capture = 1;
     int is_first = atomic_compare_exchange_strong(&g_first_capture,
                                                   &(int){1}, 0);
 
-    int n = unw_backtrace(frames, max_frames);
-    if (n < 0) n = 0;
+    int n = mtt_safe_unw_backtrace(unw_backtrace, frames, max_frames);
+    if (n < 0) {
+        /* 崩溃或失败,返回 -1,让上层 fallback 到 backtrace */
+        if (is_first) {
+            mtt_log_stage(30, "first unw_backtrace failed/crashed");
+        }
+        return -1;
+    }
 
     if (is_first) {
         mtt_log_stage(30, "first unw_backtrace done frames=%d", n);
@@ -154,6 +279,9 @@ static void try_load_libunwind(void)
 
 int mtt_libunwind_available(void)
 {
+    /* 运行时崩溃后永久禁用 */
+    if (atomic_load_explicit(&g_libunwind_disabled, memory_order_acquire))
+        return 0;
     pthread_once(&g_libunwind.once, try_load_libunwind);
     return atomic_load_explicit(&g_libunwind.available, memory_order_acquire) == 1;
 }
@@ -162,12 +290,16 @@ int mtt_libunwind_capture(void **frames, int max_frames)
 {
     if (frames == NULL || max_frames <= 0) return -1;
 
+    /* 运行时崩溃后永久短路 */
+    if (atomic_load_explicit(&g_libunwind_disabled, memory_order_acquire))
+        return -1;
+
     pthread_once(&g_libunwind.once, try_load_libunwind);
     if (atomic_load_explicit(&g_libunwind.available, memory_order_acquire) != 1)
         return -1;
 
-    int n = g_libunwind.backtrace(frames, max_frames);
-    if (n < 0) n = 0;
+    int n = mtt_safe_unw_backtrace(g_libunwind.backtrace, frames, max_frames);
+    if (n < 0) return -1;
 
     /* 清除 ARM32 Thumb bit(LSB=1),与 backtrace() 后处理保持一致,
      * 让下游 hash/dladdr 不受 Thumb 状态干扰 */
