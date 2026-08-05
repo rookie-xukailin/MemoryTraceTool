@@ -981,7 +981,14 @@ void mtt_ensure_init(void)
     size_t   want_srate    = MTT_SAMPLE_RATE_DEFAULT; /* 默认使用字节统计采样 */
     time_t   want_leak_threshold = MTT_LEAK_THRESHOLD_DEFAULT;
     time_t   want_skip_startup   = MTT_SKIP_STARTUP_DEFAULT;
-    size_t   want_pool_entries   = MTT_POOL_ENTRIES_DEFAULT; /* 池子容量，可被 MTT_POOL_ENTRIES 覆盖 */
+    /* entry 池容量:默认按 MTT_POOL_TARGET_BYTES(20MB) 反推 entry 数,
+     * 让两个平台 pool 预占用都接近 20MB:
+     *   ARM32 sizeof(mtt_entry_t)=288B → ~72817 entries × 288B = 20MB
+     *   ARM64 sizeof(mtt_entry_t)=560B → ~37449 entries × 560B = 20MB
+     * 被 [MIN, MAX] 夹紧,可被 MTT_POOL_ENTRIES 环境变量覆盖 */
+    size_t   want_pool_entries   = MTT_POOL_TARGET_BYTES / sizeof(mtt_entry_t);
+    if (want_pool_entries < MTT_POOL_ENTRIES_MIN) want_pool_entries = MTT_POOL_ENTRIES_MIN;
+    if (want_pool_entries > MTT_POOL_ENTRIES_MAX) want_pool_entries = MTT_POOL_ENTRIES_MAX;
     int      want_debug    = MTT_DEBUG_DEFAULT;
 
     {

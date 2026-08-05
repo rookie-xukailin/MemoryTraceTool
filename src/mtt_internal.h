@@ -60,7 +60,7 @@
  * ======================================================================== */
 
 #define MTT_BUCKETS             4096    /* 哈希桶数量（必须为 2 的幂，用于位掩码取模） */
-#define MTT_MAX_ENTRIES         65536   /* 分配追踪表最大条目数（同时是池子上限） */
+#define MTT_MAX_ENTRIES         131072  /* 分配追踪表最大条目数(同时是池子上限,扩到 2^17 让 ARM32 也能用 20MB pool) */
 #define MTT_STACK_DEPTH         64      /* 调用栈最大深度（RPC 回调链 + 多层 .so 嵌套场景需要） */
 
 /* FP chain（帧指针链）兜底触发阈值：
@@ -72,10 +72,16 @@
  *   - ARM64 上 bt_frames 通常 >> 4，FP chain 不触发，零开销 */
 #define MTT_FP_FALLBACK_THRESHOLD 4
 
+/* entry 池目标内存占用(运行时按 sizeof(mtt_entry_t) 反推 entry 数):
+ *   ARM32 sizeof(mtt_entry_t)=288 → 72817 entries × 288B = 20MB
+ *   ARM64 sizeof(mtt_entry_t)=560 → 37449 entries × 560B = 20MB
+ * 实际值还会被 MTT_POOL_ENTRIES_MIN/MAX 夹紧,可被 MTT_POOL_ENTRIES 环境变量覆盖 */
+#define MTT_POOL_TARGET_BYTES   (20 * 1024 * 1024)
+
 /* entry 池配置 */
-#define MTT_POOL_ENTRIES_DEFAULT 16384  /* 池子默认 entry 数（约 10MB，可被环境变量 MTT_POOL_ENTRIES 覆盖） */
+#define MTT_POOL_ENTRIES_DEFAULT 0      /* 0=按 MTT_POOL_TARGET_BYTES 自动算(init 时算) */
 #define MTT_POOL_ENTRIES_MIN     1024   /* 池子最小 entry 数 */
-#define MTT_POOL_ENTRIES_MAX     65536  /* 池子最大 entry 数（与 MTT_MAX_ENTRIES 一致，避免改 hash 硬上限） */
+#define MTT_POOL_ENTRIES_MAX     131072 /* 池子最大 entry 数(与 MTT_MAX_ENTRIES 一致) */
 
 /* 池子模式标识（atomic_int 存储于 mtt_state_t.pool_mode） */
 #define MTT_POOL_MODE_NONE       0      /* 尚未初始化 */
