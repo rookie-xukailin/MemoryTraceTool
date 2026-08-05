@@ -92,13 +92,19 @@ docker build --platform linux/arm64 -f Dockerfile.hdm3-sim -t hdm3-sim:latest .
 
 每轮:全工程阅读 + 修复 + 两平台编译/测试 + 模拟环境验证 + 单独 commit,不允许失败就退出。
 
-## 静默运行模式(MTT_DEBUG=0)
+## 日志等级(MTT_DEBUG=0/1/2)
 
-为降低对被监控进程的性能影响,工具支持 `MTT_DEBUG=0` 静默模式:
+工具支持三档日志等级,由环境变量 `MTT_DEBUG` 控制:
 
-- **屏蔽** 所有 stderr 诊断(`hook first call`、`Reporter/HTTP/Signal started`、`scan enter/dedup/done`、`periodic scan start`、`final scan` 等)
-- **保留** 泄漏报告(`/var/log/mtt/<pid>_<name>.log`)、60s heartbeat(`/var/log/mtt/<pid>_heartbeat.log`)、HTTP API、SIGUSR1 即时报告
-- 默认开(`MTT_DEBUG=1`),调试时可观察工具行为;生产部署建议 `MTT_DEBUG=0` 降低开销
+| 等级 | 名称 | 输出内容 |
+|------|------|----------|
+| `0` | 静默 | **完全静默**——只输出 leak 报告 + heartbeat + HTTP API + SIGUSR1 |
+| `1` | 关键(默认) | hook first call、Reporter/HTTP/Signal 启动、pool init、final scan、libunwind 崩溃、WARNING |
+| `2` | 全量 | 等级 1 + 阶段日志 `S1-S74` + scan enter/dedup/done + periodic scan start |
+
+- **默认 1**:启动时几行关键事件,确认工具就绪;正常运行无噪声
+- **生产部署建议 `0`**:降低 stderr 写入开销
+- **调试崩溃用 `2`**:定位 init/hook/libunwind 崩溃位置
 
 heartbeat 文件 60s 覆盖写一次,字段:`ts/rss/pool/entries/cur_bytes/leaks/siteuniq/skipped`。
 
@@ -108,7 +114,7 @@ heartbeat 文件 60s 覆盖写一次,字段:`ts/rss/pool/entries/cur_bytes/leaks
 
 1. **首选**:让用户在目标工程 CFLAGS 加 `-funwind-tables -fno-omit-frame-pointer` 重建,95% 的浅栈问题立刻消失
 2. **次选**:确认工具侧已集成 libunwind(`MTT_UNWINDER=libunwind`,见 src/unwind_libunwind.c)
-3. **观测**:工具检测到 >20% 分配帧数 <4 时,会在 stderr 输出一次性 WARNING(即便 `MTT_DEBUG=0`)
+3. **观测**:工具检测到 >20% 分配帧数 <4 时,会在 stderr 输出一次性 WARNING(即便 `MTT_DEBUG=0`,该 WARNING 受 INFO 等级控制即 `MTT_DEBUG>=1` 才输出)
 
 ARM32 Thumb-2 上 `__builtin_frame_address(0)` 返回 r7 而非 r11,{prev_fp,lr} 偏移随 prologue 变化,FP chain 兜底仅在 `bt_frames==0` 时启用且做了可执行段校验。根本性方案是 libunwind。
 

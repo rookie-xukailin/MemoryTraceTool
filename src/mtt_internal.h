@@ -370,19 +370,29 @@ int          mtt_is_blacklisted(mtt_state_t *s, const char *symbol);
 void         mtt_capture_stack(mtt_entry_t *entry);
 int          mtt_pool_contains(const void *ptr);   /* 判断 ptr 是否落在 entry 池范围内（防止误 free） */
 
-/* 诊断日志开关（tracker.c 定义）。
- * =1: 输出 init 状态/scan 进度等诊断信息到 stderr
- * =0: 静默运行,只输出 leak 报告 + heartbeat
- * 由环境变量 MTT_DEBUG 控制,默认开。
- * 所有非热路径的诊断打印都应判断此标志。 */
-extern _Atomic int mtt_debug_enabled;
+/* 三档日志等级(tracker.c 定义,由环境变量 MTT_DEBUG 控制)。
+ *   0 = 静默:只输出 leak 报告 + heartbeat + HTTP API + SIGUSR1
+ *   1 = 关键:启动/退出事件、libunwind 崩溃、WARNING(最少日志)
+ *   2 = 全量:等级 1 + 阶段日志 S1-S74 + scan enter/dedup/done 等调试细节
+ * 默认 1。生产部署建议 0 降低开销,调试崩溃用 2。 */
+extern _Atomic int mtt_debug_level;
 
-/* 工具自身的 stderr 诊断打印宏(仅非热路径用)。
- * 默认开,关闭时编译期不消除但运行时短路(单次分支判断,可忽略)。
- * pool init 日志、关键 ERROR/WARNING 不受此开关控制(始终输出)。 */
+/* 关键事件日志(等级 >= 1 输出):hook first call、Reporter 启动、
+ * Signal 线程就绪、pool init、final scan、libunwind 崩溃、WARNING。
+ * 用法与 MTT_DIAG_LOG 一致:buf/len 已组装好的字符串。 */
+#define MTT_LOG_INFO(buf, len) \
+    do { \
+        if (atomic_load_explicit(&mtt_debug_level, memory_order_relaxed) >= 1) { \
+            long __mtt_w = (long)write(STDERR_FILENO, (buf), (len)); \
+            (void)__mtt_w; \
+        } \
+    } while (0)
+
+/* 调试事件日志(等级 >= 2 输出):scan 进度、dedup 详情、阶段日志等。
+ * 等级 0/1 静默,默认 1 时不输出,需要完整诊断时设 MTT_DEBUG=2。 */
 #define MTT_DIAG_LOG(buf, len) \
     do { \
-        if (atomic_load_explicit(&mtt_debug_enabled, memory_order_relaxed)) { \
+        if (atomic_load_explicit(&mtt_debug_level, memory_order_relaxed) >= 2) { \
             long __mtt_w = (long)write(STDERR_FILENO, (buf), (len)); \
             (void)__mtt_w; \
         } \

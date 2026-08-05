@@ -42,6 +42,7 @@
 #include "unwind_libunwind.h"
 
 #include <stddef.h>
+#include <stdio.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -227,6 +228,17 @@ int mtt_libunwind_capture(void **frames, int max_frames)
         /* per-thread 降级:本线程后续 capture 直接返回 -1,
          * 其他线程不受影响 */
         mtt_libunwind_disable_this_thread();
+        /* 崩溃属关键事件:用 MTT_LOG_INFO(等级 >= 1 输出),不走 stage(等级 2)
+         * 用户在 MTT_DEBUG=1 默认模式下也能看到 libunwind 降级提示 */
+        {
+            char cbuf[160];
+            int clen = snprintf(cbuf, sizeof(cbuf),
+                "[MTT] libunwind crashed (signal %d) at frame %d, kept %d partial frames, "
+                "this thread falls back to FP chain\n",
+                sig, n + 1, n);
+            if (clen > 0 && clen < (int)sizeof(cbuf))
+                MTT_LOG_INFO(cbuf, (size_t)clen);
+        }
         mtt_log_stage(31, "unw_step crashed (signal %d) at frame %d, kept %d partial frames",
                       sig, n + 1, n);
         /* 关键:返回 n 而非 -1,把崩溃前的部分帧交给上层使用 */
@@ -396,6 +408,15 @@ int mtt_libunwind_capture(void **frames, int max_frames)
     if (crashed) {
         /* dlopen 模式下没法拿到部分帧,只能放弃 */
         mtt_libunwind_disable_this_thread();
+        /* 关键事件:等级 >= 1 输出 */
+        {
+            char cbuf[128];
+            int clen = snprintf(cbuf, sizeof(cbuf),
+                "[MTT] libunwind crashed (signal %d), this thread falls back to backtrace/FP chain\n",
+                sig);
+            if (clen > 0 && clen < (int)sizeof(cbuf))
+                MTT_LOG_INFO(cbuf, (size_t)clen);
+        }
         mtt_log_stage(31, "unw_backtrace crashed (signal %d), no partial frames (dlopen mode)", sig);
         return -1;
     }

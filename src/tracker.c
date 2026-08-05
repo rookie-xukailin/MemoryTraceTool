@@ -82,9 +82,11 @@ raw_calloc_fn  volatile raw_calloc  = NULL;
 raw_realloc_fn volatile raw_realloc = NULL;
 raw_posix_memalign_fn volatile raw_posix_memalign = NULL;
 
-/* 诊断日志开关(由环境变量 MTT_DEBUG 控制,默认开)。
- * =0 时屏蔽所有 stderr 诊断,只保留 leak 报告 + heartbeat。 */
-_Atomic int mtt_debug_enabled = MTT_DEBUG_DEFAULT;
+/* 三档日志等级(由环境变量 MTT_DEBUG 控制)。
+ *   0 = 静默(只输出 leak 报告 + heartbeat + HTTP API + SIGUSR1)
+ *   1 = 关键事件(启动/退出/libunwind 崩溃/WARNING,默认)
+ *   2 = 全量(等级 1 + 阶段日志 + scan 进度) */
+_Atomic int mtt_debug_level = MTT_DEBUG_DEFAULT;
 
 /* 栈回溯模式(由环境变量 MTT_UNWINDER 控制):
  * 0 = auto(libunwind 优先,失败 fallback backtrace)
@@ -99,9 +101,9 @@ int g_unwinder_mode = 0;
 /**
  * 输出带阶段编号的诊断日志,定位 init / hook 崩溃用。
  *
- * 仅在 mtt_debug_enabled=1 时输出,关闭时只剩一次 atomic_load,
- * 热路径几乎零开销。用 stage_id 标识阶段(数字越小越早),
- * 日志格式: "[MTT] S<id>: <msg>\n"
+ * 仅在 mtt_debug_level>=2(全量调试模式)时输出,等级 0/1 静默,
+ * 关闭时只剩一次 atomic_load,热路径几乎零开销。用 stage_id 标识阶段
+ * (数字越小越早),日志格式: "[MTT] S<id> [t=xxx]: <msg>\n"
  *
  * 线程安全:只使用栈缓冲区 + write(),不调用 malloc。
  *
@@ -110,7 +112,7 @@ int g_unwinder_mode = 0;
  */
 void mtt_log_stage(int stage_id, const char *fmt, ...)
 {
-    if (!atomic_load_explicit(&mtt_debug_enabled, memory_order_relaxed))
+    if (atomic_load_explicit(&mtt_debug_level, memory_order_relaxed) < 2)
         return;
 
     /* 取低 12 位作为线程短 ID(够区分线程,不暴露真实 tid 隐私),
@@ -925,13 +927,18 @@ static void mtt_register_fork_handlers(void);
 
 void mtt_ensure_init(void)
 {
-    /* 尽早读 MTT_DEBUG 并打开 mtt_debug_enabled,让后续阶段日志能输出。
-     * 否则 mtt_debug_enabled 要到阶段 13 才被设置,前 12 个阶段的崩溃定位不到。 */
+    /* 尽早读 MTT_DEBUG 并设置 mtt_debug_level,让后续阶段日志能按等级输出。
+     * 否则 mtt_debug_level 要到阶段 13 才被设置,前 12 个阶段的崩溃定位不到。 */
     {
         const char *env_d = getenv("MTT_DEBUG");
-        int early_debug = MTT_DEBUG_DEFAULT;
-        if (env_d != NULL) early_debug = (strcmp(env_d, "0") == 0) ? 0 : 1;
-        atomic_store_explicit(&mtt_debug_enabled, early_debug, memory_order_relaxed);
+        int early_level = MTT_DEBUG_DEFAULT;
+        if (env_d != NULL) {
+            int lv = atoi(env_d);
+            if (lv < 0) lv = 0;
+            if (lv > 2) lv = 2;
+            early_level = lv;
+        }
+        atomic_store_explicit(&mtt_debug_level, early_level, memory_order_relaxed);
     }
     mtt_log_stage(1, "mtt_ensure_init enter pid=%d", (int)getpid());
 
@@ -984,8 +991,11 @@ void mtt_ensure_init(void)
 
         const char *env_debug = getenv("MTT_DEBUG");
         if (env_debug != NULL) {
-            /* MTT_DEBUG=0 关闭诊断日志; 其他值(1/yes/on)打开 */
-            want_debug = (strcmp(env_debug, "0") == 0) ? 0 : 1;
+            /* MTT_DEBUG=0 静默, 1 关键事件(默认), 2 全量调试 */
+            int lv = atoi(env_debug);
+            if (lv < 0) lv = 0;
+            if (lv > 2) lv = 2;
+            want_debug = lv;
         }
 
         const char *env_sample = getenv("MTT_SAMPLE");
@@ -1160,7 +1170,7 @@ void mtt_ensure_init(void)
     atomic_store_explicit(&s->temp_alloc_count,   0, memory_order_relaxed);
     atomic_store_explicit(&s->expired_alloc_count, 0, memory_order_relaxed);
     atomic_store_explicit(&s->free_expired_count,  0, memory_order_relaxed);
-    atomic_store_explicit(&mtt_debug_enabled, want_debug, memory_order_relaxed);
+    atomic_store_explicit(&mtt_debug_level, want_debug, memory_order_relaxed);
 
     /* 设置启动阶段结束时间（0=不跳过） */
     if (want_skip_startup > 0)
@@ -1173,7 +1183,8 @@ void mtt_ensure_init(void)
     s->proc_name_ready = 1;
 
     /* 输出 pool 初始化日志（stderr，便于用户观察工具自身内存占用情况,
-     * 受 MTT_DEBUG 控制,但 init 时 mtt_debug_enabled 已经在阶段2 设置完成） */
+     * 受 MTT_DEBUG 控制,init 时 mtt_debug_level 已经在阶段 2 设置完成,
+     * pool init 属关键事件(MTT_LOG_INFO,等级 >= 1 输出)） */
     {
         int mode = atomic_load_explicit(&s->pool_mode, memory_order_relaxed);
         char log_buf[160];
@@ -1181,11 +1192,11 @@ void mtt_ensure_init(void)
             int len = snprintf(log_buf, sizeof(log_buf),
                 "[MTT] pool init: mode=ACTIVE capacity=%zu bytes=%zu\n",
                 s->pool_capacity, s->pool_raw_size);
-            if (len > 0) MTT_DIAG_LOG(log_buf, (size_t)len);
+            if (len > 0) MTT_LOG_INFO(log_buf, (size_t)len);
         } else if (mode == MTT_POOL_MODE_FALLBACK) {
             int len = snprintf(log_buf, sizeof(log_buf),
                 "[MTT] pool init: mode=FALLBACK (raw_malloc per-entry)\n");
-            if (len > 0) MTT_DIAG_LOG(log_buf, (size_t)len);
+            if (len > 0) MTT_LOG_INFO(log_buf, (size_t)len);
         }
     }
 
@@ -1230,6 +1241,14 @@ void mtt_ensure_init(void)
         }
         mtt_http_server_start(http_port);
         mtt_log_stage(13, "http server started port=%u", (unsigned)http_port);
+        /* HTTP 启动属关键事件,等级 >= 1 输出(与 Reporter/Signal INFO 对齐) */
+        {
+            char hbuf[96];
+            int hlen = snprintf(hbuf, sizeof(hbuf),
+                "[MTT] HTTP server started port=%u\n", (unsigned)http_port);
+            if (hlen > 0 && hlen < (int)sizeof(hbuf))
+                MTT_LOG_INFO(hbuf, (size_t)hlen);
+        }
     }
 
     /* 启动信号处理线程（SIGUSR1 触发即时报告） */
@@ -1366,13 +1385,13 @@ void mtt_signal_thread_start(void)
         return;
     }
 
-    /* 诊断输出(MTT_DEBUG=0 时屏蔽) */
+    /* 诊断输出:Signal 线程就绪属关键事件(等级 >= 1 输出) */
     char diag[96] = {0};
     int len = snprintf(diag, sizeof(diag),
         "[MTT] Signal thread ready (kill -USR1 %d for instant report)\n",
         (int)getpid());
     if (len > 0 && len < (int)sizeof(diag))
-        MTT_DIAG_LOG(diag, (size_t)len);
+        MTT_LOG_INFO(diag, (size_t)len);
 }
 
 /* ======================================================================== *

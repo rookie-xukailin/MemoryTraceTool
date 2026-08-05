@@ -922,7 +922,7 @@ static void scan_and_report_locked(void)
      * 触发场景:目标二进制 -O2 -fomit-frame-pointer 且无 -funwind-tables,
      * glibc backtrace 拿不到完整栈,即使 FP chain 兜底也补不全。
      * 警告只在首次满足条件时输出(g_shallow_warned 哨兵),
-     * 避免日志噪声。MTT_DEBUG=0 时也输出(WARNING 级,不受静默影响)。
+     * 避免日志噪声。等级 >= 1 输出(关键诊断)。
      *
      * 注意:必须在 cleanup: 释放 snaps 之前访问,否则 use-after-free。 */
     if (snaps != NULL && snap_count > 100) {
@@ -948,7 +948,7 @@ static void scan_and_report_locked(void)
                     shallow, total_with_stack,
                     (double)shallow * 100.0 / (double)total_with_stack);
                 if (wlen > 0 && wlen < (int)sizeof(wbuf))
-                    MTT_DIAG_WRITE(STDERR_FILENO, wbuf, (size_t)wlen);
+                    MTT_LOG_INFO(wbuf, (size_t)wlen);
             }
         }
     }
@@ -980,14 +980,14 @@ cleanup:
     return;
 
 skip_scan:
-    /* 快照分配失败 — 静默跳过本次扫描(WARNING 始终输出) */
+    /* 快照分配失败 — 跳过本次扫描(WARNING 等级 1+ 输出) */
     {
         char err_buf[128] = {0};
         int err_len = snprintf(err_buf, sizeof(err_buf),
             "[MTT] WARNING: snapshot alloc failed for %llu entries, skipping scan\n",
             (unsigned long long)entry_total_orig);
         if (err_len > 0 && err_len < (int)sizeof(err_buf))
-            MTT_DIAG_WRITE(STDERR_FILENO, err_buf, (size_t)err_len);
+            MTT_LOG_INFO(err_buf, (size_t)err_len);
     }
 }
 
@@ -1154,7 +1154,7 @@ static void* reporter_thread_fn(void *arg)
         int dlen = snprintf(dbuf, sizeof(dbuf),
             "[MTT] reporter: final scan before exit\n");
         if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_LOG(dbuf, (size_t)dlen);
+            MTT_LOG_INFO(dbuf, (size_t)dlen);
     }
     scan_and_report();
 
@@ -1232,13 +1232,13 @@ void mtt_reporter_start(void)
         g_atexit_registered = 1;
     }
 
-    /* 首次诊断输出（使用 write 避免 malloc，受 MTT_DEBUG 控制） */
+    /* 首次诊断输出:Reporter 启动属关键事件(等级 >= 1 输出) */
     char diag[256] = {0};
     int len = snprintf(diag, sizeof(diag),
         "[MTT] Reporter thread started (pid=%d, log=%s, interval=%ds)\n",
         (int)getpid(), g_reporter.log_path, MTT_REPORT_INTERVAL_SEC);
     if (len > 0 && len < (int)sizeof(diag))
-        MTT_DIAG_LOG(diag, (size_t)len);
+        MTT_LOG_INFO(diag, (size_t)len);
 }
 
 /**

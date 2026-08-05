@@ -44,14 +44,22 @@ static _Atomic int g_first_calloc_diag  = 1;
 static _Atomic int g_first_realloc_diag = 1;
 
 /** 仅在首次调用时输出诊断（确认 hook 被调用，受 MTT_DEBUG 控制）。
- * 直接读环境变量,不依赖 mtt_debug_enabled(后者在 init 阶段2 才设置,
- * 而 first_call 通常在 init 之前触发)。 */
+ * 直接读环境变量,不依赖 mtt_debug_level(后者在 init 阶段2 才设置,
+ * 而 first_call 通常在 init 之前触发)。
+ * MTT_DEBUG 等级语义:0 静默,1 关键事件(默认输出 first call),2 全量 */
 static void first_call_diag(const char *func_name, _Atomic int *flag, int stage_id)
 {
     int expected = 1;
     if (atomic_compare_exchange_strong(flag, &expected, 0)) {
         const char *env_debug = getenv("MTT_DEBUG");
-        if (env_debug != NULL && strcmp(env_debug, "0") == 0)
+        int level = MTT_DEBUG_DEFAULT;
+        if (env_debug != NULL) {
+            int lv = atoi(env_debug);
+            if (lv < 0) lv = 0;
+            if (lv > 2) lv = 2;
+            level = lv;
+        }
+        if (level < 1)
             return;  /* MTT_DEBUG=0:静默,不输出 first call 诊断 */
         char buf[128] = {0};
         int len = snprintf(buf, sizeof(buf),

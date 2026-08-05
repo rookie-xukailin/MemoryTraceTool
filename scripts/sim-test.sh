@@ -98,6 +98,7 @@ run_arm32() {
     echo "--- LD_PRELOAD 跑多线程 RPC demo (期望: 不崩 + entry>0 + sites>0) ---"
     qemu-arm-static -L /usr/arm-linux-gnueabi \
       -E LD_PRELOAD=./libmemorytracetool-arm32.so \
+      -E MTT_DEBUG=2 \
       ./demo_realistic-arm32 >/tmp/out.txt 2>/tmp/err.txt
     RC=$?
     echo "LD_PRELOAD exit=$RC"
@@ -140,7 +141,7 @@ run_arm64() {
     echo "baseline exit=$?"
 
     echo "--- LD_PRELOAD 跑多线程 RPC demo ---"
-    LD_PRELOAD=./libmemorytracetool-arm64.so \
+    MTT_DEBUG=2 LD_PRELOAD=./libmemorytracetool-arm64.so \
       ./demo_realistic-arm64 >/tmp/out.txt 2>/tmp/err.txt
     RC=$?
     echo "LD_PRELOAD exit=$RC"
