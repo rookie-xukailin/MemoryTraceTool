@@ -117,7 +117,7 @@ static const char g_dashboard_html[] =
 "  var pad={top:28,right:28,bottom:48,left:64};\n"
 "  var pw=W-pad.left-pad.right,ph=H-pad.top-pad.bottom;\n"
 "  var maxB=1;\n"
-"  for(var i=0;i<ts.length;i++){var p=ts[i];if(p.peak>maxB)maxB=p.peak;if(p.cur>maxB)maxB=p.cur;}\n"
+"  for(var i=0;i<ts.length;i++){var p=ts[i];if(p.peak>maxB)maxB=p.peak;if(p.cur>maxB)maxB=p.cur;if(p.leak!=null&&p.leak>maxB)maxB=p.leak;}\n"
 "  if(maxB<1)maxB=1;\n"
 "  function x(i){return pad.left+(i/Math.max(1,ts.length-1))*pw}\n"
 "  function y(v){return pad.top+ph-(v/maxB)*ph}\n"
@@ -155,19 +155,29 @@ static const char g_dashboard_html[] =
 "  ctx.beginPath();ctx.setLineDash([3,3]);\n"
 "  for(var i=0;i<ts.length;i++){if(i===0)ctx.moveTo(x(i),y(ts[i].peak));else ctx.lineTo(x(i),y(ts[i].peak))}\n"
 "  ctx.strokeStyle='#f59e0b';ctx.lineWidth=1.5;ctx.stroke();ctx.setLineDash([]);\n"
+"  /* leak line: 累积已识别泄漏字节(单调不减,真实反映泄漏趋势) */\n"
+"  ctx.beginPath();\n"
+"  if(ts.length>0&&ts[0].leak!=null){\n"
+"    ctx.moveTo(x(0),y(ts[0].leak));\n"
+"    for(var i=1;i<ts.length;i++){if(ts[i].leak==null)continue;var mx=(x(i-1)+x(i))/2,my=(y(ts[i-1].leak)+y(ts[i].leak))/2;ctx.quadraticCurveTo(x(i-1),y(ts[i-1].leak),mx,my)}\n"
+"    ctx.lineTo(x(ts.length-1),y(ts[ts.length-1].leak));\n"
+"    ctx.strokeStyle='#dc2626';ctx.lineWidth=2;ctx.lineJoin='round';ctx.lineCap='round';ctx.stroke();\n"
+"  }\n"
 "  /* legend: 圆点 + 文字 */\n"
 "  ctx.font='11px -apple-system,BlinkMacSystemFont,sans-serif';ctx.textAlign='left';\n"
 "  ctx.fillStyle='#3b82f6';ctx.beginPath();ctx.arc(pad.left+8,16,3.5,0,2*Math.PI);ctx.fill();\n"
 "  ctx.fillStyle=txtColor;ctx.fillText('current_bytes',pad.left+16,20);\n"
 "  ctx.fillStyle='#f59e0b';ctx.beginPath();ctx.arc(pad.left+128,16,3.5,0,2*Math.PI);ctx.fill();\n"
 "  ctx.fillStyle=txtColor;ctx.fillText('peak_bytes',pad.left+136,20);\n"
+"  ctx.fillStyle='#dc2626';ctx.beginPath();ctx.arc(pad.left+232,16,3.5,0,2*Math.PI);ctx.fill();\n"
+"  ctx.fillStyle=txtColor;ctx.fillText('leak_bytes',pad.left+240,20);\n"
 "  /* X labels */\n"
 "  var steps=Math.min(8,ts.length);\n"
 "  ctx.fillStyle=txtColor;ctx.globalAlpha=0.65;ctx.font='10px -apple-system,BlinkMacSystemFont,sans-serif';ctx.textAlign='center';\n"
 "  for(var i=0;i<=steps;i++){var idx=Math.floor((ts.length-1)*i/steps);if(idx>=ts.length)idx=ts.length-1;var xx=x(idx);ctx.fillText(ft(ts[idx].ts),xx,H-pad.bottom+18)}\n"
 "  ctx.globalAlpha=1;\n"
 "  /* hover */\n"
-"  chartCanvas.onmousemove=function(e){var r=chartCanvas.getBoundingClientRect();var sx=chartCanvas.width/r.width;var mx=(e.clientX-r.left)*sx;for(var i=0;i<ts.length;i++){if(Math.abs(mx-x(i))<5){var pt=ts[i];tip.style.display='block';tip.style.left=(e.clientX+15)+'px';tip.style.top=(e.clientY-30)+'px';tip.textContent=ft(pt.ts)+' | cur:'+fb(pt.cur)+' | peak:'+fb(pt.peak)+' | allocs:'+pt.allocs+' | frees:'+pt.frees;return}}tip.style.display='none'}\n"
+"  chartCanvas.onmousemove=function(e){var r=chartCanvas.getBoundingClientRect();var sx=chartCanvas.width/r.width;var mx=(e.clientX-r.left)*sx;for(var i=0;i<ts.length;i++){if(Math.abs(mx-x(i))<5){var pt=ts[i];tip.style.display='block';tip.style.left=(e.clientX+15)+'px';tip.style.top=(e.clientY-30)+'px';tip.textContent=ft(pt.ts)+' | cur:'+fb(pt.cur)+' | peak:'+fb(pt.peak)+' | leak:'+(pt.leak!=null?fb(pt.leak):'N/A')+' | allocs:'+pt.allocs+' | frees:'+pt.frees;return}}tip.style.display='none'}\n"
 "}\n"
 "function renderStats(st){\n"
 "  var s=st||{};\n"
@@ -525,11 +535,11 @@ static void handle_api_data(int client_fd)
                 if (wrote_first) MTT_DIAG_WRITE(client_fd, ",", 1);
                 wrote_first = 1;
                 len = snprintf(buf, sizeof(buf),
-                    "{\"ts\":%lld,\"cur\":%zu,\"peak\":%zu,\"allocs\":%zu,\"frees\":%zu,\"entries\":%zu,\"rss\":%zu}",
+                    "{\"ts\":%lld,\"cur\":%zu,\"peak\":%zu,\"allocs\":%zu,\"frees\":%zu,\"entries\":%zu,\"rss\":%zu,\"leak\":%zu}",
                     (long long)ts_buf[i].timestamp, ts_buf[i].current_bytes,
                     ts_buf[i].peak_bytes, ts_buf[i].alloc_count,
                     ts_buf[i].free_count, ts_buf[i].entry_count,
-                    ts_buf[i].rss_bytes);
+                    ts_buf[i].rss_bytes, ts_buf[i].leak_bytes);
                 if (len < 0) len = 0;
                 else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
                 MTT_DIAG_WRITE(client_fd, buf, (size_t)len);

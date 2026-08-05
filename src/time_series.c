@@ -87,6 +87,7 @@ void mtt_ts_record_point(void)
     pt.alloc_count   = atomic_load_explicit(&s->alloc_count,  memory_order_relaxed);
     pt.free_count    = atomic_load_explicit(&s->free_count,   memory_order_relaxed);
     pt.entry_count   = (size_t)atomic_load_explicit(&s->entry_count, memory_order_relaxed);
+    pt.leak_bytes    = atomic_load_explicit(&s->leak_bytes_total, memory_order_relaxed);
 
     /* 读取 RSS（驻留集大小）以区分堆泄漏和 mmap 泄漏。
      * /proc/self/statm 第二个字段为 RSS 页数，不触发 malloc。 */

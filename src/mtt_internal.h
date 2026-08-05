@@ -253,6 +253,7 @@ typedef struct {
     _Atomic size_t      current_bytes;              /* 当前仍未释放的字节数 */
     _Atomic size_t      peak_bytes;                 /* 历史峰值 current_bytes */
     _Atomic size_t      total_bytes;                /* 累计分配字节总数 */
+    _Atomic size_t      leak_bytes_total;           /* 已识别泄漏站点累积字节(reporter 每次 scan 后刷新) */
     _Atomic uint64_t    entry_count;                /* 当前哈希表条目数（64-bit 防回绕） */
     _Atomic unsigned    sample_period;              /* 采样周期：0=全量, N>0=每N次记录1次 */
     _Atomic uint64_t    sample_counter;             /* 采样计数器（64-bit 防回绕） */

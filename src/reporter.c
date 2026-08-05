@@ -501,6 +501,22 @@ static void scan_and_report_locked(void)
             MTT_DIAG_LOG(dbuf, (size_t)dlen);
     }
 
+    /* 累加所有 leak_site.total_size → s->leak_bytes_total,供时序图红线使用。
+     * leak_bytes_total 单调反映"已识别泄漏累积字节",与瞬时 current_bytes 不同:
+     * 即使业务 alloc/free 平衡导致 current 看不出趋势,leak_bytes 仍能直显泄漏增长。
+     * 每次 scan 重新计算(覆盖写),不累计,因为 leak_table 自身记录的是当前未释放站点。 */
+    {
+        size_t leak_total = 0;
+        for (unsigned b = 0; b < MTT_LEAK_DEDUP_SIZE; b++) {
+            mtt_leak_site_t *site = leak_table.entries[b];
+            while (site != NULL) {
+                leak_total += site->total_size;
+                site = site->next;
+            }
+        }
+        atomic_store_explicit(&s->leak_bytes_total, leak_total, memory_order_relaxed);
+    }
+
     /* ---- 阶段 3: 懒解析栈符号（安全网：补解析阶段 2 遗漏的条目） ----
      * 正常情况下阶段 2 已将首次创建缓存条目时所关联栈全部解析完毕，
      * 此阶段仅处理极端边界情况（如哈希碰撞导致 site->stack_hash 匹配了
