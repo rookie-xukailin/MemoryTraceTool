@@ -198,7 +198,7 @@ static const char g_dashboard_html[] =
 "    '<div class=\"stat\"><div class=\"val\">'+fb(s.total_allocated||0)+'</div><div class=\"lbl\">累计分配总量</div></div>'+\n"
 "    '<div class=\"stat\">'+poolHtml+'</div>';\n"
 "}\n"
-"function alCmd(frame){var m1=frame.match(/\\((.+)\\)$/);var m2=frame.match(/\\+(0x[0-9a-fA-F]+)/);if(m1&&m2)return'addr2line -e '+m1[1]+' -f -C '+m2[1];return''}\n"
+"function alCmd(frame){var m=frame.match(/\\((.+)\\+(0x[0-9a-fA-F]+)\\)$/);if(m)return'addr2line -e '+m[1]+' -f -C '+m[2];return''}\n"
 "function renderLeaks(leaks){\n"
 "  allLeaks=leaks||[];\n"
 "  var total=Math.ceil(allLeaks.length/PAGE_SIZE)||1;\n"
