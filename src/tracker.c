@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #if MTT_HAS_BACKTRACE
 #include <execinfo.h>
 #endif
@@ -84,6 +85,42 @@ raw_posix_memalign_fn volatile raw_posix_memalign = NULL;
 /* 诊断日志开关(由环境变量 MTT_DEBUG 控制,默认开)。
  * =0 时屏蔽所有 stderr 诊断,只保留 leak 报告 + heartbeat。 */
 _Atomic int mtt_debug_enabled = MTT_DEBUG_DEFAULT;
+
+/* ======================================================================== *
+ *                    阶段标记日志(MTT_DEBUG=1 时定位崩溃用)                  *
+ * ======================================================================== */
+
+/**
+ * 输出带阶段编号的诊断日志,定位 init / hook 崩溃用。
+ *
+ * 仅在 mtt_debug_enabled=1 时输出,关闭时只剩一次 atomic_load,
+ * 热路径几乎零开销。用 stage_id 标识阶段(数字越小越早),
+ * 日志格式: "[MTT] S<id>: <msg>\n"
+ *
+ * 线程安全:只使用栈缓冲区 + write(),不调用 malloc。
+ *
+ * @param stage_id  阶段编号(1~99,数字越小越早)
+ * @param fmt       printf 风格格式串
+ */
+void mtt_log_stage(int stage_id, const char *fmt, ...)
+{
+    if (!atomic_load_explicit(&mtt_debug_enabled, memory_order_relaxed))
+        return;
+
+    char buf[256];
+    int off = snprintf(buf, sizeof(buf), "[MTT] S%d: ", stage_id);
+    if (off <= 0 || off >= (int)sizeof(buf)) return;
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, sizeof(buf) - off, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (off + n >= (int)sizeof(buf) - 1)
+        n = (int)sizeof(buf) - off - 2;
+    buf[off + n] = '\n';
+    MTT_DIAG_WRITE(STDERR_FILENO, buf, (size_t)(off + n + 1));
+}
 
 /* CAS 保护的一次性解析标志 */
 static atomic_int g_raw_resolved = 0;
@@ -839,6 +876,16 @@ static void mtt_register_fork_handlers(void);
 
 void mtt_ensure_init(void)
 {
+    /* 尽早读 MTT_DEBUG 并打开 mtt_debug_enabled,让后续阶段日志能输出。
+     * 否则 mtt_debug_enabled 要到阶段 13 才被设置,前 12 个阶段的崩溃定位不到。 */
+    {
+        const char *env_d = getenv("MTT_DEBUG");
+        int early_debug = MTT_DEBUG_DEFAULT;
+        if (env_d != NULL) early_debug = (strcmp(env_d, "0") == 0) ? 0 : 1;
+        atomic_store_explicit(&mtt_debug_enabled, early_debug, memory_order_relaxed);
+    }
+    mtt_log_stage(1, "mtt_ensure_init enter pid=%d", (int)getpid());
+
     /* 尽早忽略 SIGPIPE：HTTP 客户端断开连接时 write() 会触发 SIGPIPE，
      * 默认行为是终止进程。此处用 sigaction(2) 替代 signal(2)：
      * sigaction 是 POSIX 标准接口，语义明确（不会像 signal 那样
@@ -851,16 +898,26 @@ void mtt_ensure_init(void)
         sa.sa_flags = SA_RESTART;
         sigaction(SIGPIPE, &sa, NULL);
     }
+    mtt_log_stage(2, "SIGPIPE ignored");
 
     mtt_state_t *s = mtt_state_get();
-    if (s == NULL) return;
+    if (s == NULL) {
+        mtt_log_stage(3, "FATAL: mtt_state_get returned NULL");
+        return;
+    }
+    mtt_log_stage(3, "state ok");
 
     /* 快速路径：已初始化（acquire 确保初始化数据可见） */
-    if (atomic_load_explicit(&s->initialized, memory_order_acquire))
+    if (atomic_load_explicit(&s->initialized, memory_order_acquire)) {
+        mtt_log_stage(4, "already initialized (fast path)");
         return;
+    }
+    mtt_log_stage(4, "not yet initialized, proceeding");
 
     /* 确保 raw_* 函数指针已解析 */
     mtt_resolve_raw_allocators();
+    mtt_log_stage(5, "raw allocators resolved malloc=%p calloc=%p",
+                  (void*)raw_malloc, (void*)raw_calloc);
 
     /* ---- 阶段1: 读取环境变量（无需持锁） ---- */
     int      want_disabled = 0;
@@ -938,8 +995,11 @@ void mtt_ensure_init(void)
     }
 
     /* ---- 阶段2: 持锁初始化数据结构（双重检查锁定） ---- */
+    mtt_log_stage(6, "env read done: pool_entries=%zu debug=%d",
+                  want_pool_entries, want_debug);
     static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&init_lock);
+    mtt_log_stage(7, "init_lock acquired");
 
     /* 双重检查：可能在等锁期间已被其他线程初始化 */
     if (atomic_load_explicit(&s->initialized, memory_order_acquire)) {
@@ -972,6 +1032,8 @@ void mtt_ensure_init(void)
     s->hash_seed = ((uint64_t)time(NULL) ^
                     ((uint64_t)getpid() << 16) ^
                     UINT64_C(0x9e3779b97f4a7c15));
+    mtt_log_stage(8, "hash_seed=%016llx buckets=%u",
+                  (unsigned long long)s->hash_seed, s->bucket_count);
 
     /* 初始化分段锁（缓存行对齐，避免 ARM 多核伪共享） */
     for (int i = 0; i < MTT_LOCK_STRIPES; i++)
@@ -1010,11 +1072,14 @@ void mtt_ensure_init(void)
             s->pool_free_lists[idx] = &s->pool[i];
         }
         atomic_store_explicit(&s->pool_mode, MTT_POOL_MODE_ACTIVE, memory_order_relaxed);
+        mtt_log_stage(9, "pool ACTIVE capacity=%zu bytes=%zu",
+                      s->pool_capacity, s->pool_raw_size);
     } else {
         /* 池子申请失败：降级为旧模式，工具功能不丢，仅性能下降 */
         s->pool_capacity = 0;
         s->pool_raw_size = 0;
         atomic_store_explicit(&s->pool_mode, MTT_POOL_MODE_FALLBACK, memory_order_relaxed);
+        mtt_log_stage(9, "pool FALLBACK (raw_malloc failed)");
     }
 
     /* 初始化原子计数器（relaxed：此时仅有当前线程可见，release store 最后做） */
@@ -1069,9 +1134,11 @@ void mtt_ensure_init(void)
     /* 标记初始化完成（release 确保上述所有初始化对其他线程可见） */
     atomic_store_explicit(&s->initialized, 1, memory_order_release);
     pthread_mutex_unlock(&init_lock);
+    mtt_log_stage(10, "initialized=1, init_lock released");
 
     /* 先初始化时序数据（必须在 reporter 线程启动前完成） */
     mtt_ts_init();
+    mtt_log_stage(11, "mtt_ts_init done");
 
     /* 启动子系统时设置 in_hook=1 + tool_internal=1,防止 pthread_create / socket
      * / bind 等内部调用 malloc() 被 hook 拦截并追踪为"疑似泄漏"。
@@ -1090,6 +1157,7 @@ void mtt_ensure_init(void)
 
     /* 启动周期报告线程（锁外，避免 pthread_create 内部 malloc → 递归） */
     mtt_reporter_start();
+    mtt_log_stage(12, "reporter thread started");
 
     /* 启动 HTTP 服务器（从环境变量读取端口，0=禁用） */
     {
@@ -1103,10 +1171,12 @@ void mtt_ensure_init(void)
                 http_port = 0;
         }
         mtt_http_server_start(http_port);
+        mtt_log_stage(13, "http server started port=%u", (unsigned)http_port);
     }
 
     /* 启动信号处理线程（SIGUSR1 触发即时报告） */
     mtt_signal_thread_start();
+    mtt_log_stage(14, "signal thread started");
 
     if (ctx != NULL) {
         ctx->in_hook = saved_hook;
@@ -1116,6 +1186,7 @@ void mtt_ensure_init(void)
     /* 注册 fork 安全处理器（仅需注册一次） */
     static pthread_once_t g_fork_init = PTHREAD_ONCE_INIT;
     pthread_once(&g_fork_init, mtt_register_fork_handlers);
+    mtt_log_stage(15, "mtt_ensure_init done");
 }
 
 /* ======================================================================== *

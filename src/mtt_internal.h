@@ -107,6 +107,9 @@
 /* SIGUSR1 信号触发即时报告 */
 #define MTT_SIGNAL_REPORT       SIGUSR1 /* 触发即时报告的信号 */
 
+/* 阶段标记日志(MTT_DEBUG=1 时输出,定位崩溃用)。定义在 tracker.c */
+void mtt_log_stage(int stage_id, const char *fmt, ...);
+
 /* 诊断日志开关（MTT_DEBUG=1 开, =0 关）。
  * 默认打开; 关闭后只保留泄漏报告写到 /var/log/mtt 下、
  * 60s heartbeat 写到 /var/log/mtt/下 <pid>_heartbeat.log、HTTP API、SIGUSR1 即时报告。

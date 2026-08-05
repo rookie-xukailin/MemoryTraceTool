@@ -42,8 +42,17 @@ int mtt_libunwind_capture(void **frames, int max_frames)
 {
     if (frames == NULL || max_frames <= 0) return -1;
 
+    /* 第一次调用时输出阶段日志,定位 libunwind 是否触发 */
+    static _Atomic int g_first_capture = 1;
+    int is_first = atomic_compare_exchange_strong(&g_first_capture,
+                                                  &(int){1}, 0);
+
     int n = unw_backtrace(frames, max_frames);
     if (n < 0) n = 0;
+
+    if (is_first) {
+        mtt_log_stage(30, "first unw_backtrace done frames=%d", n);
+    }
 
     /* 清除 ARM32 Thumb bit(LSB=1),与 dlopen 路径后处理保持一致,
      * 让下游 hash/dladdr 不受 Thumb 状态干扰 */

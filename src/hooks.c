@@ -46,7 +46,7 @@ static _Atomic int g_first_realloc_diag = 1;
 /** 仅在首次调用时输出诊断（确认 hook 被调用，受 MTT_DEBUG 控制）。
  * 直接读环境变量,不依赖 mtt_debug_enabled(后者在 init 阶段2 才设置,
  * 而 first_call 通常在 init 之前触发)。 */
-static void first_call_diag(const char *func_name, _Atomic int *flag)
+static void first_call_diag(const char *func_name, _Atomic int *flag, int stage_id)
 {
     int expected = 1;
     if (atomic_compare_exchange_strong(flag, &expected, 0)) {
@@ -58,6 +58,8 @@ static void first_call_diag(const char *func_name, _Atomic int *flag)
             "[MTT] hook: %s first call (pid=%d)\n", func_name, (int)getpid());
         if (len > 0 && len < (int)sizeof(buf))
             MTT_DIAG_WRITE(STDERR_FILENO, buf, (size_t)len);
+        /* 加阶段编号,跟 init 阶段串起来定位崩溃点 */
+        mtt_log_stage(stage_id, "first %s done", func_name);
     }
 }
 
@@ -115,7 +117,7 @@ static inline void mtt_hook_dec_depth(void)
 void* malloc(size_t size)
 {
     /* 首次调用诊断 */
-    first_call_diag("malloc", &g_first_malloc_diag);
+    first_call_diag("malloc", &g_first_malloc_diag, 20);
 
     /* 递归保护：__thread 深度计数器（哨兵自动修正脏值） */
     {
@@ -161,6 +163,7 @@ void* malloc(size_t size)
 
     mtt_ensure_init();
     mtt_state_t *s = mtt_state_get();
+    mtt_log_stage(24, "malloc post-init size=%zu", size);
 
     /* 启动阶段宽限：跳过追踪，直接透传 */
     if (s != NULL && mtt_is_startup_phase(s)) {
@@ -264,7 +267,7 @@ void* malloc(size_t size)
  */
 void free(void *ptr)
 {
-    first_call_diag("free", &g_first_free_diag);
+    first_call_diag("free", &g_first_free_diag, 21);
 
     if (ptr == NULL) return;
 
@@ -354,7 +357,7 @@ void free(void *ptr)
  */
 void* calloc(size_t count, size_t size)
 {
-    first_call_diag("calloc", &g_first_calloc_diag);
+    first_call_diag("calloc", &g_first_calloc_diag, 22);
 
     /* 递归保护：栈回溯检测 */
     if (mtt_hook_enter() > 0) {
@@ -412,7 +415,7 @@ void* calloc(size_t count, size_t size)
  */
 void* realloc(void *ptr, size_t size)
 {
-    first_call_diag("realloc", &g_first_realloc_diag);
+    first_call_diag("realloc", &g_first_realloc_diag, 23);
 
     if (ptr == NULL) return malloc(size);
     if (size == 0) { free(ptr); return NULL; }
