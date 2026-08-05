@@ -5,23 +5,29 @@
  *
  * 静态模式(MTT_STATIC_LIBUNWIND):
  *   - unw_backtrace 在链接期解析到静态库符号,无 dlopen/dlsym/pthread_once 开销
- *   - mtt_libunwind_available() 恒为 1(除非运行时崩溃被永久禁用)
+ *   - mtt_libunwind_available() 恒为 1(除非该线程被运行时崩溃永久禁用)
  *
  * dlopen 模式(默认):
  *   - pthread_once 串行化首次加载,dlsym 解析 unw_backtrace
  *   - 失败时永久标记不可用,后续调用零开销短路(atomic load)
  *   - dlsym/dlopen 本身线程安全(POSIX 保证)
  *
- * SIGSEGV/SIGBUS 信号保护(双模式共有):
+ * SIGSEGV/SIGBUS 信号保护 + per-thread 降级(双模式共有):
  *   背景:libunwind 1.8.2 在 ARM32 上走到某些缺 .ARM.exidx 的 .so 内部
  *   时,unw_step 可能解引用无效指针触发 SIGSEGV,整个被监控进程崩溃。
  *   典型场景:HDM3 storageManager 进程加载闭源厂商库,libunwind 走进去就崩。
  *
- *   方案:
- *   - 全局 mutex 串行化 capture 调用
+ *   方案(per-thread 粒度,避免单点崩溃拖垮全进程):
+ *   - 全局 mutex 串行化 capture 调用,保证 handler 不跨线程干扰
  *   - sigaction 临时注册 SIGSEGV/SIGBUS handler
  *   - sigsetjmp 保存上下文,handler 用 siglongjmp 跳回
- *   - 崩过一次永久标记 libunwind 不可用,后续零开销走 backtrace fallback
+ *   - 跳回后用 pthread_setspecific 标记**当前线程** libunwind 已禁用
+ *   - 该线程后续 capture 直接走 backtrace fallback,零开销
+ *   - 其他线程未触发崩溃,继续用 libunwind 拿深栈
+ *
+ *   为什么不用全局降级:
+ *   多线程进程里,线程 A 调用闭源库可能崩,线程 B 调用开源库完全 OK。
+ *   全局禁用会让线程 B 也丢失深栈,降低监控价值。per-thread 粒度更合理。
  *
  * ARM32 Thumb bit 处理(两种模式一致):
  *   libunwind 返回的地址在 Thumb 模式下 LSB=1,统一清除。
@@ -40,12 +46,34 @@
 #include "mtt_internal.h"   /* MTT_FIX_THUMB_ADDR, mtt_log_stage */
 
 /* ======================================================================== *
- *                  共享:SIGSEGV/SIGBUS 信号保护                             *
+ *        共享:SIGSEGV/SIGBUS 信号保护 + per-thread 降级                     *
  * ======================================================================== */
 
-/* 永久禁用标志:运行时崩溃后置 1,后续所有 capture 走 backtrace fallback。
- * 用 atomic 保证多线程可见性,崩溃后所有线程立即停止使用 libunwind */
-static _Atomic int g_libunwind_disabled = 0;
+/* per-thread 降级标志。
+ * pthread_key_create 用 pthread_once 懒初始化,首次访问时建立。
+ * pthread_setspecific/pthread_getspecific 不能在 signal handler 里调用
+ * (非 async-signal-safe),所以 mark 必须在 siglongjmp 跳回后做。 */
+static pthread_key_t  g_disabled_key;
+static pthread_once_t g_key_once = PTHREAD_ONCE_INIT;
+
+static void mtt_make_disabled_key(void)
+{
+    (void)pthread_key_create(&g_disabled_key, NULL);
+}
+
+/* 判断当前线程是否已被降级(已崩过 libunwind) */
+static inline int mtt_libunwind_thread_disabled(void)
+{
+    (void)pthread_once(&g_key_once, mtt_make_disabled_key);
+    return pthread_getspecific(g_disabled_key) != NULL;
+}
+
+/* 标记当前线程 libunwind 永久禁用 */
+static inline void mtt_libunwind_disable_this_thread(void)
+{
+    (void)pthread_once(&g_key_once, mtt_make_disabled_key);
+    (void)pthread_setspecific(g_disabled_key, (void *)(intptr_t)1);
+}
 
 /* 串行化 mutex:同一时刻只有一个线程在 unw_backtrace 调用中,
  * 防止多线程同时触发 handler 时跳错 sigjmp_buf */
@@ -63,7 +91,8 @@ static volatile sig_atomic_t g_in_unwind_call = 0;
  *   - 仅在 g_in_unwind_call=1 时拦截,其余场景恢复 SIG_DFL 并 raise,
  *     不影响进程原有信号处理(被监控业务可能依赖 SIGSEGV 跑 core dump)
  *   - siglongjmp 是 async-signal-safe(POSIX 明确保证)
- *   - 不持有任何锁,跳回后由 mtt_safe_unw_backtrace 继续清理 */
+ *   - 不持有任何锁,跳回后由 mtt_safe_unw_backtrace 继续清理
+ *   - 不调用 pthread_setspecific(非 async-signal-safe),mark 留给上层 */
 static void mtt_unwind_crash_handler(int sig, siginfo_t *info, void *uctx)
 {
     (void)info; (void)uctx;
@@ -91,7 +120,7 @@ static void mtt_unwind_crash_handler(int sig, siginfo_t *info, void *uctx)
  *   3. sigsetjmp 保存上下文
  *   4. 调用 unw_backtrace
  *   5. 恢复原 handler,解锁
- *   6. 若崩溃:永久禁用 libunwind,返回 -1
+ *   6. 若崩溃:标记当前线程 libunwind 永久禁用,返回 -1
  *
  * @param fn         unw_backtrace 函数指针(静态模式直接取 &unw_backtrace)
  * @param frames     输出帧数组
@@ -128,10 +157,11 @@ static int mtt_safe_unw_backtrace(int (*fn)(void **, int),
     pthread_mutex_unlock(&g_unwind_mutex);
 
     if (crashed) {
-        /* 永久禁用 libunwind:所有线程后续直接走 backtrace fallback,
-         * atomic_store 保证其他线程立即可见 */
-        atomic_store_explicit(&g_libunwind_disabled, 1, memory_order_release);
-        mtt_log_stage(31, "unw_backtrace crashed (signal %d), libunwind disabled permanently", sig);
+        /* 标记当前线程 libunwind 永久禁用(per-thread 粒度):
+         * 该线程后续 capture 直接走 backtrace fallback,
+         * 其他未触发崩溃的线程不受影响,继续用 libunwind 拿深栈 */
+        mtt_libunwind_disable_this_thread();
+        mtt_log_stage(31, "unw_backtrace crashed (signal %d), libunwind disabled for this thread", sig);
         return -1;
     }
     return n;
@@ -147,8 +177,8 @@ static int mtt_safe_unw_backtrace(int (*fn)(void **, int),
 
 int mtt_libunwind_available(void)
 {
-    /* 静态链接:符号已链入,但运行时崩溃后被永久禁用则返回 0 */
-    if (atomic_load_explicit(&g_libunwind_disabled, memory_order_acquire))
+    /* 静态链接:符号已链入。但当前线程若被 per-thread 降级,返回 0 */
+    if (mtt_libunwind_thread_disabled())
         return 0;
     return 1;
 }
@@ -157,8 +187,8 @@ int mtt_libunwind_capture(void **frames, int max_frames)
 {
     if (frames == NULL || max_frames <= 0) return -1;
 
-    /* 运行时崩溃后永久短路,零开销 */
-    if (atomic_load_explicit(&g_libunwind_disabled, memory_order_acquire))
+    /* 当前线程已崩过 libunwind,永久短路,零开销 fallback 到 backtrace */
+    if (mtt_libunwind_thread_disabled())
         return -1;
 
     /* 第一次调用时输出阶段日志,定位 libunwind 是否触发 */
@@ -279,8 +309,8 @@ static void try_load_libunwind(void)
 
 int mtt_libunwind_available(void)
 {
-    /* 运行时崩溃后永久禁用 */
-    if (atomic_load_explicit(&g_libunwind_disabled, memory_order_acquire))
+    /* 当前线程已被 per-thread 降级 */
+    if (mtt_libunwind_thread_disabled())
         return 0;
     pthread_once(&g_libunwind.once, try_load_libunwind);
     return atomic_load_explicit(&g_libunwind.available, memory_order_acquire) == 1;
@@ -290,8 +320,8 @@ int mtt_libunwind_capture(void **frames, int max_frames)
 {
     if (frames == NULL || max_frames <= 0) return -1;
 
-    /* 运行时崩溃后永久短路 */
-    if (atomic_load_explicit(&g_libunwind_disabled, memory_order_acquire))
+    /* 当前线程已崩过 libunwind,永久短路 */
+    if (mtt_libunwind_thread_disabled())
         return -1;
 
     pthread_once(&g_libunwind.once, try_load_libunwind);
