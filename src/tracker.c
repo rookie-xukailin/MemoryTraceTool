@@ -398,11 +398,16 @@ void mtt_capture_stack(mtt_entry_t *entry)
      *
      * 注意:libunwind 仍受目标二进制的 .ARM.exidx 完整性约束 —— 若目标
      * 编译时未加 -funwind-tables,无 unwind 信息的函数处仍会终止。
-     * 工具检测到此场景会输出 WARNING 提示用户重建(见 reporter.c Phase 1.3)。 */
+     * 工具检测到此场景会输出 WARNING 提示用户重建(见 reporter.c Phase 1.3)。
+     *
+     * per-thread 降级:libunwind 崩过的线程被 mtt_libunwind_thread_disabled
+     * 标记,跳过 libunwind 调用。同一栈上 backtrace 必崩(_Unwind_Backtrace
+     * 同样踩雷),所以降级线程也跳过 backtrace,只走 FP chain 兜底 */
     int use_libunwind = (g_unwinder_mode != 2);
-    mtt_log_stage(63, "capture_stack use_libunwind=%d (mode=%d)",
-                  use_libunwind, g_unwinder_mode);
-    if (use_libunwind && mtt_libunwind_available()) {
+    int disabled = mtt_libunwind_thread_disabled();
+    mtt_log_stage(63, "capture_stack use_libunwind=%d (mode=%d) disabled=%d",
+                  use_libunwind, g_unwinder_mode, disabled);
+    if (use_libunwind && !disabled && mtt_libunwind_available()) {
         mtt_log_stage(70, "capture_stack calling mtt_libunwind_capture");
         int n = mtt_libunwind_capture(entry->stack, MTT_STACK_DEPTH);
         mtt_log_stage(71, "capture_stack libunwind returned n=%d", n);
@@ -412,30 +417,30 @@ void mtt_capture_stack(mtt_entry_t *entry)
             mtt_log_stage(72, "capture_stack done via libunwind frames=%d", n);
             return;
         }
-        if (n == -1) {
-            /* libunwind 触发崩溃被 SIGSEGV/SIGBUS handler 跳回(per-thread 降级)。
-             * 关键:不能再调用 glibc backtrace —— 它内部走 _Unwind_Backtrace,
-             * 同样会踩到 libunwind 崩过的那个缺 .ARM.exidx 的 .so,
-             * 此时我们的信号 handler 已恢复 SIG_DFL,直接 core dump。
-             * 放弃当前 entry 的栈信息,保进程不崩 */
-            entry->stack_frames = 0;
-            ctx->in_capture = saved;
-            mtt_log_stage(74, "capture_stack abort (libunwind crashed, skip backtrace)");
-            return;
+        /* n < 2:重新检查 disabled,因为 mtt_libunwind_capture 内可能刚 mark */
+        disabled = mtt_libunwind_thread_disabled();
+        if (disabled) {
+            /* libunwind 刚崩(返回 -1 或 0/1 帧且已 mark),不能走 backtrace:
+             * 同栈上 _Unwind_Backtrace 必崩,handler 已恢复 SIG_DFL → core dump。
+             * 直接放弃栈信息,走 FP chain 兜底 */
+            mtt_log_stage(74, "capture_stack skip backtrace (thread disabled after libunwind crash)");
+        } else {
+            /* libunwind 没崩只是浅栈(0/1 帧),落回 glibc backtrace 再试一次 */
+            mtt_log_stage(73, "capture_stack libunwind weak (%d<2), falling back", n);
         }
-        /* libunwind 拿到 0-1 帧(没崩):栈太浅或 unwind 提早终止,
-         * 落回 glibc backtrace 再试一次 */
-        mtt_log_stage(73, "capture_stack libunwind weak (%d<2), falling back", n);
     }
 
+    /* backtrace 路径:降级线程跳过(同栈 libunwind 崩过,_Unwind_Backtrace 必崩) */
+    if (!disabled) {
 #if MTT_HAS_BACKTRACE
-    entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
-    if (entry->stack_frames < 0)
-        entry->stack_frames = 0;
-    for (int i = 0; i < entry->stack_frames; i++)
-        entry->stack[i] = MTT_FIX_THUMB_ADDR(entry->stack[i]);
-    bt_frames = entry->stack_frames;
+        entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
+        if (entry->stack_frames < 0)
+            entry->stack_frames = 0;
+        for (int i = 0; i < entry->stack_frames; i++)
+            entry->stack[i] = MTT_FIX_THUMB_ADDR(entry->stack[i]);
+        bt_frames = entry->stack_frames;
 #endif
+    }
 
     /* FP chain 兜底:仅当 backtrace 完全失败(0 帧)时启用。
      *

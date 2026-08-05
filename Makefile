@@ -154,7 +154,7 @@ $(BUILD_DIR)/addr_validate.o: $(SRC_DIR)/addr_validate.c $(SRC_DIR)/addr_validat
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
 $(BUILD_DIR)/unwind_libunwind.o: $(SRC_DIR)/unwind_libunwind.c $(SRC_DIR)/unwind_libunwind.h $(SRC_DIR)/mtt_internal.h $(LIBUNWIND_STATIC) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INC_SHARED) $(if $(filter -DMTT_STATIC_LIBUNWIND,$(CFLAGS)),-I$(LIBUNWIND_BUILD)/include -I$(LIBUNWIND_SRC)/include) -c -o $@ $<
+	$(CC) $(CFLAGS) $(INC_SHARED) $(if $(filter -DMTT_STATIC_LIBUNWIND,$(CFLAGS)),-DUNW_LOCAL_ONLY -I$(LIBUNWIND_BUILD)/include -I$(LIBUNWIND_SRC)/include) -c -o $@ $<
 
 $(BUILD_DIR) $(OUTPUT_DIR):
 	mkdir -p $@

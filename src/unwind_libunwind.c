@@ -4,25 +4,30 @@
  * 详见 unwind_libunwind.h 头部说明。
  *
  * 静态模式(MTT_STATIC_LIBUNWIND):
- *   - unw_backtrace 在链接期解析到静态库符号,无 dlopen/dlsym/pthread_once 开销
+ *   - 直接链入 unw_getcontext / unw_init_local / unw_step / unw_get_reg
+ *   - 用细粒度 step 循环替代高层 unw_backtrace,崩溃时保留已回溯帧
  *   - mtt_libunwind_available() 恒为 1(除非该线程被运行时崩溃永久禁用)
  *
  * dlopen 模式(默认):
  *   - pthread_once 串行化首次加载,dlsym 解析 unw_backtrace
  *   - 失败时永久标记不可用,后续调用零开销短路(atomic load)
  *   - dlsym/dlopen 本身线程安全(POSIX 保证)
+ *   - 注意:dlopen 模式下用高层 unw_backtrace,崩溃只能返回 -1
+ *     (libunwind 的 unw_* 都是宏,没法 dlsym 细粒度 API)
  *
- * SIGSEGV/SIGBUS 信号保护 + per-thread 降级(双模式共有):
+ * SIGSEGV/SIGBUS 信号保护 + per-thread 降级 + 部分帧保留(双模式共有):
  *   背景:libunwind 1.8.2 在 ARM32 上走到某些缺 .ARM.exidx 的 .so 内部
  *   时,unw_step 可能解引用无效指针触发 SIGSEGV,整个被监控进程崩溃。
  *   典型场景:HDM3 storageManager 进程加载闭源厂商库,libunwind 走进去就崩。
  *
- *   方案(per-thread 粒度,避免单点崩溃拖垮全进程):
+ *   方案(per-thread 粒度 + 部分帧保留):
  *   - 全局 mutex 串行化 capture 调用,保证 handler 不跨线程干扰
  *   - sigaction 临时注册 SIGSEGV/SIGBUS handler
  *   - sigsetjmp 保存上下文,handler 用 siglongjmp 跳回
+ *   - 静态模式:手动 unw_step 循环,每步成功后更新 g_unwind_safe_frames
+ *     崩溃时返回 g_unwind_safe_frames(崩溃前的所有帧都保留)
  *   - 跳回后用 pthread_setspecific 标记**当前线程** libunwind 已禁用
- *   - 该线程后续 capture 直接走 backtrace fallback,零开销
+ *   - 该线程后续 capture 直接走 FP chain 兜底,零开销
  *   - 其他线程未触发崩溃,继续用 libunwind 拿深栈
  *
  *   为什么不用全局降级:
@@ -61,14 +66,12 @@ static void mtt_make_disabled_key(void)
     (void)pthread_key_create(&g_disabled_key, NULL);
 }
 
-/* 判断当前线程是否已被降级(已崩过 libunwind) */
-static inline int mtt_libunwind_thread_disabled(void)
+int mtt_libunwind_thread_disabled(void)
 {
     (void)pthread_once(&g_key_once, mtt_make_disabled_key);
     return pthread_getspecific(g_disabled_key) != NULL;
 }
 
-/* 标记当前线程 libunwind 永久禁用 */
 static inline void mtt_libunwind_disable_this_thread(void)
 {
     (void)pthread_once(&g_key_once, mtt_make_disabled_key);
@@ -79,10 +82,13 @@ static inline void mtt_libunwind_disable_this_thread(void)
  * 防止多线程同时触发 handler 时跳错 sigjmp_buf */
 static pthread_mutex_t g_unwind_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* sigsetjmp 缓冲区 + 进入标志。
- * mutex 保证单线程独占,这两个变量无需 thread_local */
+/* sigsetjmp 缓冲区 + 进入标志 + 已成功回溯帧数。
+ * mutex 保证单线程独占,这三个变量无需 thread_local。
+ * g_unwind_safe_frames 在每次 capture 入口清零,每步 unw_step 成功后更新,
+ * 崩溃时由 mtt_safe_unw_backtrace 读取作为返回值 */
 static sigjmp_buf          g_unwind_jmp;
 static volatile sig_atomic_t g_in_unwind_call = 0;
+static volatile sig_atomic_t g_unwind_safe_frames = 0;
 
 /**
  * SIGSEGV/SIGBUS 临时 handler:libunwind 崩溃时跳回 capture 调用点。
@@ -111,69 +117,57 @@ static void mtt_unwind_crash_handler(int sig, siginfo_t *info, void *uctx)
     raise(sig);
 }
 
-/**
- * 调用 unw_backtrace,带 SIGSEGV/SIGBUS 信号保护。
- *
- * 流程:
- *   1. 加锁串行化
- *   2. 临时安装 SIGSEGV/SIGBUS handler
- *   3. sigsetjmp 保存上下文
- *   4. 调用 unw_backtrace
- *   5. 恢复原 handler,解锁
- *   6. 若崩溃:标记当前线程 libunwind 永久禁用,返回 -1
- *
- * @param fn         unw_backtrace 函数指针(静态模式直接取 &unw_backtrace)
- * @param frames     输出帧数组
- * @param max_frames 数组容量
- * @return           ≥0=帧数,-1=libunwind 崩溃或调用失败 */
-static int mtt_safe_unw_backtrace(int (*fn)(void **, int),
-                                  void **frames, int max_frames)
-{
-    struct sigaction old_segv, old_bus;
-    struct sigaction sa;
-    sa.sa_sigaction = mtt_unwind_crash_handler;
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
-
-    pthread_mutex_lock(&g_unwind_mutex);
-
-    sigaction(SIGSEGV, &sa, &old_segv);
-    sigaction(SIGBUS,  &sa, &old_bus);
-
-    g_in_unwind_call = 1;
-    int sig = sigsetjmp(g_unwind_jmp, 1);
-
-    int n = 0;
-    int crashed = (sig != 0);
-    if (!crashed) {
-        n = fn(frames, max_frames);
-        if (n < 0) n = 0;
-    }
-    g_in_unwind_call = 0;
-
-    sigaction(SIGSEGV, &old_segv, NULL);
-    sigaction(SIGBUS,  &old_bus, NULL);
-
-    pthread_mutex_unlock(&g_unwind_mutex);
-
-    if (crashed) {
-        /* 标记当前线程 libunwind 永久禁用(per-thread 粒度):
-         * 该线程后续 capture 直接走 backtrace fallback,
-         * 其他未触发崩溃的线程不受影响,继续用 libunwind 拿深栈 */
-        mtt_libunwind_disable_this_thread();
-        mtt_log_stage(31, "unw_backtrace crashed (signal %d), libunwind disabled for this thread", sig);
-        return -1;
-    }
-    return n;
-}
-
 /* ======================================================================== *
  *                  模式 1: 静态链接(MTT_STATIC_LIBUNWIND)                    *
  * ======================================================================== */
 
 #ifdef MTT_STATIC_LIBUNWIND
 
-#include <libunwind.h>   /* unw_backtrace 声明 */
+#include <libunwind.h>   /* unw_* API */
+
+/**
+ * 细粒度 unwind:用 unw_init_local + unw_step + unw_get_reg 循环。
+ *
+ * 与高层 unw_backtrace 区别:
+ *   - unw_backtrace 是黑盒,崩了之后无法知道已回溯多少帧
+ *   - 细粒度循环每步更新 g_unwind_safe_frames,崩溃时该值就是有效帧数
+ *
+ * 行为:
+ *   - 跳过当前帧(unw_getcontext 那帧,即 mtt_unwind_step_loop 自身)
+ *     与 unw_backtrace 行为一致
+ *   - 每步 unw_step 成功后 unw_get_reg 取 IP 写入 frames[n]
+ *   - g_unwind_safe_frames 在每次写入后更新(确保 frames[n-1] 已就绪)
+ *
+ * 注意:本函数运行在信号保护上下文内(mtt_safe_unw_backtrace 已注册 handler),
+ *       如果 unw_step 触发 SIGSEGV/SIGBUS,handler 用 siglongjmp 跳回,
+ *       本函数不会返回,函数剩余代码不会执行。 */
+static int mtt_unwind_step_loop(void **frames, int max_frames)
+{
+    unw_context_t ctx;
+    unw_cursor_t  cursor;
+
+    if (unw_getcontext(&ctx) < 0) return 0;
+    if (unw_init_local(&cursor, &ctx) < 0) return 0;
+
+    int n = 0;
+    while (n < max_frames) {
+        /* 移动到下一帧。崩溃通常发生在这里:unw_step 内部访问 .ARM.exidx
+         * 表 + 栈帧,缺表或栈被破坏时解引用无效指针 */
+        int ret = unw_step(&cursor);
+        if (ret <= 0) break;
+
+        unw_word_t pc;
+        if (unw_get_reg(&cursor, UNW_REG_IP, &pc) != UNW_ESUCCESS) break;
+
+        frames[n++] = (void *)pc;
+        /* 关键:每步成功后立即更新 g_unwind_safe_frames。
+         * 若下一步 unw_step 崩了,handler 跳回,本函数不返回,
+         * 调用方通过 g_unwind_safe_frames 拿到本次循环已写入的帧数 */
+        g_unwind_safe_frames = n;
+    }
+
+    return n;
+}
 
 int mtt_libunwind_available(void)
 {
@@ -187,7 +181,7 @@ int mtt_libunwind_capture(void **frames, int max_frames)
 {
     if (frames == NULL || max_frames <= 0) return -1;
 
-    /* 当前线程已崩过 libunwind,永久短路,零开销 fallback 到 backtrace */
+    /* 当前线程已崩过 libunwind,永久短路 */
     if (mtt_libunwind_thread_disabled())
         return -1;
 
@@ -196,21 +190,64 @@ int mtt_libunwind_capture(void **frames, int max_frames)
     int is_first = atomic_compare_exchange_strong(&g_first_capture,
                                                   &(int){1}, 0);
 
-    int n = mtt_safe_unw_backtrace(unw_backtrace, frames, max_frames);
-    if (n < 0) {
-        /* 崩溃或失败,返回 -1,让上层 fallback 到 backtrace */
+    /* 信号保护上下文 */
+    struct sigaction old_segv, old_bus;
+    struct sigaction sa;
+    sa.sa_sigaction = mtt_unwind_crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+
+    pthread_mutex_lock(&g_unwind_mutex);
+
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS,  &sa, &old_bus);
+
+    g_unwind_safe_frames = 0;
+    g_in_unwind_call = 1;
+    int sig = sigsetjmp(g_unwind_jmp, 1);
+
+    int n = 0;
+    int crashed = (sig != 0);
+    if (!crashed) {
+        n = mtt_unwind_step_loop(frames, max_frames);
+        if (n < 0) n = 0;
+    } else {
+        /* 崩了:取已成功回溯的帧数(可能 0..N-1)
+         * frames[0..n-1] 都已被 mtt_unwind_step_loop 写入有效 IP */
+        n = (int)g_unwind_safe_frames;
+    }
+    g_in_unwind_call = 0;
+
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS,  &old_bus, NULL);
+
+    pthread_mutex_unlock(&g_unwind_mutex);
+
+    if (crashed) {
+        /* per-thread 降级:本线程后续 capture 直接返回 -1,
+         * 其他线程不受影响 */
+        mtt_libunwind_disable_this_thread();
+        mtt_log_stage(31, "unw_step crashed (signal %d) at frame %d, kept %d partial frames",
+                      sig, n + 1, n);
+        /* 关键:返回 n 而非 -1,把崩溃前的部分帧交给上层使用 */
+        if (n >= 1) {
+            /* 有部分帧,清除 Thumb bit 后返回 */
+            for (int i = 0; i < n; i++)
+                frames[i] = MTT_FIX_THUMB_ADDR(frames[i]);
+            return n;
+        }
+        /* n == 0:第一帧就崩了,完全没拿到栈,返回 -1 让上层 fallback */
         if (is_first) {
-            mtt_log_stage(30, "first unw_backtrace failed/crashed");
+            mtt_log_stage(30, "first unw_step crashed at frame 1");
         }
         return -1;
     }
 
     if (is_first) {
-        mtt_log_stage(30, "first unw_backtrace done frames=%d", n);
+        mtt_log_stage(30, "first unw_step loop done frames=%d", n);
     }
 
-    /* 清除 ARM32 Thumb bit(LSB=1),与 dlopen 路径后处理保持一致,
-     * 让下游 hash/dladdr 不受 Thumb 状态干扰 */
+    /* 清除 ARM32 Thumb bit(LSB=1),让下游 hash/dladdr 不受 Thumb 状态干扰 */
     for (int i = 0; i < n; i++)
         frames[i] = MTT_FIX_THUMB_ADDR(frames[i]);
 
@@ -224,9 +261,7 @@ int mtt_libunwind_capture(void **frames, int max_frames)
 
 #include <dlfcn.h>
 
-/* libunwind unw_backtrace 函数指针类型
- * 原型: int unw_backtrace(void **buffer, int size);
- * 行为与 glibc backtrace() 相同,内部走 libunwind 多策略 unwind */
+/* libunwind unw_backtrace 函数指针类型 */
 typedef int (*mtt_unw_backtrace_fn)(void **, int);
 
 /* ---- 全局状态 ---- */
@@ -328,11 +363,44 @@ int mtt_libunwind_capture(void **frames, int max_frames)
     if (atomic_load_explicit(&g_libunwind.available, memory_order_acquire) != 1)
         return -1;
 
-    int n = mtt_safe_unw_backtrace(g_libunwind.backtrace, frames, max_frames);
-    if (n < 0) return -1;
+    /* dlopen 模式:用高层 unw_backtrace + 信号保护。
+     * 与静态模式不同,这里没法做细粒度 step(libunwind 的 unw_* 是宏,
+     * 无法 dlsym),崩了只能返回 -1,部分帧全部丢失 */
+    struct sigaction old_segv, old_bus;
+    struct sigaction sa;
+    sa.sa_sigaction = mtt_unwind_crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
 
-    /* 清除 ARM32 Thumb bit(LSB=1),与 backtrace() 后处理保持一致,
-     * 让下游 hash/dladdr 不受 Thumb 状态干扰 */
+    pthread_mutex_lock(&g_unwind_mutex);
+
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS,  &sa, &old_bus);
+
+    g_in_unwind_call = 1;
+    int sig = sigsetjmp(g_unwind_jmp, 1);
+
+    int n = 0;
+    int crashed = (sig != 0);
+    if (!crashed) {
+        n = g_libunwind.backtrace(frames, max_frames);
+        if (n < 0) n = 0;
+    }
+    g_in_unwind_call = 0;
+
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS,  &old_bus, NULL);
+
+    pthread_mutex_unlock(&g_unwind_mutex);
+
+    if (crashed) {
+        /* dlopen 模式下没法拿到部分帧,只能放弃 */
+        mtt_libunwind_disable_this_thread();
+        mtt_log_stage(31, "unw_backtrace crashed (signal %d), no partial frames (dlopen mode)", sig);
+        return -1;
+    }
+
+    /* 清除 ARM32 Thumb bit(LSB=1),与静态模式后处理保持一致 */
     for (int i = 0; i < n; i++)
         frames[i] = MTT_FIX_THUMB_ADDR(frames[i]);
 

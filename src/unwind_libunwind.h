@@ -49,4 +49,16 @@ int mtt_libunwind_available(void);
  */
 int mtt_libunwind_capture(void **frames, int max_frames);
 
+/**
+ * 当前线程是否已被 per-thread 降级(libunwind 崩过)。
+ *
+ * 调用方(如 mtt_capture_stack)应在调用 backtrace 前检查:
+ * 已降级线程的栈上存在缺 .ARM.exidx 的坏 .so,libunwind 走进去会崩,
+ * glibc backtrace 内部用 _Unwind_Backtrace 同样会崩。
+ *
+ * @return 1=本线程 libunwind 已禁用,应跳过 backtrace 走 FP chain 兜底
+ *         0=本线程 libunwind 正常
+ */
+int mtt_libunwind_thread_disabled(void);
+
 #endif /* MTT_UNWIND_LIBUNWIND_H */
