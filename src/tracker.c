@@ -412,7 +412,18 @@ void mtt_capture_stack(mtt_entry_t *entry)
             mtt_log_stage(72, "capture_stack done via libunwind frames=%d", n);
             return;
         }
-        /* libunwind 拿到 0-1 帧:可能 libunwind 自身出问题或栈太浅,
+        if (n == -1) {
+            /* libunwind 触发崩溃被 SIGSEGV/SIGBUS handler 跳回(per-thread 降级)。
+             * 关键:不能再调用 glibc backtrace —— 它内部走 _Unwind_Backtrace,
+             * 同样会踩到 libunwind 崩过的那个缺 .ARM.exidx 的 .so,
+             * 此时我们的信号 handler 已恢复 SIG_DFL,直接 core dump。
+             * 放弃当前 entry 的栈信息,保进程不崩 */
+            entry->stack_frames = 0;
+            ctx->in_capture = saved;
+            mtt_log_stage(74, "capture_stack abort (libunwind crashed, skip backtrace)");
+            return;
+        }
+        /* libunwind 拿到 0-1 帧(没崩):栈太浅或 unwind 提早终止,
          * 落回 glibc backtrace 再试一次 */
         mtt_log_stage(73, "capture_stack libunwind weak (%d<2), falling back", n);
     }
