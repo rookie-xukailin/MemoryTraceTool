@@ -1135,6 +1135,26 @@ static void* reporter_thread_fn(void *arg)
         }
 
         if (atomic_load_explicit(&g_reporter.running, memory_order_acquire)) {
+            /* 心跳日志:每 MTT_REPORT_INTERVAL_SEC(60s) 一条,等级 1 输出。
+             * 用途:串口/控制台长时间无输出会断连,需要工具表明"还在工作"。
+             * 等级 0(MTT_DEBUG=0) 仍静默,文件 heartbeat 继续写到 /var/log/mtt/。
+             * 带 entry_count 让用户能粗略看分配趋势,不必打开 heartbeat 文件 */
+            {
+                mtt_state_t *st = mtt_state_get();
+                uint64_t ec = 0;
+                if (st != NULL) {
+                    ec = atomic_load_explicit(&st->entry_count,
+                                              memory_order_relaxed);
+                }
+                char hbuf[128];
+                int hlen = snprintf(hbuf, sizeof(hbuf),
+                    "[MTT] heartbeat: running ts=%ld entries=%llu interval=%ds\n",
+                    (long)time(NULL),
+                    (unsigned long long)ec,
+                    MTT_REPORT_INTERVAL_SEC);
+                if (hlen > 0 && hlen < (int)sizeof(hbuf))
+                    MTT_LOG_INFO(hbuf, (size_t)hlen);
+            }
             {
                 char dbuf[64];
                 int dlen = snprintf(dbuf, sizeof(dbuf),
