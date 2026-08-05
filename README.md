@@ -165,6 +165,20 @@ python3 tests/test_frontend_html.py    # HTML/JS/CSS 结构验证
 | M8 | `e7d14fe` | 产物分离：output/ 最终产物 + build/ 中间 .o |
 | M9 | `c0bb2c4` | **栈深度 16→32** + RSS 进程内存跟踪 + GDB 运行时注入 + ARM32 栈溢出修复 |
 | M10 | `32aec7f` | **libunwind v1.8.2 vendored 静态链接** + 性能优化(pool_lock per-stripe + CLOCK_REALTIME_COARSE),单 .so 内置 unwind,目标机零依赖 |
+| M11 | `779fbd3` | **addr2line 行号解析修复**:alCmd 命令格式修正(-e 不再带 +offset)+ 非 PIE 主程序帧地址修正(读 ELF e_type 判定,主程序帧输出运行时地址,libc/.so 帧保持 file_off)。HDM3 storageManager 主进程泄漏点可正确解析 `func at file.c:line` |
+
+## 验证状态
+
+| 指标 | ARM32 | ARM64 | x86_64 |
+|------|-------|-------|--------|
+| 编译警告 | 0 | 0 | 0 |
+| test_basic | 36/36 PASS | — | 36/36 PASS |
+| test_stability | 17/17 PASS | — | 17/17 PASS |
+| LD_PRELOAD + HTTP | PASS | — | PASS |
+| 栈回溯（函数名+偏移） | PASS | — | PASS |
+| **addr2line 行号解析（PIE + 非 PIE）** | PASS | PASS | — |
+| RSS 进程内存 | PASS | — | PASS |
+| 火焰图 collapsed stacks | PASS | — | PASS |
 
 ## 验证状态
 
