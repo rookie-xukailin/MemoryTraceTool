@@ -79,7 +79,13 @@ static void first_call_diag(const char *func_name, _Atomic int *flag, int stage_
  * mtt_hook_enter/inc/dec 内部通过 mtt_thread_get() 访问。 */
 
 /** 获取当前 hook 调用深度，首次调用时自动修正脏值。
- * 若槽位满返回 -1（降级：视为递归，直接透传 raw_*） */
+ * 若槽位满返回 -1（降级：视为递归，直接透传 raw_*）。
+ *
+ * TID 复用残留修正:槽位永不清零,线程池场景下线程 A 退出后槽位保留
+ * A 的 hook_depth 残留值,内核回收 A 的 TID 后被新线程 B 复用,
+ * B 命中旧槽位会拿到 A 残留的 hook_depth(>0) → 永远走递归透传分支,
+ * B 的所有 malloc 静默丢失。当 depth_inited 已初始化(0x2A)但
+ * hook_depth 超过合理上限(MTT_HOOK_DEPTH_MAX)时,判定为残留,重置为 0。 */
 static inline int mtt_hook_enter(void)
 {
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get();
@@ -87,6 +93,9 @@ static inline int mtt_hook_enter(void)
     if (ctx->depth_inited != 0x2A) {
         ctx->hook_depth = 0;
         ctx->depth_inited = 0x2A;
+    } else if (ctx->hook_depth > MTT_HOOK_DEPTH_MAX) {
+        /* TID 复用残留:清零,恢复追踪 */
+        ctx->hook_depth = 0;
     }
     return ctx->hook_depth;
 }
@@ -97,6 +106,7 @@ static inline void mtt_hook_inc_depth(void)
     if (ctx == NULL) return; /* 降级：无槽位时跳过 */
     int init_ok = (ctx->depth_inited == 0x2A);
     if (!init_ok) { ctx->hook_depth = 0; ctx->depth_inited = 0x2A; }
+    if (ctx->hook_depth >= MTT_HOOK_DEPTH_MAX) return; /* 防溢出 + 防残留累积 */
     ctx->hook_depth++;
 }
 
@@ -137,7 +147,9 @@ void* malloc(size_t size)
     }
     mtt_per_thread_t *ctx = mtt_thread_get();
     if (ctx == NULL) {
-        /* 槽位满：降级透传，不追踪 */
+        /* 槽位满(512 上限):降级透传,不追踪。
+         * MTT_DEBUG=2 时输出 S25,定位"线程太多导致泄漏丢失"场景 */
+        mtt_log_stage(25, "malloc ctx==NULL (slot full) size=%zu, NOT tracking", size);
         mtt_resolve_raw_allocators();
         return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
     }
@@ -298,7 +310,8 @@ void free(void *ptr)
     }
     mtt_per_thread_t *ctx = mtt_thread_get();
     if (ctx == NULL) {
-        /* 槽位满：降级直接释放 */
+        /* 槽位满：降级直接释放,不维护 entry */
+        mtt_log_stage(25, "free ctx==NULL (slot full), NOT untracking");
         mtt_resolve_raw_allocators();
         if (raw_free != NULL) raw_free(ptr);
         return;
@@ -383,7 +396,9 @@ void* calloc(size_t count, size_t size)
     }
     mtt_per_thread_t *ctx = mtt_thread_get();
     if (ctx == NULL) {
-        /* 槽位满：降级，直接 raw_malloc + memset */
+        /* 槽位满：降级,不追踪 */
+        mtt_log_stage(25, "calloc ctx==NULL (slot full) size=%zu, NOT tracking",
+                      (size_t)(count * size));
         mtt_resolve_raw_allocators();
         if (raw_malloc == NULL) return NULL;
         if (count > 0 && size > SIZE_MAX / count) return NULL;
@@ -445,7 +460,8 @@ void* realloc(void *ptr, size_t size)
     }
     mtt_per_thread_t *ctx = mtt_thread_get();
     if (ctx == NULL) {
-        /* 槽位满：降级使用 raw_realloc */
+        /* 槽位满：降级,不追踪 */
+        mtt_log_stage(25, "realloc ctx==NULL (slot full) size=%zu, NOT tracking", size);
         mtt_resolve_raw_allocators();
         if (raw_realloc != NULL) return raw_realloc(ptr, size);
         if (raw_malloc == NULL) return NULL;
