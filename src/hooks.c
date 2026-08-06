@@ -229,7 +229,7 @@ void* malloc(size_t size)
     mtt_log_stage(27, "malloc past track/cap checks, calling entry_new");
 
     /* 创建追踪记录（内部使用 raw_malloc） */
-    mtt_entry_t *e = mtt_entry_new(ptr, size);
+    mtt_entry_t *e = mtt_entry_new(ptr, size, mtt_light_fingerprint());
     if (e == NULL) {
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
@@ -555,7 +555,7 @@ void* realloc(void *ptr, size_t size)
 
             /* 创建新追踪记录（不阻塞业务） */
             if (!mtt_is_over_capacity(s)) {
-                mtt_entry_t *new_e = mtt_entry_new(new_ptr, size);
+                mtt_entry_t *new_e = mtt_entry_new(new_ptr, size, mtt_light_fingerprint());
                 if (new_e != NULL) {
                     mtt_stripe_lock(s, new_ptr);
                     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) < MTT_MAX_ENTRIES) {
@@ -606,7 +606,7 @@ void* realloc(void *ptr, size_t size)
     }
 
     /* 创建新追踪记录 */
-    mtt_entry_t *new_e = mtt_entry_new(new_ptr, size);
+    mtt_entry_t *new_e = mtt_entry_new(new_ptr, size, mtt_light_fingerprint());
     if (new_e == NULL) {
         raw_free(new_ptr);
     mtt_hook_dec_depth();
