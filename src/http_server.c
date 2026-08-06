@@ -39,7 +39,7 @@ static const char g_dashboard_html[] =
 "<head>\n"
 "<meta charset=\"UTF-8\">\n"
 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
-"<meta http-equiv=\"Cache-Control\" content=\"no-cache\">\n"
+"<meta http-equiv=\"Cache-Control\" content=\"no-store, no-cache\">\n"
 "<title>MemoryTraceTool</title>\n"
 "<style>\n"
 ":root{--bg:#fff;--bg2:#f6f8fa;--text:#24292f;--border:#d0d7de;--accent:#0969da;--orange:#d97706;--green:#16a34a;--warn:#dc2626}\n"
@@ -284,7 +284,7 @@ static void handle_root(int client_fd)
     const char *header =
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
-        "Cache-Control: no-cache\r\n"
+        "Cache-Control: no-store, no-cache, max-age=0\r\n"
         "Connection: close\r\n"
         "\r\n";
     MTT_DIAG_WRITE(client_fd, header, strlen(header));
@@ -439,7 +439,7 @@ static void handle_api_data(int client_fd)
     const char *header =
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: application/json; charset=utf-8\r\n"
-        "Cache-Control: no-cache\r\n"
+        "Cache-Control: no-store, no-cache, max-age=0\r\n"
         "Connection: close\r\n"
         "\r\n";
     MTT_DIAG_WRITE(client_fd, header, strlen(header));
@@ -563,7 +563,7 @@ static void handle_api_leaks(int client_fd)
     const char *header =
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: application/json; charset=utf-8\r\n"
-        "Cache-Control: no-cache\r\n"
+        "Cache-Control: no-store, no-cache, max-age=0\r\n"
         "Connection: close\r\n"
         "\r\n";
     MTT_DIAG_WRITE(client_fd, header, strlen(header));
