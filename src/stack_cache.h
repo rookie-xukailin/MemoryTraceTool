@@ -24,6 +24,19 @@ typedef struct mtt_stack_entry {
     struct mtt_stack_entry *next;                      /* 哈希碰撞链表 */
 } mtt_stack_entry_t;
 
+/* ---- 轻量指纹索引(1.2 栈回溯缓存复用) ---- */
+
+/** 轻量指纹索引条目:按 mtt_light_fingerprint() 的指纹索引已回溯的栈。
+ * 同调用栈的 N 次分配只回溯一次,后续命中指纹直接抄缓存栈(零失真)。 */
+typedef struct mtt_fp_entry {
+    uint64_t  fp;                                      /* 轻量指纹 */
+    void     *frames[MTT_STACK_DEPTH];                 /* 已回溯的栈帧 */
+    int       frame_count;                             /* 帧数 */
+    struct mtt_fp_entry *next;                         /* 碰撞链表 */
+} mtt_fp_entry_t;
+
+#define MTT_FP_CACHE_SIZE 1024   /* 指纹索引容量(远小于栈缓存,命中率足够) */
+
 /** 栈帧缓存表（开放哈希，数组+链表） */
 typedef struct {
     mtt_stack_entry_t *entries[MTT_STACK_CACHE_SIZE];  /* 桶数组 */
@@ -63,5 +76,33 @@ mtt_stack_entry_t* mtt_stack_cache_lookup(void **frames, int frame_count);
  * @param entry  栈缓存条目
  */
 void mtt_stack_resolve(mtt_stack_entry_t *entry);
+
+/* ---- 轻量指纹索引 API ---- */
+
+/**
+ * 按轻量指纹查找已回溯的栈(1.2 缓存复用)。
+ *
+ * 命中:返回缓存条目的帧数组(调用方直接抄给 entry,不回溯)。
+ * 未命中:返回 NULL,调用方照旧回溯,回溯后调 mtt_fp_cache_store 存入。
+ *
+ * 线程安全:内部加锁。业务线程(malloc 热路径)与 reporter 线程并发安全。
+ *
+ * @param fp        轻量指纹(mtt_light_fingerprint 计算结果)
+ * @param frames    输出缓冲(命中时填入缓存栈帧)
+ * @param max_frames 输出缓冲容量
+ * @return          命中时帧数(>0),未命中 0
+ */
+int mtt_fp_cache_lookup(uint64_t fp, void **frames, int max_frames);
+
+/**
+ * 将真实回溯结果按指纹存入索引(1.2 缓存复用)。
+ *
+ * 只有"真实回溯"的结果能入缓存,保证抄出来的栈零失真。
+ *
+ * @param fp        轻量指纹
+ * @param frames    真实回溯的帧数组
+ * @param frame_count 帧数
+ */
+void mtt_fp_cache_store(uint64_t fp, void **frames, int frame_count);
 
 #endif /* MTT_STACK_CACHE_H */

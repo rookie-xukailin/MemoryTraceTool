@@ -203,6 +203,7 @@ typedef struct mtt_entry {
     uint64_t         alloc_num;                     /* 全局单调递增的分配序号（64-bit 防回绕） */
     void            *stack[MTT_STACK_DEPTH];        /* backtrace 返回的调用栈帧地址 */
     int              stack_frames;                  /* 实际栈帧数 */
+    uint64_t         fp_hint;                       /* 轻量指纹(1.2 缓存复用,0=未记录) */
     struct mtt_entry *next;                         /* 哈希桶内单向链表指针 */
 } mtt_entry_t;
 

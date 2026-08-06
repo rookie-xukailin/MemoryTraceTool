@@ -31,6 +31,7 @@
 #include "per_thread.h"
 #include "addr_validate.h"
 #include "unwind_libunwind.h"
+#include "stack_cache.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -374,6 +375,50 @@ void mtt_resolve_raw_allocators(void)
  *   - 支持异步跨线程回溯（heaptrack 注入模式的核心能力）
  *   详见 stack_cache.c 头部注释中的 libunwind 改进说明。
  */
+/**
+ * 计算轻量调用位置指纹(不调用 libunwind/backtrace)。
+ *
+ * 用途:栈回溯缓存复用(1.2)的"预判键"——同调用栈的 N 次分配,
+ * 只有第一次需要真实回溯,后续用指纹查缓存直接抄结果,省 CPU。
+ *
+ * 原理:
+ *   - __builtin_return_address(0):当前 malloc 调用点的返回地址(1 指令)
+ *   - 手动读 FP 链 1-2 层取 LR:提高区分度(防止不同位置指纹相同)
+ *
+ * 注意:
+ *   - 指纹只是"预判提示",命中缓存后仍以缓存栈逐帧比对为准,
+ *     碰撞/误判只会导致重回溯,不会拿错栈(零失真保证)。
+ *   - ARM32 Thumb 地址 LSB 统一清除,与帧处理保持一致。
+ *
+ * @return 64 位指纹(非零)
+ */
+static uint64_t mtt_light_fingerprint(void)
+{
+    void *frames[3] = {0};
+
+    /* 第 0 帧:当前函数调用点返回地址 */
+    frames[0] = __builtin_return_address(0);
+
+    /* 第 1-2 帧:手动沿 FP 链读 LR(不调用回溯库,仅几次内存读) */
+    void **fp = (void**)__builtin_frame_address(0);
+    for (int i = 1; i < 3 && fp != NULL; i++) {
+        void *lr = fp[1];
+        if (lr == NULL) break;
+        frames[i] = lr;
+        void *prev_fp = fp[0];
+        if (prev_fp == NULL || prev_fp <= (void*)fp) break;
+        fp = (void**)prev_fp;
+    }
+
+    /* 合并成 64 位指纹(xxhash 风格混合,避免简单加法碰撞) */
+    uint64_t h = 0x9e3779b97f4a7c15ULL;
+    for (int i = 0; i < 3; i++) {
+        uintptr_t a = (uintptr_t)MTT_FIX_THUMB_ADDR(frames[i]);
+        h ^= a + 0x9e3779b9ULL + (h << 6) + (h >> 2);
+    }
+    return (h != 0) ? h : 1;
+}
+
 void mtt_capture_stack(mtt_entry_t *entry)
 {
     if (entry == NULL) return;
@@ -391,6 +436,22 @@ void mtt_capture_stack(mtt_entry_t *entry)
     ctx->in_capture = 1;
 
     int bt_frames = 0;
+
+    /* 1.2 栈回溯缓存复用:同调用栈的 N 次分配只回溯一次。
+     * 用轻量指纹(几微秒)预查缓存,命中则直接抄缓存栈,跳过 libunwind
+     * (几十微秒)。缓存内容来自"第一次真实回溯",抄出来零失真。 */
+    {
+        uint64_t fp = mtt_light_fingerprint();
+        int cached_frames = mtt_fp_cache_lookup(fp, entry->stack,
+                                                MTT_STACK_DEPTH);
+        if (cached_frames > 0) {
+            entry->stack_frames = cached_frames;
+            ctx->in_capture = saved;
+            mtt_log_stage(65, "capture_stack fp-cache hit frames=%d", cached_frames);
+            return;
+        }
+        entry->fp_hint = fp;   /* 记录指纹,回溯后入缓存 */
+    }
 
     /* 优先路径:libunwind(若可用且未被 MTT_UNWINDER=backtrace 禁用)
      * libunwind 内建 ARM EHABI + DWARF + FP chain 多策略 unwind,在 ARM32
@@ -415,6 +476,12 @@ void mtt_capture_stack(mtt_entry_t *entry)
         mtt_log_stage(71, "capture_stack libunwind returned n=%d", n);
         if (n >= 2) {
             entry->stack_frames = n;
+            /* 1.2 缓存复用:真实回溯完成,立即入缓存(供后续同位置分配复用)。
+             * 注意:此路径原本直接 return 会跳过末尾 store,缓存永远为空 */
+            if (entry->fp_hint != 0) {
+                mtt_fp_cache_store(entry->fp_hint, entry->stack, n);
+                entry->fp_hint = 0;
+            }
             ctx->in_capture = saved;
             mtt_log_stage(72, "capture_stack done via libunwind frames=%d", n);
             return;
@@ -504,6 +571,14 @@ void mtt_capture_stack(mtt_entry_t *entry)
                 entry->stack[i] = fp_stack[i];
             entry->stack_frames = fp_count;
         }
+    }
+
+    /* 1.2 缓存复用:真实回溯完成,按指纹存入缓存,供后续同位置分配复用。
+     * 只有这里(真实回溯)能入缓存,保证抄出来的栈零失真。
+     * entry->fp_hint 由 fp-cache 未命中路径设置;命中路径已直接 return。 */
+    if (entry->fp_hint != 0 && entry->stack_frames > 0) {
+        mtt_fp_cache_store(entry->fp_hint, entry->stack, entry->stack_frames);
+        entry->fp_hint = 0;   /* 用完清掉,entry 回池后不残留 */
     }
 
     ctx->in_capture = saved;
