@@ -170,35 +170,6 @@ extern raw_posix_memalign_fn volatile raw_posix_memalign;
 #include "per_thread.h"
 
 /* ======================================================================== *
- *      轻量调用位置指纹(1.2 栈回溯缓存复用)                                   *
- * ======================================================================== */
-
-/**
- * 计算轻量调用位置指纹(不调用 libunwind/backtrace,1 条指令)。
- *
- * 关键:必须在 malloc hook 层调用(malloc 函数体内),此时
- * __builtin_return_address(0) 返回的是**业务调用点**(谁调了 malloc)。
- * 在 capture_stack(工具内部函数)里调用会取到工具内部地址,
- * 所有 malloc 指纹相同 → 缓存互相覆盖 → 泄漏点全部错误合并(14000 次
- * 合并成 1 个站点的 bug 根因)。
- *
- * 只用返回地址,不用 FP 链:FP 链在 -O2 -fomit-frame-pointer 下不可靠,
- * 且宏封装场景(STORAGE_SAFE_MALLOC 直接调 malloc)返回地址天然区分
- * 不同调用点。同一函数内多行 malloc 返回地址相同(同栈),合并合理。
- *
- * @return 64 位指纹(非零)
- */
-static inline uint64_t mtt_light_fingerprint(void)
-{
-    uintptr_t a = (uintptr_t)__builtin_return_address(0);
-    a = (uintptr_t)MTT_FIX_THUMB_ADDR((void*)a);
-    uint64_t h = 0x9e3779b97f4a7c15ULL ^ (a + 0x9e3779b9ULL
-                  + ((0x9e3779b97f4a7c15ULL) << 6)
-                  + ((0x9e3779b97f4a7c15ULL) >> 2));
-    return (h != 0) ? h : 1;
-}
-
-/* ======================================================================== *
  *                       缓存行对齐的互斥锁（避免伪共享）                        *
  * ======================================================================== */
 
@@ -232,7 +203,6 @@ typedef struct mtt_entry {
     uint64_t         alloc_num;                     /* 全局单调递增的分配序号（64-bit 防回绕） */
     void            *stack[MTT_STACK_DEPTH];        /* backtrace 返回的调用栈帧地址 */
     int              stack_frames;                  /* 实际栈帧数 */
-    uint64_t         fp_hint;                       /* 轻量指纹(1.2 缓存复用,0=未记录) */
     struct mtt_entry *next;                         /* 哈希桶内单向链表指针 */
 } mtt_entry_t;
 
@@ -395,7 +365,7 @@ static inline time_t mtt_now_sec(void)
 /* tracker.c */
 void         mtt_ensure_init(void);
 void         mtt_resolve_raw_allocators(void);
-mtt_entry_t* mtt_entry_new(void *ptr, size_t size, uint64_t fp_hint);
+mtt_entry_t* mtt_entry_new(void *ptr, size_t size);
 void         mtt_entry_add(mtt_state_t *s, mtt_entry_t *e);
 void         mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e);   /* 归还未入表的 entry(pool 模式回 free_list,raw 模式 raw_free) */
 mtt_entry_t* mtt_entry_find(mtt_state_t *s, const void *ptr);
@@ -404,7 +374,7 @@ int          mtt_should_track(mtt_state_t *s, size_t size);
 int          mtt_is_over_capacity(mtt_state_t *s);
 int          mtt_is_startup_phase(mtt_state_t *s);
 int          mtt_is_blacklisted(mtt_state_t *s, const char *symbol);
-void         mtt_capture_stack(mtt_entry_t *entry, uint64_t fp_hint);
+void         mtt_capture_stack(mtt_entry_t *entry);
 int          mtt_pool_contains(const void *ptr);   /* 判断 ptr 是否落在 entry 池范围内（防止误 free） */
 
 /* 三档日志等级(tracker.c 定义,由环境变量 MTT_DEBUG 控制)。

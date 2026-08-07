@@ -375,7 +375,7 @@ void mtt_resolve_raw_allocators(void)
  *   - 支持异步跨线程回溯（heaptrack 注入模式的核心能力）
  *   详见 stack_cache.c 头部注释中的 libunwind 改进说明。
  */
-void mtt_capture_stack(mtt_entry_t *entry, uint64_t fp_hint)
+void mtt_capture_stack(mtt_entry_t *entry)
 {
     if (entry == NULL) return;
     mtt_log_stage(60, "capture_stack enter entry=%p", (void*)entry);
@@ -392,22 +392,6 @@ void mtt_capture_stack(mtt_entry_t *entry, uint64_t fp_hint)
     ctx->in_capture = 1;
 
     int bt_frames = 0;
-
-    /* 1.2 栈回溯缓存复用:同调用栈的 N 次分配只回溯一次。
-     * fp_hint==0 表示调用方未提供指纹(工具内部 API 路径),跳过缓存。
-     * 指纹必须在 malloc hook 层算(业务调用点),在 capture_stack 内算
-     * 会取到工具内部地址,所有 malloc 指纹相同 → 泄漏点错误合并(bug)。 */
-    if (fp_hint != 0) {
-        int cached_frames = mtt_fp_cache_lookup(fp_hint, entry->stack,
-                                                MTT_STACK_DEPTH);
-        if (cached_frames > 0) {
-            entry->stack_frames = cached_frames;
-            ctx->in_capture = saved;
-            mtt_log_stage(65, "capture_stack fp-cache hit frames=%d", cached_frames);
-            return;
-        }
-        entry->fp_hint = fp_hint;   /* 记录指纹,回溯后入缓存 */
-    }
 
     /* 优先路径:libunwind(若可用且未被 MTT_UNWINDER=backtrace 禁用)
      * libunwind 内建 ARM EHABI + DWARF + FP chain 多策略 unwind,在 ARM32
@@ -432,12 +416,6 @@ void mtt_capture_stack(mtt_entry_t *entry, uint64_t fp_hint)
         mtt_log_stage(71, "capture_stack libunwind returned n=%d", n);
         if (n >= 2) {
             entry->stack_frames = n;
-            /* 1.2 缓存复用:真实回溯完成,立即入缓存(供后续同位置分配复用)。
-             * 注意:此路径原本直接 return 会跳过末尾 store,缓存永远为空 */
-            if (entry->fp_hint != 0) {
-                mtt_fp_cache_store(entry->fp_hint, entry->stack, n);
-                entry->fp_hint = 0;
-            }
             ctx->in_capture = saved;
             mtt_log_stage(72, "capture_stack done via libunwind frames=%d", n);
             return;
@@ -527,14 +505,6 @@ void mtt_capture_stack(mtt_entry_t *entry, uint64_t fp_hint)
                 entry->stack[i] = fp_stack[i];
             entry->stack_frames = fp_count;
         }
-    }
-
-    /* 1.2 缓存复用:真实回溯完成,按指纹存入缓存,供后续同位置分配复用。
-     * 只有这里(真实回溯)能入缓存,保证抄出来的栈零失真。
-     * entry->fp_hint 由 fp-cache 未命中路径设置;命中路径已直接 return。 */
-    if (entry->fp_hint != 0 && entry->stack_frames > 0) {
-        mtt_fp_cache_store(entry->fp_hint, entry->stack, entry->stack_frames);
-        entry->fp_hint = 0;   /* 用完清掉,entry 回池后不残留 */
     }
 
     ctx->in_capture = saved;
@@ -810,7 +780,7 @@ void mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e)
  * @param size  分配字节数
  * @return      新条目指针，池子满或 raw_malloc 失败时返回 NULL
  */
-mtt_entry_t* mtt_entry_new(void *ptr, size_t size, uint64_t fp_hint)
+mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
 {
     mtt_state_t *s = mtt_state_get();
 
@@ -861,7 +831,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size, uint64_t fp_hint)
         e->stack_frames  = 0;
         /* e->stack 已被上面 memset(e, 0, sizeof(*e)) 清零，无需重复 memset */
 
-        mtt_capture_stack(e, fp_hint);
+        mtt_capture_stack(e);
         mtt_log_stage(41, "entry_new capture_stack done frames=%d", e->stack_frames);
         return e;
     }
@@ -886,7 +856,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size, uint64_t fp_hint)
     /* e->stack 已被上面 memset(e, 0, sizeof(*e)) 清零，无需重复 memset */
 
     /* 捕获调用栈（内部有防重入保护 + Thumb bit 清除） */
-    mtt_capture_stack(e, fp_hint);
+    mtt_capture_stack(e);
 
     return e;
 }
@@ -1486,7 +1456,7 @@ void* mtt_malloc(size_t size)
         return ptr; /* 放行但不追踪 */
 
     /* 创建追踪记录（raw_malloc 内部分配，不触发 hook） */
-    mtt_entry_t *e = mtt_entry_new(ptr, size, 0);
+    mtt_entry_t *e = mtt_entry_new(ptr, size);
     if (e == NULL) return ptr; /* 追踪记录失败不阻塞业务 */
 
     /* 持锁插入哈希表 + 更新统计 */
@@ -1639,7 +1609,7 @@ void* mtt_realloc(void *ptr, size_t size)
 
             /* 创建新追踪记录 */
             if (!mtt_is_over_capacity(s)) {
-                mtt_entry_t *new_e = mtt_entry_new(new_ptr, size, 0);
+                mtt_entry_t *new_e = mtt_entry_new(new_ptr, size);
                 if (new_e != NULL) {
                     mtt_stripe_lock(s, new_ptr);
                     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) < MTT_MAX_ENTRIES) {
@@ -1673,7 +1643,7 @@ void* mtt_realloc(void *ptr, size_t size)
     void *new_ptr = raw_malloc(size);
     if (new_ptr == NULL) return NULL;
 
-    mtt_entry_t *new_e = mtt_entry_new(new_ptr, size, 0);
+    mtt_entry_t *new_e = mtt_entry_new(new_ptr, size);
     if (new_e == NULL) {
         raw_free(new_ptr);
         return NULL;
