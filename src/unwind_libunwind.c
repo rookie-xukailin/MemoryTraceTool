@@ -244,6 +244,15 @@ int mtt_libunwind_capture(void **frames, int max_frames)
                 sig, n + 1, n, (unsigned long)g_crash_addr);
             if (clen > 0 && clen < (int)sizeof(cbuf))
                 MTT_LOG_INFO(cbuf, (size_t)clen);
+            /* 崩溃时把已回溯的部分帧打出来,定位崩在哪个 .so(仅崩溃一次,非热路径) */
+            for (int i = 0; i < n && i < MTT_STACK_DEPTH; i++) {
+                char fbuf[96];
+                int flen = snprintf(fbuf, sizeof(fbuf),
+                    "[MTT]   frame %d: 0x%lx\n",
+                    i, (unsigned long)frames[i]);
+                if (flen > 0 && flen < (int)sizeof(fbuf))
+                    MTT_LOG_INFO(fbuf, (size_t)flen);
+            }
         }
         mtt_log_stage(31, "unw_step crashed (signal %d) at frame %d, kept %d partial frames",
                       sig, n + 1, n);
