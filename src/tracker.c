@@ -93,10 +93,11 @@ _Atomic int mtt_debug_level = MTT_DEBUG_DEFAULT;
  * 0 = auto(libunwind 优先,失败 fallback backtrace)
  * 1 = libunwind only
  * 2 = glibc backtrace only(绕过 libunwind,HDM3 等环境崩溃时的 workaround)
- * 默认 2:实测 backtrace 快 6 倍(0.275s vs libunwind 1.715s,帧数相同,
- * 业务库补 -funwind-tables 后两者帧数持平)。libunwind 代码保留,
- * 需要时 MTT_UNWINDER=libunwind / =0 切回。 */
-int g_unwinder_mode = 2;
+ * 默认 0(auto=libunwind):实测 backtrace 虽快 6.5 倍,但在 HDM3 上
+ * storageManager 场景会 coredump(backtrace 内部 _Unwind_Backtrace 在
+ * 缺 unwind 表的 .so 上必崩且无保护),libunwind 有信号保护兜底。
+ * 若需测试 backtrace 性能,用 MTT_UNWINDER=backtrace。 */
+int g_unwinder_mode = 0;
 
 /* ======================================================================== *
  *                    阶段标记日志(MTT_DEBUG=1 时定位崩溃用)                  *
