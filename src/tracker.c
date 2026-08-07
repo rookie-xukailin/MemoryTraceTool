@@ -92,8 +92,11 @@ _Atomic int mtt_debug_level = MTT_DEBUG_DEFAULT;
 /* 栈回溯模式(由环境变量 MTT_UNWINDER 控制):
  * 0 = auto(libunwind 优先,失败 fallback backtrace)
  * 1 = libunwind only
- * 2 = glibc backtrace only(绕过 libunwind,HDM3 等环境崩溃时的 workaround) */
-int g_unwinder_mode = 0;
+ * 2 = glibc backtrace only(绕过 libunwind,HDM3 等环境崩溃时的 workaround)
+ * 默认 2:实测 backtrace 快 6 倍(0.275s vs libunwind 1.715s,帧数相同,
+ * 业务库补 -funwind-tables 后两者帧数持平)。libunwind 代码保留,
+ * 需要时 MTT_UNWINDER=libunwind / =0 切回。 */
+int g_unwinder_mode = 2;
 
 /* ======================================================================== *
  *                    阶段标记日志(MTT_DEBUG=1 时定位崩溃用)                  *
