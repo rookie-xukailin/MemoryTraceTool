@@ -61,7 +61,8 @@
 
 #define MTT_BUCKETS             4096    /* 哈希桶数量（必须为 2 的幂，用于位掩码取模） */
 #define MTT_MAX_ENTRIES         131072  /* 分配追踪表最大条目数(同时是池子上限,扩到 2^17 让 ARM32 也能用 20MB pool) */
-#define MTT_STACK_DEPTH         64      /* 调用栈最大深度（RPC 回调链 + 多层 .so 嵌套场景需要） */
+#define MTT_STACK_DEPTH         4       /* 调用栈最大深度:强制 4 帧,降低回溯成本(libunwind 每帧 EXIDX 解析贵)。
+                                         * 泄漏点接口函数通常在帧 2-3,4 帧足够覆盖。若需更深栈再调大。 */
 
 /* FP chain（帧指针链）兜底触发阈值：
  *   - backtrace() 返回的帧数 < 此阈值时，启用 FP chain 补全
