@@ -90,6 +90,8 @@ static pthread_mutex_t g_unwind_mutex = PTHREAD_MUTEX_INITIALIZER;
 static sigjmp_buf          g_unwind_jmp;
 static volatile sig_atomic_t g_in_unwind_call = 0;
 static volatile sig_atomic_t g_unwind_safe_frames = 0;
+/* 崩溃访问的无效地址(si_addr),定位崩在哪个 .so 用。每次 capture 入口清零。 */
+static volatile uintptr_t  g_crash_addr = 0;
 
 /**
  * SIGSEGV/SIGBUS 临时 handler:libunwind 崩溃时跳回 capture 调用点。
@@ -102,8 +104,11 @@ static volatile sig_atomic_t g_unwind_safe_frames = 0;
  *   - 不调用 pthread_setspecific(非 async-signal-safe),mark 留给上层 */
 static void mtt_unwind_crash_handler(int sig, siginfo_t *info, void *uctx)
 {
-    (void)info; (void)uctx;
+    (void)uctx;
     if (g_in_unwind_call) {
+        /* 记录崩溃访问的无效地址(si_addr),供日志定位崩在哪个 .so */
+        if (info != NULL)
+            g_crash_addr = (uintptr_t)info->si_addr;
         /* 在 libunwind 调用中触发信号:跳回 sigsetjmp 调用点,
          * siglongjmp 第二参数传 sig(非零),sigsetjmp 返回 sig */
         g_in_unwind_call = 0;
@@ -204,6 +209,7 @@ int mtt_libunwind_capture(void **frames, int max_frames)
     sigaction(SIGBUS,  &sa, &old_bus);
 
     g_unwind_safe_frames = 0;
+    g_crash_addr = 0;
     g_in_unwind_call = 1;
     int sig = sigsetjmp(g_unwind_jmp, 1);
 
@@ -231,11 +237,11 @@ int mtt_libunwind_capture(void **frames, int max_frames)
         /* 崩溃属关键事件:用 MTT_LOG_INFO(等级 >= 1 输出),不走 stage(等级 2)
          * 用户在 MTT_DEBUG=1 默认模式下也能看到 libunwind 降级提示 */
         {
-            char cbuf[160];
+            char cbuf[192];
             int clen = snprintf(cbuf, sizeof(cbuf),
                 "[MTT] libunwind crashed (signal %d) at frame %d, kept %d partial frames, "
-                "this thread falls back to FP chain\n",
-                sig, n + 1, n);
+                "crash_addr=0x%lx, this thread falls back to FP chain\n",
+                sig, n + 1, n, (unsigned long)g_crash_addr);
             if (clen > 0 && clen < (int)sizeof(cbuf))
                 MTT_LOG_INFO(cbuf, (size_t)clen);
         }
@@ -389,6 +395,7 @@ int mtt_libunwind_capture(void **frames, int max_frames)
     sigaction(SIGSEGV, &sa, &old_segv);
     sigaction(SIGBUS,  &sa, &old_bus);
 
+    g_crash_addr = 0;
     g_in_unwind_call = 1;
     int sig = sigsetjmp(g_unwind_jmp, 1);
 
@@ -410,10 +417,10 @@ int mtt_libunwind_capture(void **frames, int max_frames)
         mtt_libunwind_disable_this_thread();
         /* 关键事件:等级 >= 1 输出 */
         {
-            char cbuf[128];
+            char cbuf[160];
             int clen = snprintf(cbuf, sizeof(cbuf),
-                "[MTT] libunwind crashed (signal %d), this thread falls back to backtrace/FP chain\n",
-                sig);
+                "[MTT] libunwind crashed (signal %d), crash_addr=0x%lx, this thread falls back to backtrace/FP chain\n",
+                sig, (unsigned long)g_crash_addr);
             if (clen > 0 && clen < (int)sizeof(cbuf))
                 MTT_LOG_INFO(cbuf, (size_t)clen);
         }
