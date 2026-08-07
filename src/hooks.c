@@ -88,7 +88,7 @@ static void first_call_diag(const char *func_name, _Atomic int *flag, int stage_
  * hook_depth 超过合理上限(MTT_HOOK_DEPTH_MAX)时,判定为残留,重置为 0。 */
 static inline int mtt_hook_enter(void)
 {
-    mtt_per_thread_t * __restrict__ ctx = mtt_thread_get();
+    mtt_per_thread_t * __restrict__ ctx = mtt_thread_get_cached();
     if (ctx == NULL) return -1; /* 降级：无槽位时保守视为递归 */
     if (ctx->depth_inited != 0x2A) {
         ctx->hook_depth = 0;
@@ -102,7 +102,7 @@ static inline int mtt_hook_enter(void)
 
 static inline void mtt_hook_inc_depth(void)
 {
-    mtt_per_thread_t * __restrict__ ctx = mtt_thread_get();
+    mtt_per_thread_t * __restrict__ ctx = mtt_thread_get_cached();
     if (ctx == NULL) return; /* 降级：无槽位时跳过 */
     int init_ok = (ctx->depth_inited == 0x2A);
     if (!init_ok) { ctx->hook_depth = 0; ctx->depth_inited = 0x2A; }
@@ -112,7 +112,7 @@ static inline void mtt_hook_inc_depth(void)
 
 static inline void mtt_hook_dec_depth(void)
 {
-    mtt_per_thread_t * __restrict__ ctx = mtt_thread_get();
+    mtt_per_thread_t * __restrict__ ctx = mtt_thread_get_cached();
     if (ctx == NULL) return; /* 降级：无槽位时跳过 */
     if (ctx->hook_depth > 0)
         ctx->hook_depth--;
@@ -145,7 +145,7 @@ void* malloc(size_t size)
             return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
         }
     }
-    mtt_per_thread_t *ctx = mtt_thread_get();
+    mtt_per_thread_t *ctx = mtt_thread_get_cached();
     if (ctx == NULL) {
         /* 槽位满(512 上限):降级透传,不追踪。
          * MTT_DEBUG=2 时输出 S25,定位"线程太多导致泄漏丢失"场景 */
@@ -308,7 +308,7 @@ void free(void *ptr)
         if (raw_free != NULL) raw_free(ptr);
         return;
     }
-    mtt_per_thread_t *ctx = mtt_thread_get();
+    mtt_per_thread_t *ctx = mtt_thread_get_cached();
     if (ctx == NULL) {
         /* 槽位满：降级直接释放,不维护 entry */
         mtt_log_stage(25, "free ctx==NULL (slot full), NOT untracking");
@@ -394,7 +394,7 @@ void* calloc(size_t count, size_t size)
         if (p != NULL) memset(p, 0, total);
         return p;
     }
-    mtt_per_thread_t *ctx = mtt_thread_get();
+    mtt_per_thread_t *ctx = mtt_thread_get_cached();
     if (ctx == NULL) {
         /* 槽位满：降级,不追踪 */
         mtt_log_stage(25, "calloc ctx==NULL (slot full) size=%zu, NOT tracking",
@@ -458,7 +458,7 @@ void* realloc(void *ptr, size_t size)
         if (raw_free != NULL) raw_free(ptr);
         return new_ptr;
     }
-    mtt_per_thread_t *ctx = mtt_thread_get();
+    mtt_per_thread_t *ctx = mtt_thread_get_cached();
     if (ctx == NULL) {
         /* 槽位满：降级,不追踪 */
         mtt_log_stage(25, "realloc ctx==NULL (slot full) size=%zu, NOT tracking", size);

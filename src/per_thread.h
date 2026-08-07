@@ -110,4 +110,40 @@ static inline mtt_per_thread_t* mtt_thread_get(void)
     return NULL; /* 槽位全满且无已死线程 — 调用者降级处理 */
 }
 
+/* ======================================================================== *
+ *      1.1 热路径加速:TLS 缓存线程上下文(免每次 syscall + 扫 512 槽)        *
+ * ======================================================================== */
+
+/* TLS 缓存指针:命中免 syscall(SYS_gettid) + 线性扫 512 槽。
+ * 历史问题(某些 ARM64 设备 __thread 不可靠)用"tid 核对"兜底:
+ * 命中后原子核对槽位 tid == 当前 tid,不匹配则回退慢路径重扫。 */
+static __thread mtt_per_thread_t *mtt_tls_ctx = NULL;
+
+/**
+ * 获取当前线程上下文(热路径加速版)。
+ *
+ * 快路径:纯 TLS 读(cache + cached_tid 都在 TLS),零 syscall 零扫描。
+ * 慢路径:TLS 为空 或 缓存 tid 与槽位不一致(线程迁移/槽位回收)时
+ * 回退 mtt_thread_get() 重扫,并刷新 TLS 缓存。
+ *
+ * 注意:快路径不做 syscall 校验(会抵消缓存收益)。用 TLS 存 cached_tid,
+ * 与槽位 tid 比较纯 TLS 读;线程池场景 TID 复用导致槽位被新线程占用时,
+ * cached_tid 仍是旧值,比较失败 → 回退慢路径,正确。
+ *
+ * @return 槽位指针(可能 NULL,调用者应安全降级)
+ */
+static __thread pid_t mtt_tls_cached_tid = 0;
+
+static inline mtt_per_thread_t* mtt_thread_get_cached(void)
+{
+    mtt_per_thread_t *c = mtt_tls_ctx;
+    if (c != NULL && mtt_tls_cached_tid ==
+            atomic_load_explicit(&c->tid, memory_order_relaxed))
+        return c;   /* 快路径:纯 TLS 读,零 syscall */
+    mtt_tls_ctx = mtt_thread_get();       /* 慢路径:syscall + 扫槽 */
+    mtt_tls_cached_tid = (mtt_tls_ctx != NULL)
+        ? atomic_load_explicit(&mtt_tls_ctx->tid, memory_order_relaxed) : 0;
+    return mtt_tls_ctx;
+}
+
 #endif /* MTT_PER_THREAD_H */
