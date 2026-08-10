@@ -100,6 +100,13 @@
 #define MTT_SAMPLE_RATE_DEFAULT 0       /* 默认不启用字节采样（全量追踪），>0 时启用 */
 #define MTT_SAMPLE_RATE_MAX     30      /* 最大采样率（2^30 = 1GB） */
 #define MTT_BIG_ALLOC_THRESHOLD (1024 * 1024)  /* 大分配阈值（1MB），大分配总是追踪 */
+/* 采样豁免阈值(1KB):size >= 此值 时直接全量追踪,不参与字节采样累加。
+ * 设计目的:
+ *   1. 中等对象(1KB~1MB)100% 追踪,不漏检真实业务泄漏
+ *   2. 大对象吃掉累加器配额的问题消除(>=1KB 不进 sample_bytes_accum)
+ *   3. 小对象(<1KB)采样率更稳定(只统计小对象的累积)
+ * 适用场景:采样模式下(MTT_SAMPLE_RATE>0),希望中等对象不漏检 */
+#define MTT_SAMPLE_EXEMPT_THRESHOLD 1024  /* 1KB,>=此值豁免采样 */
 
 /* 时序数据采集 */
 #define MTT_TS_MAX_POINTS       3600    /* 环形缓冲区容量（1 小时 @ 1Hz） */

@@ -90,7 +90,7 @@ flamegraph.pl /var/log/mtt/<pid>_<name>.folded > flame.svg
 |------|------|------|
 | `MTT_DISABLE` | 0 | 设为 1 完全禁用追踪 |
 | `MTT_SAMPLE` | 0 | 旧模式：每 N 次 alloc 记录 1 次 |
-| `MTT_SAMPLE_RATE` | 0 | 字节采样率：2^N 字节平均采样一次（0=全量追踪，>=1MB 必追踪） |
+| `MTT_SAMPLE_RATE` | 0 | 字节采样率：2^N 字节平均采样一次（0=全量追踪，>=1KB 必追踪且不进累加，只对 <1KB 小对象采样） |
 | `MTT_HTTP_PORT` | 0 | Web 仪表盘端口（0=禁用） |
 | `MTT_LEAK_THRESHOLD_SEC` | 300 | 存活超过此秒数 → probable leak |
 | `MTT_SKIP_STARTUP_SEC` | 0 | 进程启动后跳过 N 秒不追踪 |
@@ -313,7 +313,7 @@ ARM EABI 的 `glibc backtrace()` 依赖 `.ARM.exidx` 段，遇到标记 `CANTUNW
 业务接口变慢时的排查路径：
 1. 先 `MTT_DEBUG=0 MTT_HTTP_PORT=0` 关诊断 + Web 仪表盘,排除 IO 开销
 2. 仍慢 → 业务二进制加 `-funwind-tables -fno-omit-frame-pointer` 重编(降低 unwind 复杂度)
-3. 极端场景 → 启用采样 `MTT_SAMPLE_RATE=15`(约每 32KB 采一次,跳过 99% 小分配的栈回溯)
+3. 极端场景 → 启用采样 `MTT_SAMPLE_RATE=15`(约每 32KB 采一次,跳过 99% 小分配的栈回溯)。**采样模式下 1KB 阈值**：size >= 1KB 直接全量追踪(不漏检中等对象),只对 <1KB 小对象采样累加,大对象不再吃掉累加器配额
 
 ## 清理
 

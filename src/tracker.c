@@ -527,15 +527,17 @@ void mtt_capture_stack(mtt_entry_t *entry)
 /**
  * 决定当前分配是否应被记录。
  *
- * 支持两种采样模式（优先级从高到低）：
- *   1. 大分配豁免：size >= MTT_BIG_ALLOC_THRESHOLD（1MB）总是追踪
- *   2. 字节统计采样（sample_rate > 0）：按 2^sample_rate 字节平均步长概率采样
- *   3. 固定计数采样（sample_period > 0）：每 N 次 alloc 记录 1 次（旧模式）
- *   4. 全量追踪（两者均为 0）
+ * 支持的判定模式（优先级从高到低）：
+ *   1. 大分配豁免:size >= MTT_BIG_ALLOC_THRESHOLD(1MB)总是追踪
+ *   2. 中等分配豁免:size >= MTT_SAMPLE_EXEMPT_THRESHOLD(1KB)总是追踪,
+ *      不参与字节采样累加(避免大对象吃掉累加器配额)
+ *   3. 字节统计采样(sample_rate > 0):size < 1KB 时按 2^sample_rate 字节
+ *      平均步长概率采样,只统计小对象的累积
+ *   4. 固定计数采样(sample_period > 0):每 N 次 alloc 记录 1 次(旧模式)
+ *   5. 全量追踪(两者均为 0)
  *
- * 字节统计采样使用累加器方式：每次 alloc 时将 size 累加到 sample_bytes_accum，
+ * 字节统计采样使用累加器方式：每次小对象 alloc 时将 size 累加到 sample_bytes_accum,
  * 当累加值超过 2^sample_rate 时，重置累加器并记录本次分配。
- * 这种方式确保大分配有更高概率被采样，小分配聚合后采样。
  *
  * @param s     全局状态指针（调用者已确保非 NULL）
  * @param size  本次分配的字节数
@@ -543,11 +545,17 @@ void mtt_capture_stack(mtt_entry_t *entry)
  */
 int mtt_should_track(mtt_state_t *s, size_t size)
 {
-    /* 大分配总是追踪 */
+    /* 大分配总是追踪(>=1MB,已有豁免) */
     if (size >= MTT_BIG_ALLOC_THRESHOLD)
         return 1;
 
-    /* 字节统计采样模式 */
+    /* 中等分配豁免(>=1KB):直接全量追踪,不参与字节采样累加。
+     * 设计目的:中等对象不漏检 + 大对象不"吃掉"累加器配额 + 小对象采样率稳定。
+     * 详见 mtt_internal.h MTT_SAMPLE_EXEMPT_THRESHOLD 注释 */
+    if (size >= MTT_SAMPLE_EXEMPT_THRESHOLD)
+        return 1;
+
+    /* 字节统计采样模式(只对 <1KB 的小对象生效) */
     size_t rate = atomic_load_explicit(&s->sample_rate, memory_order_relaxed);
     if (rate > 0) {
         size_t step = (size_t)1 << rate; /* 2^sample_rate */
