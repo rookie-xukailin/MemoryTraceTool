@@ -99,6 +99,12 @@ _Atomic int mtt_debug_level = MTT_DEBUG_DEFAULT;
  * 若需测试 backtrace 性能,用 MTT_UNWINDER=backtrace。 */
 int g_unwinder_mode = 0;
 
+/* 运行时栈回溯深度(默认 8 帧):由 MTT_MAX_STACK_FRAMES 环境变量覆盖。
+ * 回溯循环/backtrace/FP chain 用此值,控制回溯成本。
+ * 默认 8:泄漏点接口函数通常在帧 2-4,8 帧可区分且比 64 帧快 ~40%。
+ * 调大(如 16/32/64)获更深栈但回溯更慢。 */
+int g_max_stack_frames = 8;
+
 /* ======================================================================== *
  *                    阶段标记日志(MTT_DEBUG=1 时定位崩溃用)                  *
  * ======================================================================== */
@@ -416,7 +422,7 @@ void mtt_capture_stack(mtt_entry_t *entry)
                   use_libunwind, g_unwinder_mode, disabled);
     if (use_libunwind && !disabled && mtt_libunwind_available()) {
         mtt_log_stage(70, "capture_stack calling mtt_libunwind_capture");
-        int n = mtt_libunwind_capture(entry->stack, MTT_STACK_DEPTH);
+        int n = mtt_libunwind_capture(entry->stack, g_max_stack_frames);
         mtt_log_stage(71, "capture_stack libunwind returned n=%d", n);
         if (n >= 2) {
             entry->stack_frames = n;
@@ -447,14 +453,14 @@ void mtt_capture_stack(mtt_entry_t *entry)
      *                内存(leak 表里大部分 entry)全部丢失栈信息 */
 #if MTT_HAS_BACKTRACE
     if (!disabled) {
-        entry->stack_frames = backtrace(entry->stack, MTT_STACK_DEPTH);
+        entry->stack_frames = backtrace(entry->stack, g_max_stack_frames);
         if (entry->stack_frames < 0)
             entry->stack_frames = 0;
         for (int i = 0; i < entry->stack_frames; i++)
             entry->stack[i] = MTT_FIX_THUMB_ADDR(entry->stack[i]);
         bt_frames = entry->stack_frames;
     } else {
-        entry->stack_frames = mtt_safe_backtrace(entry->stack, MTT_STACK_DEPTH);
+        entry->stack_frames = mtt_safe_backtrace(entry->stack, g_max_stack_frames);
         if (entry->stack_frames < 0)
             entry->stack_frames = 0;
         for (int i = 0; i < entry->stack_frames; i++)
@@ -1085,6 +1091,15 @@ void mtt_ensure_init(void)
             if (strcmp(env_unw, "libunwind") == 0) g_unwinder_mode = 1;
             else if (strcmp(env_unw, "backtrace") == 0) g_unwinder_mode = 2;
             else g_unwinder_mode = 0;  /* auto */
+        }
+
+        /* 栈回溯深度（MTT_MAX_STACK_FRAMES=N, 1~64, 默认 8）
+         * 控制每次回溯最多抓几帧,兼顾性能和泄漏点区分度 */
+        const char *env_frames = getenv("MTT_MAX_STACK_FRAMES");
+        if (env_frames != NULL) {
+            int f = atoi(env_frames);
+            if (f >= 1 && f <= MTT_STACK_DEPTH)
+                g_max_stack_frames = f;
         }
     }
 

@@ -61,8 +61,8 @@
 
 #define MTT_BUCKETS             4096    /* 哈希桶数量（必须为 2 的幂，用于位掩码取模） */
 #define MTT_MAX_ENTRIES         131072  /* 分配追踪表最大条目数(同时是池子上限,扩到 2^17 让 ARM32 也能用 20MB pool) */
-#define MTT_STACK_DEPTH         4       /* 调用栈最大深度:强制 4 帧,降低回溯成本(libunwind 每帧 EXIDX 解析贵)。
-                                         * 泄漏点接口函数通常在帧 2-3,4 帧足够覆盖。若需更深栈再调大。 */
+#define MTT_STACK_DEPTH         64      /* 调用栈数组容量(编译期固定,entry->stack[64] 大小)。
+                                         * 运行时实际回溯深度由 MTT_MAX_STACK_FRAMES 控制(默认 8)。 */
 
 /* FP chain（帧指针链）兜底触发阈值：
  *   - backtrace() 返回的帧数 < 此阈值时，启用 FP chain 补全
@@ -120,6 +120,7 @@ void mtt_log_stage(int stage_id, const char *fmt, ...);
 /* 栈回溯模式(0=auto, 1=libunwind only, 2=backtrace only)。
  * 由 MTT_UNWINDER 环境变量控制。定义在 tracker.c */
 extern int g_unwinder_mode;
+extern int g_max_stack_frames;
 
 /* 诊断日志开关（MTT_DEBUG=1 开, =0 关）。
  * 默认打开; 关闭后只保留泄漏报告写到 /var/log/mtt 下、

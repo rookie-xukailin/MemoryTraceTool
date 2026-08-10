@@ -97,6 +97,8 @@ flamegraph.pl /var/log/mtt/<pid>_<name>.folded > flame.svg
 | `MTT_LIB_BLACKLIST` | 无 | 逗号分隔的库黑名单（如 `libc.so,libfoo.so`） |
 | `MTT_POOL_ENTRIES` | 16384 | 工具自身 entry 池容量（控制预占用内存，[1024, 65536]，约 600B/entry） |
 | `MTT_DEBUG` | 1 | 诊断日志开关（0=静默,屏蔽所有 stderr 诊断,只保留 leak 报告 + heartbeat） |
+| `MTT_MAX_STACK_FRAMES` | 8 | 栈回溯深度（每次 malloc 最多回溯几帧，[1, 64]）。调大获更深栈（定位更深调用链）但回溯更慢；调小降低 CPU。性能敏感场景建议 4-8 |
+| `MTT_UNWINDER` | auto | 栈回溯方式：`auto`（libunwind 优先，崩溃自动降级）/ `libunwind` / `backtrace`。HDM3 等 libunwind 崩溃环境可设 `backtrace` 绕过 |
 
 ## 借鉴的成熟方案
 
