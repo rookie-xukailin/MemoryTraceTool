@@ -1241,14 +1241,6 @@ void mtt_ensure_init(void)
         }
     }
 
-    /* sigaction 一次性安装:libunwind/backtrace 信号保护 handler 装
-     * 一次永久就位,后续 capture 内只保留 mutex + sigsetjmp,省 4 次
-     * sigaction syscall/次(详见 unwind_libunwind.h 头部说明)。
-     * init_lock 内 + initialized=1 之前装,保证其他线程看到 initialized=1
-     * 时 handler 已就位。 */
-    mtt_install_unwind_handler();
-    mtt_log_stage(16, "unwind handler installed (sigaction 一次性)");
-
     /* 标记初始化完成（release 确保上述所有初始化对其他线程可见） */
     atomic_store_explicit(&s->initialized, 1, memory_order_release);
     pthread_mutex_unlock(&init_lock);
