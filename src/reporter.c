@@ -18,6 +18,7 @@
 #include "http_server.h"
 #include "addr_validate.h"
 #include "mtt_internal.h"
+#include "unwind_libunwind.h"   /* mtt_check_handler_overridden (unwind-parallel 监控补偿) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1178,6 +1179,11 @@ static void* reporter_thread_fn(void *arg)
                 if (dlen > 0 && dlen < (int)sizeof(dbuf))
                     MTT_DIAG_LOG(dbuf, (size_t)dlen);
             }
+            /* unwind-parallel 监控补偿:每轮 scan 前检查 SIGSEGV/SIGBUS handler
+             * 是否被业务(JVM / Go runtime / libasan / 自定义 crash reporter)覆盖,
+             * 若覆盖则重装 mtt handler 并 chain 业务 handler。详见 plan:
+             * bmc-cpu-rpc-4-8-malloc-inherited-meerkat.md 第 6.4 节 */
+            mtt_check_handler_overridden();
             scan_and_report();
             /* 每轮 scan 结束后写一次 heartbeat 文件(60s 一次) */
             mtt_heartbeat_write();

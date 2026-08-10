@@ -1101,6 +1101,18 @@ void mtt_ensure_init(void)
             if (f >= 1 && f <= MTT_STACK_DEPTH)
                 g_max_stack_frames = f;
         }
+
+        /* libunwind 并行模式开关（MTT_UNWIND_PARALLEL=1/0,默认 1）
+         *   1 = 并行(默认):TLS 上下文,无 mutex,多核并行
+         *   0 = 串行 fallback:沿用 mutex 模式(TLS 不可靠设备兜底)
+         * 详见 unwind_libunwind.h 头部说明 */
+        const char *env_parallel = getenv("MTT_UNWIND_PARALLEL");
+        if (env_parallel != NULL) {
+            int v = atoi(env_parallel);
+            if (v == 0) {
+                g_use_parallel_unwind = 0;
+            }
+        }
     }
 
     /* ---- 阶段2: 持锁初始化数据结构（双重检查锁定） ---- */
@@ -1239,6 +1251,38 @@ void mtt_ensure_init(void)
                 "[MTT] pool init: mode=FALLBACK (raw_malloc per-entry)\n");
             if (len > 0) MTT_LOG_INFO(log_buf, (size_t)len);
         }
+    }
+
+    /* ---- unwind-parallel 改造:TLS 自检 + sigaction 一次性安装 ----
+     * 在 init_lock 内 + initialized=1 之前完成,保证:
+     *   1. 只装一次(init_lock 串行化,后续线程走 fast path 直接返回)
+     *   2. 其他线程看到 initialized=1 时,sigaction 已经装好
+     *
+     * 流程:
+     *   - TLS 自检失败 → g_use_parallel_unwind=0,降级到串行 fallback
+     *   - 自检通过且 g_use_parallel_unwind=1 → 调 mtt_install_unwind_handler 装 handler
+     *   - g_use_parallel_unwind=0(用户显式设 MTT_UNWIND_PARALLEL=0)→ 跳过安装,
+     *     沿用旧的"每 capture 装/恢复"模式 */
+    if (g_use_parallel_unwind) {
+        if (!mtt_check_tls_reliability()) {
+            char buf[128];
+            int len = snprintf(buf, sizeof(buf),
+                "[MTT] WARNING: TLS unreliable on this platform, "
+                "fallback to serial mutex mode\n");
+            if (len > 0 && len < (int)sizeof(buf))
+                MTT_LOG_INFO(buf, (size_t)len);
+            g_use_parallel_unwind = 0;
+        } else {
+            mtt_install_unwind_handler();
+            mtt_log_stage(16, "unwind handler installed (parallel mode)");
+        }
+    } else {
+        char buf[128];
+        int len = snprintf(buf, sizeof(buf),
+            "[MTT] libunwind parallel mode disabled by env, using mutex fallback\n");
+        if (len > 0 && len < (int)sizeof(buf))
+            MTT_LOG_INFO(buf, (size_t)len);
+        mtt_log_stage(16, "unwind handler NOT installed (serial fallback)");
     }
 
     /* 标记初始化完成（release 确保上述所有初始化对其他线程可见） */

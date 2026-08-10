@@ -37,6 +37,7 @@ build_all() {
     arm-linux-gnueabi-gcc -O2 -fomit-frame-pointer -fPIC -shared -o /tmp/o32/fakebiz_misuse.so examples/realistic/fakebiz_misuse.c
     arm-linux-gnueabi-gcc -O2 -fomit-frame-pointer -fPIC -shared -o /tmp/o32/fakebiz_deep1.so examples/realistic/fakebiz_deep1.c -ldl
     arm-linux-gnueabi-gcc -O2 -fomit-frame-pointer -fPIC -shared -o /tmp/o32/fakebiz_deep2.so examples/realistic/fakebiz_deep2.c
+    arm-linux-gnueabi-gcc -O2 -fomit-frame-pointer -fPIC -fvisibility=hidden -shared -o /tmp/o32/fakebiz_opensource.so examples/realistic/fakebiz_opensource.c
     arm-linux-gnueabi-gcc -O2 -fomit-frame-pointer -fPIC -o /tmp/o32/demo_realistic examples/realistic/demo_realistic.c -ldl -lpthread
     arm-linux-gnueabi-g++ -O2 -fomit-frame-pointer -fPIC -o /tmp/o32/demo_cpp examples/demo_cpp.cpp
 
@@ -47,6 +48,7 @@ build_all() {
     gcc -O2 -fomit-frame-pointer -fPIC -shared -o /tmp/o64/fakebiz_misuse.so examples/realistic/fakebiz_misuse.c
     gcc -O2 -fomit-frame-pointer -fPIC -shared -o /tmp/o64/fakebiz_deep1.so examples/realistic/fakebiz_deep1.c -ldl
     gcc -O2 -fomit-frame-pointer -fPIC -shared -o /tmp/o64/fakebiz_deep2.so examples/realistic/fakebiz_deep2.c
+    gcc -O2 -fomit-frame-pointer -fPIC -fvisibility=hidden -shared -o /tmp/o64/fakebiz_opensource.so examples/realistic/fakebiz_opensource.c
     gcc -O2 -fomit-frame-pointer -fPIC -o /tmp/o64/demo_realistic examples/realistic/demo_realistic.c -ldl -lpthread
     g++ -O2 -fomit-frame-pointer -fPIC -o /tmp/o64/demo_cpp examples/demo_cpp.cpp
 
@@ -57,6 +59,7 @@ build_all() {
     cp /tmp/o32/fakebiz_misuse.so     output/sim/fakebiz_misuse-arm32.so
     cp /tmp/o32/fakebiz_deep1.so      output/sim/fakebiz_deep1-arm32.so
     cp /tmp/o32/fakebiz_deep2.so      output/sim/fakebiz_deep2-arm32.so
+    cp /tmp/o32/fakebiz_opensource.so output/sim/fakebiz_opensource-arm32.so
     cp /tmp/o32/demo_realistic        output/sim/demo_realistic-arm32
     cp /tmp/o32/demo_cpp              output/sim/demo_cpp-arm32
     cp /tmp/o64/libmemorytracetool.so output/sim/libmemorytracetool-arm64.so
@@ -64,6 +67,7 @@ build_all() {
     cp /tmp/o64/fakebiz_misuse.so     output/sim/fakebiz_misuse-arm64.so
     cp /tmp/o64/fakebiz_deep1.so      output/sim/fakebiz_deep1-arm64.so
     cp /tmp/o64/fakebiz_deep2.so      output/sim/fakebiz_deep2-arm64.so
+    cp /tmp/o64/fakebiz_opensource.so output/sim/fakebiz_opensource-arm64.so
     cp /tmp/o64/demo_realistic        output/sim/demo_realistic-arm64
     cp /tmp/o64/demo_cpp              output/sim/demo_cpp-arm64
     ls output/sim/
@@ -90,6 +94,7 @@ run_arm32() {
     ln -sf fakebiz_misuse-arm32.so fakebiz_misuse.so
     ln -sf fakebiz_deep1-arm32.so  fakebiz_deep1.so
     ln -sf fakebiz_deep2-arm32.so  fakebiz_deep2.so
+    ln -sf fakebiz_opensource-arm32.so fakebiz_opensource.so
 
     echo "--- 基线 (无 LD_PRELOAD) ---"
     qemu-arm-static -L /usr/arm-linux-gnueabi ./demo_realistic-arm32 >/tmp/baseline.txt 2>&1
@@ -135,6 +140,7 @@ run_arm64() {
     ln -sf fakebiz_misuse-arm64.so fakebiz_misuse.so
     ln -sf fakebiz_deep1-arm64.so  fakebiz_deep1.so
     ln -sf fakebiz_deep2-arm64.so  fakebiz_deep2.so
+    ln -sf fakebiz_opensource-arm64.so fakebiz_opensource.so
 
     echo "--- 基线 ---"
     ./demo_realistic-arm64 >/tmp/baseline.txt 2>&1

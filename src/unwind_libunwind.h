@@ -27,6 +27,8 @@
 #ifndef MTT_UNWIND_LIBUNWIND_H
 #define MTT_UNWIND_LIBUNWIND_H
 
+#include <signal.h>   /* siginfo_t, sigaction(test-only API 用) */
+
 /**
  * 探测 libunwind 是否可用。
  *
@@ -79,5 +81,88 @@ int mtt_libunwind_thread_disabled(void);
  * @return            ≥0=帧数,踩雷或调用失败返回 0
  */
 int mtt_safe_backtrace(void **frames, int max_frames);
+
+/* ======================================================================== *
+ *        unwind-parallel 改造:并行 vs 串行模式控制 + 监控补偿              *
+ * ======================================================================== *
+ *  详见 unwind_libunwind.c 头部说明和 plan:
+ *  bmc-cpu-rpc-4-8-malloc-inherited-meerkat.md
+ *
+ *  改造目标:消除 mtt_libunwind_capture 内 g_unwind_mutex 全局串行化,
+ *  让栈回溯多核并行,缓解 BMC 多线程业务 CPU 飙升 + RPC P99 长尾超时。
+ *
+ *  核心思路:全局 sigjmp_buf 改 __thread TLS,handler 通过 TLS 自动识别
+ *  当前线程,siglongjmp 永远跳回当前线程的 buf,无需 mutex 串行化。
+ *
+ *  关键不变量:
+ *    - libunwind 触发 SIGSEGV/SIGBUS 时 handler 必须拦截跳回(commit 839821a)
+ *    - per-thread 降级机制(commit 8129a5c)不变
+ *    - MTT_UNWIND_PARALLEL=0 一键回退到串行 fallback
+ *    - TLS 可靠性自检失败自动降级
+ */
+
+/* 并行模式开关。
+ *   1 = 并行(默认):TLS 上下文,无 mutex,多核并行
+ *   0 = 串行 fallback:全局 mutex + 每 capture 装/恢复 sigaction
+ *
+ * 由 mtt_ensure_init 解析 MTT_UNWIND_PARALLEL 设置,
+ * TLS 自检失败也会自动改为 0。 */
+extern int g_use_parallel_unwind;
+
+/**
+ * 安装 SIGSEGV/SIGBUS handler(并行模式专用)。
+ *
+ * 在 mtt_init 阶段(单线程)和 reporter 心跳检测到业务覆盖时(多线程,
+ * 通过 g_install_lock 串行化)调用。保存业务原 handler 用于 chain。
+ *
+ * 线程安全:init 阶段单线程无 race;reporter 重装时持 g_install_lock。
+ */
+void mtt_install_unwind_handler(void);
+
+/**
+ * 检查 SIGSEGV/SIGBUS handler 是否被业务覆盖,若覆盖则重装。
+ *
+ * 由 reporter 60s 心跳调用。如果业务在 mtt_init 后 dlopen JVM/Go runtime/
+ * libasan 等装了自己的 SIGSEGV handler,会覆盖 mtt 的,导致 libunwind 崩溃
+ * 保护失效。本函数检测到覆盖后,重装 mtt handler 并保存新的业务 handler
+ * 用于 chain。
+ */
+void mtt_check_handler_overridden(void);
+
+/**
+ * TLS 可靠性自检:验证 __thread 变量在多线程下不互相污染。
+ *
+ * 背景(commit 55cce13):某些 ARM64 BMC 设备 TLS 不可靠。本次并行模式
+ * 依赖 TLS,启动时自检失败则降级到串行模式。
+ *
+ * @return 1=TLS 可靠,可走并行模式;0=不可靠,需走串行 fallback
+ */
+int mtt_check_tls_reliability(void);
+
+/* ======================================================================== *
+ *        Test-only helpers(仅测试代码调用,生产代码不引用)                 *
+ * ======================================================================== */
+
+/**
+ * 在 unwind 上下文中触发 SIGSEGV,验证 handler 拦截 + siglongjmp 跳回。
+ * 仅 tests/test_signal.c 等测试代码调用。
+ *
+ * @param use_parallel 1=走并行 TLS 路径,0=走串行 fallback 路径
+ * @return 0=未触发(异常),>0=收到的信号编号(SIGSEGV=11)
+ */
+int mtt_test_trigger_sigsegv_in_unwind(int use_parallel);
+
+/**
+ * 查询当前 SIGSEGV handler 是否是 mtt 的(测试用)。
+ * @return 1=是 mtt handler,0=不是
+ */
+int mtt_test_segv_handler_is_mtt(void);
+
+/**
+ * 获取保存的业务原 handler 的 sa_sigaction(测试用,验证 chain)。
+ * @param idx 0=SIGSEGV,1=SIGBUS
+ * @param out 输出业务原 handler 的函数指针
+ */
+void mtt_test_get_saved_handler(int idx, void (**out)(int, siginfo_t*, void*));
 
 #endif /* MTT_UNWIND_LIBUNWIND_H */
