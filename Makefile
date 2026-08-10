@@ -182,7 +182,13 @@ test_stability: $(SHARED_LIB) tests/test_stability.c | $(OUTPUT_DIR)
 		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
 	$(RUN) $(OUTPUT_DIR)/test_stability
 
-test_all: test test_stability
+# sigaction 一次性安装验证测试(方向 1)
+test_sigaction_install: $(SHARED_LIB) tests/test_sigaction_install.c | $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_sigaction_install tests/test_sigaction_install.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS) -lpthread
+	$(RUN) $(OUTPUT_DIR)/test_sigaction_install
+
+test_all: test test_stability test_sigaction_install
 
 clean:
 	rm -rf $(BUILD_DIR) $(OUTPUT_DIR)

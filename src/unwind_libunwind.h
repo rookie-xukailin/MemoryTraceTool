@@ -80,4 +80,46 @@ int mtt_libunwind_thread_disabled(void);
  */
 int mtt_safe_backtrace(void **frames, int max_frames);
 
+/* ======================================================================== *
+ *     sigaction 一次性安装(优化:省每次 capture 的 4 次 sigaction syscall)  *
+ * ======================================================================== *
+ *  原实现每次 mtt_libunwind_capture / mtt_safe_backtrace 都要装/恢复
+ *  sigaction 共 4 次 syscall(~4μs/次),是单次 capture 的 fixed cost 大头。
+ *  本函数把 sigaction 安装移到 mtt_init 阶段一次性完成。
+ *
+ *  关键约束(避免 unwind-parallel 失败教训):
+ *    - 不动 g_unwind_mutex(串行化保留)
+ *    - 不动 g_in_unwind_call / g_unwind_jmp(全局变量保留)
+ *    - 不动 mtt_unwind_crash_handler(handler 行为完全不变)
+ *    - 不做 handler chain(简化,BMC 业务不装 SIGSEGV)
+ *
+ *  兼容性兜底:如果业务真的装了 SIGSEGV handler 覆盖 mtt 的,
+ *  libunwind 崩溃保护失效,可用 MTT_UNWINDER=backtrace 绕过。
+ */
+
+/**
+ * 一次性安装 SIGSEGV/SIGBUS handler(sigaction 优化)。
+ *
+ * 在 mtt_init 阶段(init_lock 内)调用,后续 capture 不再装/恢复 sigaction。
+ * 幂等:多次调用通过 g_handler_installed 标志保证只装一次。
+ */
+void mtt_install_unwind_handler(void);
+
+/* ======================================================================== *
+ *        Test-only helpers(仅测试代码调用,生产代码不引用)                 *
+ * ======================================================================== */
+
+/**
+ * 在 unwind 上下文触发 SIGSEGV,验证 handler 拦截 + siglongjmp 跳回。
+ * 仅 tests/test_sigaction_install.c 等测试代码调用。
+ * @return 0=未触发(异常),>0=收到的信号编号(SIGSEGV=11)
+ */
+int mtt_test_trigger_sigsegv_in_unwind(void);
+
+/**
+ * 查询当前 SIGSEGV handler 是否是 mtt 的(测试用)。
+ * @return 1=是 mtt handler,0=不是
+ */
+int mtt_test_segv_handler_is_mtt(void);
+
 #endif /* MTT_UNWIND_LIBUNWIND_H */

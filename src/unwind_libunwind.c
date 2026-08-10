@@ -47,6 +47,7 @@
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "mtt_internal.h"   /* MTT_FIX_THUMB_ADDR, mtt_log_stage */
@@ -123,6 +124,100 @@ static void mtt_unwind_crash_handler(int sig, siginfo_t *info, void *uctx)
     raise(sig);
 }
 
+/* 一次性安装标志:确保 mtt_install_unwind_handler 只生效一次(init 阶段单线程,
+ * 但 reporter 重装或多次 init 调用时通过此标志保证幂等) */
+static int g_handler_installed = 0;
+
+/**
+ * 一次性安装 SIGSEGV/SIGBUS handler(sigaction-一次性安装优化)。
+ *
+ * 背景:原实现每次 mtt_libunwind_capture / mtt_safe_backtrace 都要
+ * 装/恢复 sigaction 共 4 次 syscall(约 4μs/次),是单次 capture 的
+ * fixed cost 大头。本函数把 sigaction 安装移到 mtt_init 阶段一次性完成,
+ * 后续 capture 内只保留 mutex + sigsetjmp(省 4 次 syscall/次)。
+ *
+ * 与 unwind-parallel 改造(commit dc0b897,已 revert)的本质区别:
+ *   - 不动 g_unwind_mutex(串行化保留)
+ *   - 不动 g_in_unwind_call / g_unwind_jmp(全局变量保留)
+ *   - 不动 handler 逻辑(行为完全不变)
+ *   - 不做 handler chain / reporter 监控补偿(简化)
+ *
+ * 兼容性:不保存业务原 handler。BMC 业务一般不装 SIGSEGV(commit 839821a
+ * 当初就是业务没装,libunwind 直接挂进程)。如果业务真的装了 SIGSEGV
+ * 覆盖 mtt handler,libunwind 崩溃保护失效,可用 MTT_UNWINDER=backtrace 绕过。
+ *
+ * 线程安全:init 阶段单线程首次调用,后续 reporter 重装通过 g_handler_installed
+ * 标志幂等(虽然本方案不做 reporter 监控,保留以备未来扩展)。
+ */
+void mtt_install_unwind_handler(void)
+{
+    if (g_handler_installed) return;
+
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = mtt_unwind_crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+
+    g_handler_installed = 1;
+}
+
+/* ======================================================================== *
+ *        Test-only helpers(仅测试代码调用,生产代码不引用)                 *
+ * ======================================================================== */
+
+/**
+ * 在 unwind 上下文触发 SIGSEGV,验证 handler 拦截 + siglongjmp 跳回。
+ *
+ * 流程:
+ *   1. 设置 g_in_unwind_call=1(模拟在 libunwind 调用中)
+ *   2. sigsetjmp 保存上下文到 g_unwind_jmp
+ *   3. 第一次调用(sig==0):解引用无效地址 0xdeadbeef 触发 SIGSEGV
+ *   4. handler 拦截 → siglongjmp 跳回 → sigsetjmp 返回 SIGSEGV(11)
+ *   5. 第二次调用(sig!=0):返回 sig 值
+ *
+ * 关键验证点:依赖 g_unwind_mutex 串行化 + 全局 g_unwind_jmp + handler
+ * 拦截逻辑(commit 839821a 核心保护)。改造前后行为应完全一致。
+ *
+ * 注意:必须在 mtt_init 完成(handler 已装)后调用,否则 SIGSEGV 会让进程挂。
+ *
+ * @return 0=未触发(异常),>0=收到的信号编号(SIGSEGV=11)
+ */
+int mtt_test_trigger_sigsegv_in_unwind(void)
+{
+    pthread_mutex_lock(&g_unwind_mutex);
+    g_in_unwind_call = 1;
+    int sig = sigsetjmp(g_unwind_jmp, 1);
+    if (sig == 0) {
+        /* 触发 SIGSEGV:解引用无效地址。
+         * volatile 防止编译器优化掉 */
+        volatile int *bad = (volatile int*)0xdeadbeef;
+        *bad = 42;
+        /* 不应该到这里,handler 应该跳回来 */
+        g_in_unwind_call = 0;
+        pthread_mutex_unlock(&g_unwind_mutex);
+        return 0;
+    }
+    g_in_unwind_call = 0;
+    pthread_mutex_unlock(&g_unwind_mutex);
+    return sig;
+}
+
+/**
+ * 查询当前 SIGSEGV handler 是否是 mtt 的(测试用)。
+ * @return 1=是 mtt handler,0=不是
+ */
+int mtt_test_segv_handler_is_mtt(void)
+{
+    struct sigaction cur;
+    memset(&cur, 0, sizeof(cur));
+    sigaction(SIGSEGV, NULL, &cur);
+    return cur.sa_sigaction == mtt_unwind_crash_handler;
+}
+
 /* ======================================================================== *
  *                  模式 1: 静态链接(MTT_STATIC_LIBUNWIND)                    *
  * ======================================================================== */
@@ -196,17 +291,9 @@ int mtt_libunwind_capture(void **frames, int max_frames)
     int is_first = atomic_compare_exchange_strong(&g_first_capture,
                                                   &(int){1}, 0);
 
-    /* 信号保护上下文 */
-    struct sigaction old_segv, old_bus;
-    struct sigaction sa;
-    sa.sa_sigaction = mtt_unwind_crash_handler;
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
-
+    /* sigaction 已在 mtt_init 阶段一次性安装(见 mtt_install_unwind_handler),
+     * 这里只保留 mutex 串行化 + sigsetjmp 跳板,省 4 次 sigaction syscall/次 */
     pthread_mutex_lock(&g_unwind_mutex);
-
-    sigaction(SIGSEGV, &sa, &old_segv);
-    sigaction(SIGBUS,  &sa, &old_bus);
 
     g_unwind_safe_frames = 0;
     g_crash_addr = 0;
@@ -224,9 +311,6 @@ int mtt_libunwind_capture(void **frames, int max_frames)
         n = (int)g_unwind_safe_frames;
     }
     g_in_unwind_call = 0;
-
-    sigaction(SIGSEGV, &old_segv, NULL);
-    sigaction(SIGBUS,  &old_bus, NULL);
 
     pthread_mutex_unlock(&g_unwind_mutex);
 
@@ -392,17 +476,11 @@ int mtt_libunwind_capture(void **frames, int max_frames)
 
     /* dlopen 模式:用高层 unw_backtrace + 信号保护。
      * 与静态模式不同,这里没法做细粒度 step(libunwind 的 unw_* 是宏,
-     * 无法 dlsym),崩了只能返回 -1,部分帧全部丢失 */
-    struct sigaction old_segv, old_bus;
-    struct sigaction sa;
-    sa.sa_sigaction = mtt_unwind_crash_handler;
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
-
+     * 无法 dlsym),崩了只能返回 -1,部分帧全部丢失。
+     *
+     * sigaction 已在 mtt_init 阶段一次性安装,这里只保留 mutex + sigsetjmp,
+     * 省 4 次 sigaction syscall/次 */
     pthread_mutex_lock(&g_unwind_mutex);
-
-    sigaction(SIGSEGV, &sa, &old_segv);
-    sigaction(SIGBUS,  &sa, &old_bus);
 
     g_crash_addr = 0;
     g_in_unwind_call = 1;
@@ -415,9 +493,6 @@ int mtt_libunwind_capture(void **frames, int max_frames)
         if (n < 0) n = 0;
     }
     g_in_unwind_call = 0;
-
-    sigaction(SIGSEGV, &old_segv, NULL);
-    sigaction(SIGBUS,  &old_bus, NULL);
 
     pthread_mutex_unlock(&g_unwind_mutex);
 
@@ -468,16 +543,9 @@ int mtt_safe_backtrace(void **frames, int max_frames)
 {
     if (frames == NULL || max_frames <= 0) return 0;
 
-    struct sigaction old_segv, old_bus;
-    struct sigaction sa;
-    sa.sa_sigaction = mtt_unwind_crash_handler;
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
-    sigemptyset(&sa.sa_mask);
-
+    /* sigaction 已在 mtt_init 阶段一次性安装,这里只保留 mutex + sigsetjmp,
+     * 省 4 次 sigaction syscall/次 */
     pthread_mutex_lock(&g_unwind_mutex);
-
-    sigaction(SIGSEGV, &sa, &old_segv);
-    sigaction(SIGBUS,  &sa, &old_bus);
 
     g_in_unwind_call = 1;
     int sig = sigsetjmp(g_unwind_jmp, 1);
@@ -489,9 +557,6 @@ int mtt_safe_backtrace(void **frames, int max_frames)
         if (n < 0) n = 0;
     }
     g_in_unwind_call = 0;
-
-    sigaction(SIGSEGV, &old_segv, NULL);
-    sigaction(SIGBUS,  &old_bus, NULL);
 
     pthread_mutex_unlock(&g_unwind_mutex);
 

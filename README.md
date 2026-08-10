@@ -308,6 +308,7 @@ ARM EABI 的 `glibc backtrace()` 依赖 `.ARM.exidx` 段，遇到标记 `CANTUNW
 | **延迟符号解析** | dladdr/backtrace_symbols 移到 reporter 后台线程 | 热路径不做符号解析 |
 | **entry 对象池** | 启动时一次性 raw_malloc 大块,entry 复用槽位 | 热路径不调 libc malloc |
 | **64 段 stripe_lock** | 哈希桶链表 64 分段锁,缓存行对齐 | 多线程并发读写无伪共享 |
+| **sigaction 一次性安装** | 每次 capture 装/恢复 sigaction(4 次 syscall) → mtt_init 时一次性安装 | 单次栈回溯 fixed cost 减半(8.5μs → ~4.5μs,省 47%) |
 
 业务接口变慢时的排查路径：
 1. 先 `MTT_DEBUG=0 MTT_HTTP_PORT=0` 关诊断 + Web 仪表盘,排除 IO 开销
