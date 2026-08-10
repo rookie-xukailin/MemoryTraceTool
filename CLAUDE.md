@@ -128,18 +128,6 @@ ARM32 Thumb-2 上 `__builtin_frame_address(0)` 返回 r7 而非 r11,{prev_fp,lr}
 
 **禁止破坏已有功能** — 修改任何代码前必须确认受影响的功能范围，改动后逐项验证已有功能仍完好。编译通过 + 测试通过不等于功能正确。
 
-**线程/信号相关改动必须跑全套测试** — `src/unwind_libunwind.c` / `src/per_thread.h` / 信号 handler 等**线程并发或信号保护相关代码**改动后,除了 `./scripts/compile-{arm32,arm64}.sh clean test` 跑基础 36 个测试,还**必须**跑:
-- `make test_concurrent` — 5 个多线程并发 + 并行加速比测试(T9/T10/T11/T12/T26)
-- `make test_signal` — 9 个信号保护测试(T13-T19,含 commit `839821a` 核心保护回归)
-- `make test_handler_override` — 4 个业务覆盖 + reporter 监控补偿测试(T20-T22)
-
-原因:多线程/信号 bug 在普通单线程测试下不会暴露,只有专门的并发场景才能触发(典型例:unwind-parallel 改造在 ARM64/ARM32 上验证了 4 线程加速比 3.7~6.2x,SIGSEGV 跨线程跳对位置)。
-
-**unwind-parallel 改造回退指令** — 用户说「回退 unwind-parallel」时,按 memory `project_unwind_parallel.md` 的 3 级回退策略执行:
-- Level 1(运行时):`MTT_UNWIND_PARALLEL=0 LD_PRELOAD=... your_program`(零代码改动)
-- Level 2(git):`git revert <unwind-parallel 系列提交>`
-- Level 3(手动):按文件清单反向还原(详见 memory)
-
 ## 内网同步——更新代码后必报改动文件夹
 
 当用户说「更新到最新代码」「更新代码」「拉取最新代码」等类似表达时，除了执行 `git pull` 外，**必须**在更新完成后报告本次改动涉及的**顶层文件夹（去重）**，方便用户按文件夹增量拷贝到内网，而非全量拷贝。

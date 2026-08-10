@@ -182,23 +182,7 @@ test_stability: $(SHARED_LIB) tests/test_stability.c | $(OUTPUT_DIR)
 		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
 	$(RUN) $(OUTPUT_DIR)/test_stability
 
-# 并发 + 信号 + handler 覆盖监控测试(unwind-parallel 改造新增)
-test_concurrent: $(SHARED_LIB) tests/test_concurrent.c | $(OUTPUT_DIR)
-	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_concurrent tests/test_concurrent.c \
-		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS) -lpthread
-	$(RUN) $(OUTPUT_DIR)/test_concurrent
-
-test_signal: $(SHARED_LIB) tests/test_signal.c | $(OUTPUT_DIR)
-	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_signal tests/test_signal.c \
-		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS) -lpthread
-	$(RUN) $(OUTPUT_DIR)/test_signal
-
-test_handler_override: $(SHARED_LIB) tests/test_handler_override.c | $(OUTPUT_DIR)
-	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_handler_override tests/test_handler_override.c \
-		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS) -lpthread
-	$(RUN) $(OUTPUT_DIR)/test_handler_override
-
-test_all: test test_stability test_concurrent test_signal test_handler_override
+test_all: test test_stability
 
 clean:
 	rm -rf $(BUILD_DIR) $(OUTPUT_DIR)

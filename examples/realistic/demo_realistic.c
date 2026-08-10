@@ -36,7 +36,6 @@ typedef enum {
     TASK_BIZ_MISUSE_REALLOC,
     TASK_BIZ_MISUSE_CACHE,
     TASK_IN_PROCESS_LEAK,
-    TASK_OPENSOURCE_LEAK,   /* unwind-parallel 改造:开源库泄漏(T29) */
     TASK_TYPE_COUNT
 } task_type_t;
 
@@ -124,11 +123,6 @@ static void *worker_main(void *arg)
             break;
         case TASK_IN_PROCESS_LEAK:
             leak_in_worker(task.task_id);
-            break;
-        case TASK_OPENSOURCE_LEAK:
-            /* 调用开源库(模拟 cJSON/sqlite/openssl),验证工具在
-             * 缺 unwind info 的 .so 内不挂,仍能定位到导出 API 调用点 */
-            call_biz("./fakebiz_opensource.so", "opensource_api", 5);
             break;
         default:
             break;

@@ -99,7 +99,6 @@ flamegraph.pl /var/log/mtt/<pid>_<name>.folded > flame.svg
 | `MTT_DEBUG` | 1 | 诊断日志开关（0=静默,屏蔽所有 stderr 诊断,只保留 leak 报告 + heartbeat） |
 | `MTT_MAX_STACK_FRAMES` | 8 | 栈回溯深度（每次 malloc 最多回溯几帧，[1, 64]）。调大获更深栈（定位更深调用链）但回溯更慢；调小降低 CPU。性能敏感场景建议 4-8 |
 | `MTT_UNWINDER` | auto | 栈回溯方式：`auto`（libunwind 优先，崩溃自动降级）/ `libunwind` / `backtrace`。HDM3 等 libunwind 崩溃环境可设 `backtrace` 绕过 |
-| `MTT_UNWIND_PARALLEL` | 1 | libunwind 栈回溯并行模式开关（unwind-parallel 改造）。`1`=并行(默认,TLS 上下文+无 mutex,多核发挥)；`0`=串行 fallback(全局 mutex,TLS 不可靠设备兜底)。BMC 多线程业务 CPU 飙升 / RPC 长尾超时默认即生效,有问题设 0 一键回退 |
 
 ## 借鉴的成熟方案
 
@@ -309,7 +308,6 @@ ARM EABI 的 `glibc backtrace()` 依赖 `.ARM.exidx` 段，遇到标记 `CANTUNW
 | **延迟符号解析** | dladdr/backtrace_symbols 移到 reporter 后台线程 | 热路径不做符号解析 |
 | **entry 对象池** | 启动时一次性 raw_malloc 大块,entry 复用槽位 | 热路径不调 libc malloc |
 | **64 段 stripe_lock** | 哈希桶链表 64 分段锁,缓存行对齐 | 多线程并发读写无伪共享 |
-| **libunwind 并行化(unwind-parallel)** | 全局 `g_unwind_mutex` + `g_unwind_jmp` → `__thread` TLS sigjmp 上下文 + sigaction 一次性安装 + handler chain + reporter 60s 监控补偿 | 多线程 malloc 多核并行,4 线程实测加速比 3.7~6.2x(commit `839821a` 的 SIGSEGV 保护零回归) |
 
 业务接口变慢时的排查路径：
 1. 先 `MTT_DEBUG=0 MTT_HTTP_PORT=0` 关诊断 + Web 仪表盘,排除 IO 开销
