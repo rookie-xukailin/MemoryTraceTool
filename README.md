@@ -94,7 +94,8 @@ flamegraph.pl /var/log/mtt/<pid>_<name>.folded > flame.svg
 | `MTT_HTTP_PORT` | 0 | Web 仪表盘端口（0=禁用） |
 | `MTT_LEAK_THRESHOLD_SEC` | 300 | 存活超过此秒数 → probable leak |
 | `MTT_SKIP_STARTUP_SEC` | 0 | 进程启动后跳过 N 秒不追踪 |
-| `MTT_LIB_BLACKLIST` | 无 | 逗号分隔的库黑名单（如 `libc.so,libfoo.so`） |
+| `MTT_LIB_BLACKLIST` | 无 | 逗号分隔的库黑名单（如 `libc.so,libfoo.so`）。reporter scan 时按符号字符串过滤,只影响 leak 报告显示 |
+| `MTT_LIB_BLACKLIST_FAST` | 无 | **库地址范围快速黑名单(省 CPU)**。逗号分隔的库名关键词(如 `liblmdb,libxml2`)。启动时解析 /proc/self/maps 记录地址范围,热路径 hook 用 LR 快速判断,命中则**跳过抓栈**节省 8.5μs/次。适合 lmdb/XML 等库内部海量 malloc 导致命令超时的场景。栈会丢失(库内调用链不可见),但业务代码层面的 malloc 仍正常追踪 |
 | `MTT_POOL_ENTRIES` | 16384 | 工具自身 entry 池容量（控制预占用内存，[1024, 65536]，约 600B/entry） |
 | `MTT_DEBUG` | 1 | 诊断日志开关（0=静默,屏蔽所有 stderr 诊断,只保留 leak 报告 + heartbeat） |
 | `MTT_MAX_STACK_FRAMES` | 64 | 栈回溯深度（每次 malloc 最多回溯几帧，[1, 64]）。调大获更深栈（定位更深调用链）但回溯更慢；调小降低 CPU。性能敏感场景建议 4-8,默认 64 拿最深栈 |

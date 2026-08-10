@@ -182,7 +182,13 @@ test_stability: $(SHARED_LIB) tests/test_stability.c | $(OUTPUT_DIR)
 		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
 	$(RUN) $(OUTPUT_DIR)/test_stability
 
-test_all: test test_stability
+# 库地址范围黑名单验证测试(MTT_LIB_BLACKLIST_FAST)
+test_blacklist_fast: $(SHARED_LIB) tests/test_blacklist_fast.c | $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_blacklist_fast tests/test_blacklist_fast.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
+	$(RUN) $(OUTPUT_DIR)/test_blacklist_fast
+
+test_all: test test_stability test_blacklist_fast
 
 clean:
 	rm -rf $(BUILD_DIR) $(OUTPUT_DIR)

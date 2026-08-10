@@ -605,6 +605,145 @@ int mtt_is_blacklisted(mtt_state_t *s, const char *symbol)
     return 0;
 }
 
+/* ======================================================================== *
+ *     库地址范围黑名单(MTT_LIB_BLACKLIST_FAST)                              *
+ * ======================================================================== *
+ *  启动时解析 /proc/self/maps,记录黑名单库的地址范围。热路径 hook 用 LR
+ *  (__builtin_return_address(0))快速判断,命中则跳过抓栈(节省 8.5μs/次)。
+ *
+ *  与 MTT_LIB_BLACKLIST 区别:
+ *    - 现有 MTT_LIB_BLACKLIST:reporter scan 时按 symbol 字符串过滤(只影响显示)
+ *    - 本次 MTT_LIB_BLACKLIST_FAST:热路径按地址范围过滤(直接跳过抓栈,省 CPU)
+ *
+ *  典型场景:BMC 业务调 lmdb / libxml2,库内部海量 malloc 触发工具抓栈,
+ *  命令处理从 1 秒拖到 30~45 秒。设 MTT_LIB_BLACKLIST_FAST=liblmdb,libxml2
+ *  后,这些库内部的 malloc 跳过抓栈,业务命令处理速度恢复。
+ */
+mtt_addr_range_t g_blacklist_ranges[MTT_BLACKLIST_RANGES_MAX];
+int              g_blacklist_range_count = 0;
+int              g_blacklist_fast_enabled = 0;
+
+/**
+ * 解析 MTT_LIB_BLACKLIST_FAST 环境变量 + /proc/self/maps,填充 g_blacklist_ranges。
+ *
+ * 流程:
+ *   1. 读环境变量,逗号分隔成 tokens(类似 MTT_LIB_BLACKLIST)
+ *   2. fopen /proc/self/maps 逐行解析 "起始-结束 rwxp ... pathname"
+ *   3. pathname 包含某 token → 记录 [start, end]
+ *
+ * 失败处理:
+ *   - 环境变量未设:静默 return,黑名单不启用
+ *   - /proc/self/maps 不可读:静默 return,黑名单不启用(fallback 现状)
+ *   - 范围数超过 MTT_BLACKLIST_RANGES_MAX:截断,输出 INFO 日志
+ *
+ * 由 mtt_ensure_init 在 init_lock 内调用,保证单线程首次执行。
+ */
+static void mtt_parse_blacklist_fast(void)
+{
+    const char *env = getenv("MTT_LIB_BLACKLIST_FAST");
+    if (env == NULL || env[0] == '\0') {
+        return;  /* 用户未配置,黑名单不启用 */
+    }
+
+    /* 复制到本地 buffer strtok 会修改 */
+    char buf[512];
+    size_t elen = strlen(env);
+    if (elen >= sizeof(buf)) elen = sizeof(buf) - 1;
+    memcpy(buf, env, elen);
+    buf[elen] = '\0';
+
+    /* 解析为 tokens(最多 16 个) */
+    char *tokens[16];
+    int ntokens = 0;
+    char *tok = strtok(buf, ",");
+    while (tok != NULL && ntokens < 16) {
+        while (*tok == ' ' || *tok == '\t') tok++;  /* 跳过前导空白 */
+        if (*tok != '\0') tokens[ntokens++] = tok;
+        tok = strtok(NULL, ",");
+    }
+    if (ntokens == 0) return;
+
+    /* 解析 /proc/self/maps */
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (f == NULL) {
+        char wbuf[128];
+        int wlen = snprintf(wbuf, sizeof(wbuf),
+            "[MTT] WARNING: /proc/self/maps not readable, MTT_LIB_BLACKLIST_FAST disabled\n");
+        if (wlen > 0 && wlen < (int)sizeof(wbuf))
+            MTT_LOG_INFO(wbuf, (size_t)wlen);
+        return;  /* 嵌入式环境可能没 /proc,fallback 到现状 */
+    }
+
+    char line[512];
+    int truncated = 0;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        /* 行格式:"start-end rwxp offset dev inode pathname" */
+        unsigned long start, end;
+        char pathname[256] = {0};
+        /* pathname 可能不存在(如 [stack]、[heap]),sscanf 返回 2 */
+        int n = sscanf(line, "%lx-%lx %*s %*s %*s %*s %255[^\n]",
+                       &start, &end, pathname);
+        if (n < 2) continue;  /* 解析失败 */
+        if (n < 3 || pathname[0] == '\0') continue;  /* 无 pathname(如 [heap]) */
+
+        /* 检查 pathname 是否匹配任何 token */
+        int matched = 0;
+        for (int i = 0; i < ntokens; i++) {
+            if (strstr(pathname, tokens[i]) != NULL) {
+                matched = 1;
+                break;
+            }
+        }
+        if (!matched) continue;
+
+        /* 匹配,记录地址范围 */
+        if (g_blacklist_range_count >= MTT_BLACKLIST_RANGES_MAX) {
+            truncated = 1;
+            break;
+        }
+        g_blacklist_ranges[g_blacklist_range_count].start = (void*)start;
+        g_blacklist_ranges[g_blacklist_range_count].end   = (void*)end;
+        g_blacklist_range_count++;
+    }
+    fclose(f);
+
+    if (g_blacklist_range_count > 0) {
+        g_blacklist_fast_enabled = 1;
+        char wbuf[160];
+        int wlen = snprintf(wbuf, sizeof(wbuf),
+            "[MTT] MTT_LIB_BLACKLIST_FAST enabled: %d address ranges (libraries: %s)%s\n",
+            g_blacklist_range_count, env, truncated ? " [TRUNCATED]" : "");
+        if (wlen > 0 && wlen < (int)sizeof(wbuf))
+            MTT_LOG_INFO(wbuf, (size_t)wlen);
+    } else {
+        char wbuf[160];
+        int wlen = snprintf(wbuf, sizeof(wbuf),
+            "[MTT] WARNING: MTT_LIB_BLACKLIST_FAST set but no matching libs found in /proc/self/maps\n");
+        if (wlen > 0 && wlen < (int)sizeof(wbuf))
+            MTT_LOG_INFO(wbuf, (size_t)wlen);
+    }
+}
+
+/**
+ * 判断 LR 是否在黑名单库地址范围内。
+ *
+ * 热路径调用(每次 malloc/free hook 入口)。开销 20~50 纳秒(几次指针比较)。
+ * 命中(返回 1)的 malloc 跳过抓栈,直接 raw_malloc 返回。
+ *
+ * @param lr  __builtin_return_address(0) 在 hook 最外层取的直接 caller PC
+ * @return    1=在黑名单库内(应跳过追踪),0=不在(正常追踪)
+ */
+int mtt_is_lr_in_blacklist(void *lr)
+{
+    if (!g_blacklist_fast_enabled || lr == NULL) return 0;
+    for (int i = 0; i < g_blacklist_range_count; i++) {
+        if (lr >= g_blacklist_ranges[i].start && lr < g_blacklist_ranges[i].end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /**
  * 检查当前是否处于启动阶段（应跳过追踪）。
  *
@@ -1240,6 +1379,13 @@ void mtt_ensure_init(void)
             if (len > 0) MTT_LOG_INFO(log_buf, (size_t)len);
         }
     }
+
+    /* 解析 MTT_LIB_BLACKLIST_FAST + /proc/self/maps,填充黑名单地址范围。
+     * init_lock 内 + initialized=1 之前,保证单线程首次执行 + 其他线程看到
+     * initialized=1 时黑名单已就位。/proc/self/maps 不可读时静默 fallback。 */
+    mtt_parse_blacklist_fast();
+    mtt_log_stage(16, "blacklist_fast parsed (enabled=%d ranges=%d)",
+                  g_blacklist_fast_enabled, g_blacklist_range_count);
 
     /* 标记初始化完成（release 确保上述所有初始化对其他线程可见） */
     atomic_store_explicit(&s->initialized, 1, memory_order_release);

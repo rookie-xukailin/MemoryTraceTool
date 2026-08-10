@@ -36,6 +36,17 @@
  * 所有诊断输出使用 write() 系统调用（无 malloc）。
  * 注意：snprintf 仅格式化到栈缓冲区，不触发堆分配。 */
 
+/* ---- 库地址范围黑名单快速检查宏(MTT_LIB_BLACKLIST_FAST) ----
+ * 在 hook 函数体内调用,__builtin_return_address(0) 取的是 hook 函数的
+ * 直接 caller(业务调用点或库内调用点)。命中返回 1,跳过追踪。
+ *
+ * 必须在 mtt_resolve_raw_allocators() 之后调用(需要 raw_* 函数指针)。
+ * g_blacklist_fast_enabled 全局变量,用户未设环境变量时为 0,
+ * mtt_is_lr_in_blacklist 第一行就 return 0,几乎零开销。 */
+#define MTT_LR_IN_BLACKLIST() \
+    (g_blacklist_fast_enabled && \
+     mtt_is_lr_in_blacklist(__builtin_return_address(0)))
+
 /* ---- hook 诊断计数器（仅首次记录，避免高频 IO） ---- */
 
 static _Atomic int g_first_malloc_diag  = 1;
@@ -158,6 +169,16 @@ void* malloc(size_t size)
     ctx->in_hook = 1;
 
     mtt_resolve_raw_allocators();
+
+    /* 库地址范围黑名单快速检查(MTT_LIB_BLACKLIST_FAST):
+     * LR 在黑名单库内(lmdb/XML 等),跳过追踪,直接 raw_malloc。
+     * 节省 8.5μs/次抓栈开销。用户未配置时几乎零开销(一次 atomic load)。 */
+    if (MTT_LR_IN_BLACKLIST()) {
+        void *ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
+        mtt_hook_dec_depth();
+        ctx->in_hook = saved_hook;
+        return ret;
+    }
 
     /* 工具内部线程（reporter/HTTP）：直接透传，不追踪 */
     if (ctx->tool_internal) {
@@ -322,6 +343,17 @@ void free(void *ptr)
 
     mtt_resolve_raw_allocators();
 
+    /* 库地址范围黑名单(lmdb/XML 等):跳过追踪,直接 raw_free。
+     * 黑名单库内部 malloc 当时未创建 entry,这里 free 也无需查/删 entry。
+     * 边界场景:业务把黑名单库的指针交给业务代码 free,工具找不到 entry
+     * 但 free 路径有 entry==NULL 检查,安全跳过。 */
+    if (MTT_LR_IN_BLACKLIST()) {
+        if (raw_free != NULL) raw_free(ptr);
+        mtt_hook_dec_depth();
+        ctx->in_hook = saved_hook;
+        return;
+    }
+
     /* 工具内部线程：直接透传 */
     if (ctx->tool_internal) {
         if (raw_free != NULL) raw_free(ptr);
@@ -423,6 +455,18 @@ void* calloc(size_t count, size_t size)
         return NULL;
     size_t total = count * size;
 
+    /* 库地址范围黑名单(lmdb/XML 等):跳过追踪,直接 raw_malloc + memset。
+     * 不调 malloc(total) 是因为 malloc hook 看到的 LR 是 calloc 函数体内 PC
+     * (在 libmemorytracetool.so 范围),黑名单判断会失效。这里在 calloc 入口
+     * 直接判断 LR(业务调用点或库内调用点),命中则绕过 malloc hook。 */
+    if (MTT_LR_IN_BLACKLIST()) {
+        mtt_resolve_raw_allocators();
+        if (raw_malloc == NULL) return NULL;
+        void *p = raw_malloc(total);
+        if (p != NULL) memset(p, 0, total);
+        return p;
+    }
+
     /* 通过本文件的 malloc() 分配并追踪。
      * mtt_is_recursive_call() 确保 calloc→malloc 链路中
      * malloc 能正确识别调用栈中的 calloc 帧并绕过追踪。
@@ -475,6 +519,22 @@ void* realloc(void *ptr, size_t size)
     ctx->in_hook = 1;
 
     mtt_resolve_raw_allocators();
+
+    /* 库地址范围黑名单(lmdb/XML 等):跳过追踪,直接 raw_realloc。
+     * 黑名单库内部 realloc 由 raw_realloc 处理,工具不维护 entry。
+     * 如果走 malloc+memcpy+free fallback,内部各 hook 会各自检查黑名单。 */
+    if (MTT_LR_IN_BLACKLIST()) {
+        void *ret;
+        if (raw_realloc != NULL) {
+            ret = raw_realloc(ptr, size);
+        } else {
+            ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
+            if (ret != NULL && raw_free != NULL) raw_free(ptr);
+        }
+        mtt_hook_dec_depth();
+        ctx->in_hook = saved_hook;
+        return ret;
+    }
 
     /* 工具内部线程：直接透传 */
     if (ctx->tool_internal) {
@@ -731,6 +791,13 @@ void* reallocarray(void *ptr, size_t nmemb, size_t size)
         errno = 12; /* ENOMEM */
         return NULL;
     }
+    /* 黑名单快速检查:命中则 raw_realloc,绕过 realloc hook。
+     * 否则 realloc hook 看到的 LR 是 reallocarray 函数体内 PC,黑名单失效。 */
+    if (MTT_LR_IN_BLACKLIST()) {
+        mtt_resolve_raw_allocators();
+        if (raw_realloc != NULL) return raw_realloc(ptr, nmemb * size);
+        /* raw_realloc 不可用:fallback 到 realloc(会走追踪,但罕见路径) */
+    }
     return realloc(ptr, nmemb * size);
 }
 
@@ -753,6 +820,15 @@ void* valloc(size_t size)
 /** LD_PRELOAD 拦截的 strdup：直接调 malloc，栈回溯跳过 strdup 自身 */
 char* strdup(const char *s)
 {
+    /* 黑名单快速检查:命中则 raw_malloc + memcpy,绕过 malloc hook */
+    if (MTT_LR_IN_BLACKLIST()) {
+        mtt_resolve_raw_allocators();
+        if (raw_malloc == NULL || s == NULL) return NULL;
+        size_t len = strlen(s) + 1;
+        char *p = (char*)raw_malloc(len);
+        if (p != NULL) memcpy(p, s, len);
+        return p;
+    }
     size_t len = strlen(s) + 1;
     char *p = (char*)malloc(len);
     if (p != NULL) memcpy(p, s, len);
@@ -762,6 +838,18 @@ char* strdup(const char *s)
 /** LD_PRELOAD 拦截的 strndup */
 char* strndup(const char *s, size_t n)
 {
+    /* 黑名单快速检查:同 strdup */
+    if (MTT_LR_IN_BLACKLIST()) {
+        mtt_resolve_raw_allocators();
+        if (raw_malloc == NULL || s == NULL) return NULL;
+        size_t len = strnlen(s, n);
+        char *p = (char*)raw_malloc(len + 1);
+        if (p != NULL) {
+            memcpy(p, s, len);
+            p[len] = '\0';
+        }
+        return p;
+    }
     size_t len = strnlen(s, n);
     char *p = (char*)malloc(len + 1);
     if (p != NULL) {
@@ -789,11 +877,26 @@ int vasprintf(char **strp, const char *fmt, va_list ap)
     va_copy(ap2, ap);
     int len = vsnprintf(NULL, 0, fmt, ap);
     if (len < 0) { va_end(ap2); return -1; }
-    char *buf = (char*)malloc((size_t)len + 1);
+
+    /* 黑名单快速检查:命中则 raw_malloc,绕过 malloc hook。
+     * asprintf 内部调 vasprintf,所以 asprintf 不需要单独检查。 */
+    char *buf;
+    if (MTT_LR_IN_BLACKLIST()) {
+        mtt_resolve_raw_allocators();
+        if (raw_malloc == NULL) { va_end(ap2); return -1; }
+        buf = (char*)raw_malloc((size_t)len + 1);
+    } else {
+        buf = (char*)malloc((size_t)len + 1);
+    }
     if (buf == NULL) { va_end(ap2); return -1; }
     int written = vsnprintf(buf, (size_t)len + 1, fmt, ap2);
     va_end(ap2);
-    if (written < 0) { free(buf); return -1; }
+    if (written < 0) {
+        /* 注意:黑名单命中时 buf 是 raw_malloc 分配的,free hook 会查 entry
+         * 找不到对应 entry,直接 raw_free,行为正确 */
+        free(buf);
+        return -1;
+    }
     *strp = buf;
     return written;
 }

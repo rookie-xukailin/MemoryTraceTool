@@ -379,6 +379,44 @@ int          mtt_is_blacklisted(mtt_state_t *s, const char *symbol);
 void         mtt_capture_stack(mtt_entry_t *entry);
 int          mtt_pool_contains(const void *ptr);   /* 判断 ptr 是否落在 entry 池范围内（防止误 free） */
 
+/* ======================================================================== *
+ *     库地址范围黑名单(MTT_LIB_BLACKLIST_FAST,精准跳过 lmdb/XML 等库)      *
+ * ======================================================================== *
+ *  启动时解析 /proc/self/maps,记录黑名单库的地址范围。
+ *  热路径 hook 用 LR(__builtin_return_address(0))快速判断"在不在黑名单库内",
+ *  命中则跳过抓栈(节省 8.5μs/次),不命中则正常追踪。
+ *
+ *  与现有 MTT_LIB_BLACKLIST 的区别:
+ *    - 现有:reporter scan 时按 symbol 字符串过滤(只影响显示,不省抓栈开销)
+ *    - 本次:热路径按地址范围过滤(直接跳过抓栈,省 CPU)
+ *
+ *  完全不碰 sigaction/mutex/handler/TLS,规避前 4 次失败的根因。
+ */
+#define MTT_BLACKLIST_RANGES_MAX 64   /* 地址范围上限,够 8 个库 × 8 段使用 */
+
+/** 地址范围(启动时从 /proc/self/maps 解析) */
+typedef struct {
+    void *start;
+    void *end;
+} mtt_addr_range_t;
+
+/* 全局变量(tracker.c 定义,hooks.c 通过宏读取)。
+ * extern 声明让 hooks.c 的 MTT_LR_IN_BLACKLIST 宏可见 */
+extern mtt_addr_range_t g_blacklist_ranges[MTT_BLACKLIST_RANGES_MAX];
+extern int              g_blacklist_range_count;
+extern int              g_blacklist_fast_enabled;
+
+/**
+ * 判断 LR(直接调用者的 PC)是否落在黑名单库地址范围内。
+ *
+ * 热路径调用,开销 20~50 纳秒(几次比较)。命中的 malloc 跳过抓栈,
+ * 不建 entry,直接 raw_malloc 返回。
+ *
+ * @param lr  __builtin_return_address(0) 取的直接 caller PC
+ * @return    1=在黑名单库内(跳过追踪),0=不在(正常追踪)
+ */
+int          mtt_is_lr_in_blacklist(void *lr);
+
 /* 三档日志等级(tracker.c 定义,由环境变量 MTT_DEBUG 控制)。
  *   0 = 静默:只输出 leak 报告 + heartbeat + HTTP API + SIGUSR1
  *   1 = 关键:启动/退出事件、libunwind 崩溃、WARNING(最少日志)
