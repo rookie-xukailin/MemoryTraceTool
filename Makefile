@@ -188,7 +188,13 @@ test_blacklist_fast: $(SHARED_LIB) tests/test_blacklist_fast.c | $(OUTPUT_DIR)
 		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
 	$(RUN) $(OUTPUT_DIR)/test_blacklist_fast
 
-test_all: test test_stability test_blacklist_fast
+# fork handler 验证测试(Type=forking 路径)
+test_fork: $(SHARED_LIB) tests/test_fork.c | $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_fork tests/test_fork.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS) -lpthread
+	$(RUN) $(OUTPUT_DIR)/test_fork
+
+test_all: test test_stability test_blacklist_fast test_fork
 
 clean:
 	rm -rf $(BUILD_DIR) $(OUTPUT_DIR)

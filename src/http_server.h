@@ -45,4 +45,17 @@ void mtt_http_server_start(uint16_t port);
  */
 void mtt_http_server_stop(void);
 
+/**
+ * fork 子进程后重置 HTTP server 状态。
+ *
+ * 由 tracker.c 的 mtt_fork_child 调用。fork 后:
+ *   - HTTP 线程不存在(fork 不复制其他线程)
+ *   - running 标志仍为 1(继承)
+ *   - listen_fd 是父进程的 socket fd(子进程不应该共享)
+ *
+ * 本函数关闭继承的 listen_fd + 重置 running 标志,让子进程下次
+ * mtt_http_server_start 能重新 socket/bind/listen。
+ */
+void mtt_http_reset_for_fork(void);
+
 #endif /* MTT_HTTP_SERVER_H */

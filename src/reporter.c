@@ -1306,3 +1306,33 @@ void mtt_reporter_signal_scan(void)
     scan_and_report_locked();
     pthread_mutex_unlock(&g_reporter.scan_mutex);
 }
+
+/**
+ * fork 子进程后重置 reporter 状态(tracker.c mtt_fork_child 调用)。
+ *
+ * fork 后:
+ *   - reporter 线程不存在(fork 不复制其他线程)
+ *   - g_reporter_started / g_atexit_registered / running 仍为 1(继承的脏值)
+ *   - scan_mutex / cache_lock 状态未定义(其他线程可能 fork 时持锁)
+ *
+ * 本函数重置这些标志和锁,让子进程下次 mtt_reporter_start 走完整启动流程
+ * (包括重新创建 reporter 线程 + 重新注册 atexit + 重新构建 log_path)。
+ *
+ * 注意:本函数在 fork child 上下文中调用,不调 pthread_create(async-signal-safe)。
+ * 实际的 reporter 线程重启由 mtt_ensure_init(子进程下次 malloc 触发)负责。
+ */
+void mtt_reporter_reset_for_fork(void)
+{
+    /* 重置"已启动"标志,让 mtt_reporter_start 不再跳过 */
+    atomic_store(&g_reporter_started, 0);
+    atomic_store_explicit(&g_reporter.running, 0, memory_order_release);
+    g_atexit_registered = 0;
+    g_atexit_done = 0;
+
+    /* fork 后 mutex 状态未定义,重新初始化 */
+    pthread_mutex_init(&g_reporter.scan_mutex, NULL);
+    pthread_mutex_init(&g_reporter.cache_lock, NULL);
+
+    /* 清空 leak_table(子进程从零开始追踪) */
+    memset(&g_reporter.leak_table, 0, sizeof(g_reporter.leak_table));
+}

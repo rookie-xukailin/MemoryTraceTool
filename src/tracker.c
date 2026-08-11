@@ -105,6 +105,17 @@ int g_unwinder_mode = 0;
  * 调大(如 16/32/64)获更深栈但回溯更慢。 */
 int g_max_stack_frames = 64;
 
+/* fork 安全相关变量(放文件作用域,方便 mtt_fork_child 重置)。
+ *
+ * init_lock:mtt_ensure_init 内部串行化锁,fork 后子进程需要重新初始化
+ * signal_thread_started:防止 mtt_signal_thread_start 重复启动的标志,fork 后重置
+ */
+static pthread_mutex_t g_init_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_signal_thread_started = 0;
+/* g_signal_thread_running 定义在信号线程段(line 1589),这里前向声明让
+ * mtt_fork_child(line 1495)可见 */
+extern _Atomic int g_signal_thread_running;
+
 /* ======================================================================== *
  *                    阶段标记日志(MTT_DEBUG=1 时定位崩溃用)                  *
  * ======================================================================== */
@@ -1253,13 +1264,12 @@ void mtt_ensure_init(void)
     /* ---- 阶段2: 持锁初始化数据结构（双重检查锁定） ---- */
     mtt_log_stage(6, "env read done: pool_entries=%zu debug=%d",
                   want_pool_entries, want_debug);
-    static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_lock(&init_lock);
+    pthread_mutex_lock(&g_init_lock);
     mtt_log_stage(7, "init_lock acquired");
 
     /* 双重检查：可能在等锁期间已被其他线程初始化 */
     if (atomic_load_explicit(&s->initialized, memory_order_acquire)) {
-        pthread_mutex_unlock(&init_lock);
+        pthread_mutex_unlock(&g_init_lock);
         return;
     }
 
@@ -1280,7 +1290,7 @@ void mtt_ensure_init(void)
          * 后续所有 hook 调用直接透传到 raw_*，不再重试初始化。 */
         atomic_store_explicit(&s->disabled, 1, memory_order_release);
         atomic_store_explicit(&s->initialized, 1, memory_order_release);
-        pthread_mutex_unlock(&init_lock);
+        pthread_mutex_unlock(&g_init_lock);
         return;
     }
 
@@ -1397,7 +1407,7 @@ void mtt_ensure_init(void)
 
     /* 标记初始化完成（release 确保上述所有初始化对其他线程可见） */
     atomic_store_explicit(&s->initialized, 1, memory_order_release);
-    pthread_mutex_unlock(&init_lock);
+    pthread_mutex_unlock(&g_init_lock);
     mtt_log_stage(10, "initialized=1, init_lock released");
 
     /* 先初始化时序数据（必须在 reporter 线程启动前完成） */
@@ -1484,29 +1494,88 @@ static void mtt_fork_parent(void)
         pthread_mutex_unlock(&s->bucket_locks[i].lock);
 }
 
-/** fork 后（子进程）：重新初始化所有 mutex 和状态 */
+/** fork 后(子进程):重置所有工具状态,让子进程下次 malloc 时 mtt_ensure_init
+ *  重新走完整 init 流程(启动 reporter/HTTP/signal 线程)。
+ *
+ *  本函数在 fork child 上下文中调用,只能用 async-signal-safe 操作
+ *  (pthread_mutex_init / close / syscall / memset 都是 safe)。
+ *  不调 pthread_create(不保证 safe),改用 initialized=0 让下次 malloc 触发 init。 */
 static void mtt_fork_child(void)
 {
     mtt_state_t *s = mtt_state_get();
     if (s == NULL) return;
 
-    /* 重新初始化所有分段锁（子进程中互斥锁状态未定义） */
+    /* 1. 重置后台线程标志(reporter / HTTP / signal 的"已启动"标志)
+     *    fork 后这些线程不存在(fork 只复制调用线程),标志需清零
+     *    让 mtt_reporter_start / mtt_http_server_start / mtt_signal_thread_start
+     *    不再跳过 */
+    mtt_reporter_reset_for_fork();
+    mtt_http_reset_for_fork();
+    atomic_store(&g_signal_thread_started, 0);
+    atomic_store(&g_signal_thread_running, 0);
+
+    /* 2. 重置 init_lock(fork 后 mutex 状态未定义) */
+    pthread_mutex_init(&g_init_lock, NULL);
+
+    /* 3. 清 per_thread 槽位:fork 只复制调用线程,其他线程的 tid 是脏值。
+     *    保留当前线程槽位(它必然存活,正在跑 fork_child)。 */
+    pid_t my_tid = (pid_t)syscall(SYS_gettid);
+    for (int i = 0; i < MTT_MAX_THREADS; i++) {
+        pid_t owner = atomic_load_explicit(&g_threads[i].tid, memory_order_acquire);
+        if (owner != 0 && owner != my_tid) {
+            atomic_store_explicit(&g_threads[i].tid, 0, memory_order_release);
+        }
+    }
+    /* 重置 TLS 缓存(下次 malloc 时通过 mtt_thread_get_cached 重新填充) */
+    mtt_tls_ctx = NULL;
+    mtt_tls_cached_tid = 0;
+
+    /* 4. 重新初始化所有分段锁 + pool 锁(fork 后 mutex 状态未定义) */
     for (int i = 0; i < MTT_LOCK_STRIPES; i++) {
-        pthread_mutex_t new_lock = PTHREAD_MUTEX_INITIALIZER;
-        s->bucket_locks[i].lock = new_lock;
+        pthread_mutex_init(&s->bucket_locks[i].lock, NULL);
+        pthread_mutex_init(&s->pool_locks[i].lock, NULL);
     }
 
-    /* 重置 key 状态：子进程是全新进程，parent 的追踪数据无意义 */
+    /* 5. 重置所有原子计数器(子进程是全新追踪,父进程的数据无意义) */
     atomic_store(&s->entry_count, 0);
     atomic_store(&s->alloc_count, 0);
     atomic_store(&s->free_count, 0);
     atomic_store(&s->current_bytes, 0);
     atomic_store(&s->total_bytes, 0);
     atomic_store(&s->alloc_seq, 0);
+    atomic_store(&s->sample_bytes_accum, 0);
+    atomic_store(&s->skipped_sampled, 0);
+    atomic_store(&s->skipped_overcap, 0);
+    atomic_store(&s->pool_used, 0);
+    atomic_store(&s->peak_updated, 0);
+    atomic_store(&s->peak_bytes, 0);
+    atomic_store(&s->leak_bytes_total, 0);
 
-    /* 清空桶表（子进程内存空间独立，parent 的追踪条目已无意义） */
+    /* 6. 清空桶表(子进程内存空间独立,父进程的追踪条目已无意义) */
     for (unsigned j = 0; j < s->bucket_count; j++)
         s->buckets[j] = NULL;
+
+    /* 7. 重置 pool free_list(复用 pool 内存,子进程独立空间)。
+     *    pool 数组本身继承自父进程(buckets/pool 都还在),
+     *    只需重建 free_list 让 entry 可重新分配。 */
+    for (int i = 0; i < MTT_LOCK_STRIPES; i++)
+        s->pool_free_lists[i] = NULL;
+    if (s->pool != NULL) {
+        for (size_t i = 0; i < s->pool_capacity; i++) {
+            unsigned idx = (unsigned)(i % MTT_LOCK_STRIPES);
+            s->pool[i].next = s->pool_free_lists[idx];
+            s->pool_free_lists[idx] = &s->pool[i];
+        }
+    }
+
+    /* 8. 关键:重置 initialized=0,让子进程下次 malloc 时 mtt_ensure_init
+     *    重新走完整 init 流程:
+     *      - 读环境变量(重新解析 MTT_SAMPLE_RATE 等)
+     *      - 重新启动 reporter / HTTP / signal 线程
+     *      - 重新装 sigaction(unwind handler)
+     *      - 设置 initialized=1
+     *    buckets 数组 / pool 内存继承自父进程,init 内有 NULL 检查不会重新分配。 */
+    atomic_store_explicit(&s->initialized, 0, memory_order_release);
 }
 
 /** 注册 pthread_atfork 处理器 */
@@ -1560,10 +1629,9 @@ static void* mtt_signal_thread_fn(void *arg)
  */
 void mtt_signal_thread_start(void)
 {
-    /* 防止重复启动 */
+    /* 防止重复启动(用文件作用域的 g_signal_thread_started,fork 后可重置) */
     int expected = 0;
-    static atomic_int started = 0;
-    if (!atomic_compare_exchange_strong(&started, &expected, 1))
+    if (!atomic_compare_exchange_strong(&g_signal_thread_started, &expected, 1))
         return;
 
     /* 在主线程中阻塞 SIGUSR1（子线程将通过 sigwait 接收） */

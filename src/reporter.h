@@ -88,6 +88,18 @@ void mtt_reporter_stop(void);
 void mtt_reporter_signal_scan(void);
 
 /**
+ * fork 子进程后重置 reporter 状态。
+ *
+ * 由 tracker.c 的 mtt_fork_child 调用。fork 后:
+ *   - reporter 线程不存在(fork 不复制其他线程)
+ *   - g_reporter_started / g_atexit_registered 标志仍为 1(继承)
+ *   - scan_mutex / cache_lock 状态未定义
+ *
+ * 本函数重置这些标志和锁,让子进程下次 mtt_reporter_start 能正常启动。
+ */
+void mtt_reporter_reset_for_fork(void);
+
+/**
  * 获取报告器单例指针（供 HTTP 服务器读取缓存数据）。
  *
  * @return 报告器全局状态指针（永不为 NULL）

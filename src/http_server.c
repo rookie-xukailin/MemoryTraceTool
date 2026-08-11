@@ -752,3 +752,21 @@ void mtt_http_server_stop(void)
         g_http_server.listen_fd = -1;
     }
 }
+
+/**
+ * fork 子进程后重置 HTTP server 状态。
+ *
+ * 由 tracker.c 的 mtt_fork_child 调用(async-signal-safe 上下文)。
+ * 与 stop 的差异:重置 thread/port,让子进程下次 mtt_http_server_start
+ * 重新走完整 socket/bind/listen 流程。
+ */
+void mtt_http_reset_for_fork(void)
+{
+    atomic_store_explicit(&g_http_server.running, 0, memory_order_release);
+    if (g_http_server.listen_fd > 0) {
+        close(g_http_server.listen_fd);
+        g_http_server.listen_fd = -1;
+    }
+    g_http_server.thread = 0;
+    g_http_server.port = 0;
+}
