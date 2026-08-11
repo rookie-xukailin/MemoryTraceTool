@@ -1459,6 +1459,18 @@ void mtt_ensure_init(void)
         ctx->tool_internal = 1;
     }
 
+    /* 如果工具被禁用(如进程自检匹配黑名单:busybox 等),不启动后台线程。
+     * disabled 标志在 init_lock 内的 mtt_parse_blacklist_fast 里设置。
+     * 跳过 reporter/HTTP/signal 启动,避免 fork+exec 子进程抢端口 + 噪音。 */
+    if (atomic_load_explicit(&s->disabled, memory_order_acquire)) {
+        if (ctx != NULL) {
+            ctx->in_hook = saved_hook;
+            ctx->tool_internal = saved_tool;
+        }
+        mtt_log_stage(17, "tracking disabled (blacklist self-match), skipping background threads");
+        return;
+    }
+
     /* 启动周期报告线程（锁外，避免 pthread_create 内部 malloc → 递归） */
     mtt_reporter_start();
     mtt_log_stage(12, "reporter thread started");
