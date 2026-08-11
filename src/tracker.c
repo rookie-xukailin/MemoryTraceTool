@@ -728,12 +728,42 @@ static void mtt_parse_blacklist_fast(void)
 
     if (g_blacklist_range_count > 0) {
         g_blacklist_fast_enabled = 1;
-        char wbuf[160];
+        char wbuf[256];
         int wlen = snprintf(wbuf, sizeof(wbuf),
             "[MTT] MTT_LIB_BLACKLIST_FAST enabled: %d address ranges (libraries: %s)%s\n",
             g_blacklist_range_count, env, truncated ? " [TRUNCATED]" : "");
         if (wlen > 0 && wlen < (int)sizeof(wbuf))
             MTT_LOG_INFO(wbuf, (size_t)wlen);
+
+        /* 进程自检:如果当前进程的 /proc/self/exe 匹配黑名单关键词,
+         * 说明本进程本身就是黑名单进程(如 busybox),禁用整个工具。
+         * 这样 fork+exec 出来的子进程(继承 LD_PRELOAD 但自身是黑名单程序)
+         * 不会启动 reporter/HTTP/signal,避免抢端口 + 噪音。
+         *
+         * 场景:diag_main(主进程)fork+exec busybox,busybox 继承 LD_PRELOAD。
+         * 没有这段检查:busybox 第一次 malloc 触发 init,启动 HTTP :8080,
+         * 和 diag_main daemon 的 HTTP 冲突。
+         * 有这段检查:busybox 发现自己是黑名单进程 → disabled=1 → 不启动后台线程。 */
+        char exe_path[256] = {0};
+        ssize_t en = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (en > 0) {
+            for (int i = 0; i < ntokens; i++) {
+                if (strstr(exe_path, tokens[i]) != NULL) {
+                    mtt_state_t *st = mtt_state_get();
+                    if (st != NULL) {
+                        atomic_store_explicit(&st->disabled, 1, memory_order_release);
+                    }
+                    char wbuf2[256];
+                    int wlen2 = snprintf(wbuf2, sizeof(wbuf2),
+                        "[MTT] Process exe (%s) matches blacklist '%s', "
+                        "disabling tracking (no reporter/HTTP/signal)\n",
+                        exe_path, tokens[i]);
+                    if (wlen2 > 0 && wlen2 < (int)sizeof(wbuf2))
+                        MTT_LOG_INFO(wbuf2, (size_t)wlen2);
+                    break;
+                }
+            }
+        }
     } else {
         char wbuf[160];
         int wlen = snprintf(wbuf, sizeof(wbuf),
