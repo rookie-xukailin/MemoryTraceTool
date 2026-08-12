@@ -28,9 +28,30 @@ ifneq ($(MTT_EMBEDDED),)
 endif
 
 CORE_CFLAGS = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
-# MTT_STATIC_LIBUNWIND: 启用静态链接 libunwind(随产物发布,目标机无需预装)
-# 在 src/unwind_libunwind.c 切换为编译期直连 unw_backtrace,跳过 dlopen 探测
-CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS) $(EMBEDDED_DEFS) -DMTT_STATIC_LIBUNWIND
+
+# libunwind 静态链接开关(默认关闭):
+#   MTT_LIBUNWIND_STATIC=1: ARM32 用,链接 libunwind.a,启用 libunwind 集成
+#   默认(空): ARM64 / 本机用,不链接 libunwind,unwind_libunwind.c 走空实现,
+#             capture_stack 自然走 glibc backtrace
+# 原因:libunwind 静态链接(dd1145f)会破坏 glibc backtrace(bt_test 实测验证,
+# 挂工具后 n=0)。ARM64 + 业务 .eh_frame 上 glibc backtrace 本来就工作正常,
+# 不需要 libunwind。ARM32 -fomit-frame-pointer 业务上 glibc backtrace 拿不到
+# 深栈,必须用 libunwind。
+MTT_LIBUNWIND_STATIC ?=
+
+ifeq ($(MTT_LIBUNWIND_STATIC),1)
+    LIBUNWIND_DEFINES = -DMTT_STATIC_LIBUNWIND
+    LIBUNWIND_DEPS    = $(LIBUNWIND_STATIC)
+    LIBUNWIND_LINK    = $(LIBUNWIND_STATIC)
+    LIBUNWIND_INC     = -DUNW_LOCAL_ONLY -I$(LIBUNWIND_BUILD)/include -I$(LIBUNWIND_SRC)/include
+else
+    LIBUNWIND_DEFINES = -DMTT_NO_LIBUNWIND
+    LIBUNWIND_DEPS    =
+    LIBUNWIND_LINK    =
+    LIBUNWIND_INC     =
+endif
+
+CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS) $(EMBEDDED_DEFS) $(LIBUNWIND_DEFINES)
 
 CC       = $(CROSS_COMPILE)gcc
 
@@ -125,8 +146,8 @@ $(LIBUNWIND_STATIC): $(LIBUNWIND_SRC)/configure
 	        CC="$(CC)" CFLAGS="$(ARCH_FLAGS) -O2 -fPIC -fno-omit-frame-pointer"
 	$(MAKE) -C $(LIBUNWIND_BUILD) -j4 V=0
 
-$(SHARED_LIB): $(LIB_OBJS) $(LIBUNWIND_STATIC) | $(OUTPUT_DIR)
-	$(CC) -shared -o $@ $(LIB_OBJS) $(LIBUNWIND_STATIC) \
+$(SHARED_LIB): $(LIB_OBJS) $(LIBUNWIND_DEPS) | $(OUTPUT_DIR)
+	$(CC) -shared -o $@ $(LIB_OBJS) $(LIBUNWIND_LINK) \
 	    -Wl,--exclude-libs,ALL $(LDFLAGS)
 	@rm -f $(BUILD_DIR)/*.o
 
@@ -154,8 +175,8 @@ $(BUILD_DIR)/http_server.o: $(SRC_DIR)/http_server.c $(SRC_DIR)/http_server.h $(
 $(BUILD_DIR)/addr_validate.o: $(SRC_DIR)/addr_validate.c $(SRC_DIR)/addr_validate.h $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
-$(BUILD_DIR)/unwind_libunwind.o: $(SRC_DIR)/unwind_libunwind.c $(SRC_DIR)/unwind_libunwind.h $(SRC_DIR)/mtt_internal.h $(LIBUNWIND_STATIC) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INC_SHARED) $(if $(filter -DMTT_STATIC_LIBUNWIND,$(CFLAGS)),-DUNW_LOCAL_ONLY -I$(LIBUNWIND_BUILD)/include -I$(LIBUNWIND_SRC)/include) -c -o $@ $<
+$(BUILD_DIR)/unwind_libunwind.o: $(SRC_DIR)/unwind_libunwind.c $(SRC_DIR)/unwind_libunwind.h $(SRC_DIR)/mtt_internal.h $(LIBUNWIND_DEPS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INC_SHARED) $(LIBUNWIND_INC) -c -o $@ $<
 
 $(BUILD_DIR) $(OUTPUT_DIR):
 	mkdir -p $@
