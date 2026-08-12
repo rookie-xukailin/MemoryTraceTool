@@ -147,24 +147,30 @@ static void first_call_diag(const char *func_name, _Atomic int *flag, int stage_
 static inline int mtt_hook_enter(void)
 {
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get_cached();
-    if (ctx == NULL) return -1;
+    if (ctx == NULL) return -1; /* 降级：无槽位时保守视为递归 */
     if (ctx->depth_inited != 0x2A) {
         ctx->hook_depth = 0;
         ctx->depth_inited = 0x2A;
     } else if (ctx->hook_depth > MTT_HOOK_DEPTH_MAX) {
+        /* 脏值超过合理上限:重置 */
         ctx->hook_depth = 0;
     } else if (ctx->hook_depth > 0 && !ctx->in_hook) {
+        /* 关键残留检测:depth > 0 但 in_hook=0,正常情况不可能。
+         * 必是 TID 复用 / TLS 跨线程污染 / 异常退出。重置恢复追踪。
+         * 输出详细上下文定位源头(等级 1)。 */
+        pid_t real_tid = (pid_t)syscall(SYS_gettid);
+        char dbuf[192];
+        int dlen = snprintf(dbuf, sizeof(dbuf),
+            "[MTT] DEPTH_RESIDUAL real_tid=%d slot.tid=%d depth=%d in_hook=%d "
+            "tool_internal=%d in_capture=%d raw_resolving=%d\n",
+            (int)real_tid,
+            (int)atomic_load_explicit(&ctx->tid, memory_order_relaxed),
+            ctx->hook_depth, ctx->in_hook, ctx->tool_internal,
+            ctx->in_capture, ctx->raw_resolving);
+        if (dlen > 0 && dlen < (int)sizeof(dbuf))
+            MTT_LOG_INFO(dbuf, (size_t)dlen);
         ctx->hook_depth = 0;
     }
-#if defined(__aarch64__)
-    /* ARM64:绕过 depth 残留(BMC 系统级问题,工具侧无法修复)。
-     * 三标志全=0(不在 dlsym/capture/tool_internal 嵌套中)→ 业务直接调 →
-     * 强制返回 0,不管 depth 值。正常追踪。
-     * 任一标志=1 → 在已知嵌套中 → 返回 depth(SKIP 如果 depth>0)。
-     * ARM32 完全不变(无残留,depth 正常工作)。 */
-    if (!ctx->raw_resolving && !ctx->in_capture && !ctx->tool_internal)
-        return 0;
-#endif
     return ctx->hook_depth;
 }
 
