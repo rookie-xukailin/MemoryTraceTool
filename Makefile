@@ -99,15 +99,20 @@ SHARED_LIB = $(OUTPUT_DIR)/libmemorytracetool.so
 # 会把第一个非 .PHONY 文件目标当作默认
 all: $(SHARED_LIB) bt_test
 
-# 架构伪目标(用户捷径,自动设置 MTT_LIBUNWIND_STATIC):
-#   make arm32          → ARM32 编译(链接 libunwind)
+# 架构伪目标(用户捷径):
+#   make arm32          → ARM32 编译(链接 libunwind + 嵌入式优化)
 #   make arm64          → ARM64 编译(不链接 libunwind)
 #   make                → 本机默认编译(不链接 libunwind)
-# 用户仍可手动传 CROSS_COMPILE / ARCH 控制工具链:
-#   make arm32 CROSS_COMPILE=arm-linux-gnueabihf-
-#   make arm64 CROSS_COMPILE=aarch64-linux-gnu-
+#
+# 不强制设 ARCH(避免与工具链默认 -march/-mfloat-abi 冲突),让 CROSS_COMPILE
+# 指定的工具链自己决定目标架构。仅设 MTT_LIBUNWIND_STATIC + MTT_EMBEDDED。
+#
+# 用户用法:
+#   export CROSS_COMPILE=arm-linux-gnueabihf-   # 或其他 ARM32 工具链前缀
+#   make arm32                                   # 编译 ARM32 + libunwind
+#   make arm64                                   # 编译 ARM64 + 纯 glibc backtrace
 arm32:
-	$(MAKE) MTT_LIBUNWIND_STATIC=1
+	$(MAKE) MTT_LIBUNWIND_STATIC=1 MTT_EMBEDDED=1
 
 arm64:
 	$(MAKE) MTT_LIBUNWIND_STATIC=
