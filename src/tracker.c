@@ -1538,6 +1538,14 @@ void mtt_ensure_init(void)
 #if defined(__aarch64__)
     extern void mtt_init_tool_range(void);
     mtt_init_tool_range();
+
+    /* ARM64:BMC 上 libc 初始化可能 longjmp 跳过 dec_depth,导致 depth=1 残留。
+     * init 完成后强制清零,让后续 malloc 正常追踪。
+     * ARM32 不需要(libc 不 longjmp,depth 正常 balance)。 */
+    if (ctx != NULL) {
+        ctx->hook_depth = 0;
+        ctx->in_hook = 0;
+    }
 #endif
 
     mtt_log_stage(15, "mtt_ensure_init done");
