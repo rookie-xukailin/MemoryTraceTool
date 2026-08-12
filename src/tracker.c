@@ -518,8 +518,10 @@ void mtt_capture_stack(mtt_entry_t *entry)
             void *lr      = fp[1];
             if (lr == NULL) break;
             if (prev_fp == NULL) break;
-            /* LR 必须落在可执行段内,过滤栈垃圾误判 */
+#if !defined(__aarch64__)
+            /* ARM32 / x86:LR 必须落在可执行段内,过滤栈垃圾误判 */
             if (!mtt_addr_is_executable(MTT_FIX_THUMB_ADDR(lr))) break;
+#endif
             /* 严格校验:父帧地址必须严格递增,且跨度 <= 64KB。
              * 防止无帧指针二进制上 prev_fp 为栈垃圾导致跳到无效地址。 */
             uintptr_t prev_addr = (uintptr_t)prev_fp;
