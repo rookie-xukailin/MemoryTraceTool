@@ -156,7 +156,19 @@ static inline int mtt_hook_enter(void)
         ctx->hook_depth = 0;
     } else if (ctx->hook_depth > 0 && !ctx->in_hook) {
         /* 关键残留检测:depth > 0 但 in_hook=0,正常情况不可能。
-         * 必是 TID 复用 / TLS 跨线程污染 / 异常退出。重置恢复追踪。 */
+         * 必是 TID 复用 / TLS 跨线程污染 / 异常退出。重置恢复追踪。
+         * 输出详细上下文定位源头(等级 1)。 */
+        pid_t real_tid = (pid_t)syscall(SYS_gettid);
+        char dbuf[192];
+        int dlen = snprintf(dbuf, sizeof(dbuf),
+            "[MTT] DEPTH_RESIDUAL real_tid=%d slot.tid=%d depth=%d in_hook=%d "
+            "tool_internal=%d in_capture=%d raw_resolving=%d\n",
+            (int)real_tid,
+            (int)atomic_load_explicit(&ctx->tid, memory_order_relaxed),
+            ctx->hook_depth, ctx->in_hook, ctx->tool_internal,
+            ctx->in_capture, ctx->raw_resolving);
+        if (dlen > 0 && dlen < (int)sizeof(dbuf))
+            MTT_LOG_INFO(dbuf, (size_t)dlen);
         ctx->hook_depth = 0;
     }
     return ctx->hook_depth;
@@ -205,6 +217,31 @@ void* malloc(size_t size)
     {
         int depth = mtt_hook_enter();
         if (depth > 0) {
+            /* 诊断:depth > 0 时输出完整上下文(等级 1),定位 depth 残留源头。
+             * 只在 TRACE 跟踪 size 时输出,避免污染日志。 */
+            if (MTT_TRACE_TARGET(size)) {
+                mtt_per_thread_t *__diag_ctx = mtt_thread_get_cached();
+                pid_t __real_tid = (__diag_ctx != NULL) ?
+                    (pid_t)syscall(SYS_gettid) : 0;
+                int __slot_tid = (__diag_ctx != NULL) ?
+                    (int)atomic_load_explicit(&__diag_ctx->tid, memory_order_relaxed) : 0;
+                int __in_hook = (__diag_ctx != NULL) ? __diag_ctx->in_hook : -1;
+                int __tool = (__diag_ctx != NULL) ? __diag_ctx->tool_internal : -1;
+                int __in_cap = (__diag_ctx != NULL) ? __diag_ctx->in_capture : -1;
+                int __raw_res = (__diag_ctx != NULL) ? __diag_ctx->raw_resolving : -1;
+                char __buf[256];
+                int __n = snprintf(__buf, sizeof(__buf),
+                    "[MTT] TRACE%zu SKIP recursion depth=%d real_tid=%d slot_tid=%d "
+                    "in_hook=%d tool_internal=%d in_capture=%d raw_resolving=%d "
+                    "depth_inited=%d\n",
+                    (size_t)size, depth, (int)__real_tid, __slot_tid,
+                    __in_hook, __tool, __in_cap, __raw_res,
+                    __diag_ctx ? __diag_ctx->depth_inited : -1);
+                if (__n > 0) {
+                    if (__n >= (int)sizeof(__buf)) __n = (int)sizeof(__buf) - 1;
+                    MTT_DIAG_WRITE(STDERR_FILENO, __buf, (size_t)__n);
+                }
+            }
             MTT_TRACE(size, "SKIP reason=recursion depth=%d", depth);
             mtt_resolve_raw_allocators();
             return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
