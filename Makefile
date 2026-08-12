@@ -255,4 +255,4 @@ demo_small_leak: $(SHARED_LIB) examples/demo_small_leak.c | $(OUTPUT_DIR)
 
 # bt_test:综合 backtrace 诊断(纯单线程,7 场景遍历)
 bt_test: examples/bt_test.c | $(OUTPUT_DIR)
-	$(CC) $(CFLAGS) -o $(OUTPUT_DIR)/bt_test examples/bt_test.c
+	$(CC) -Wall -Wextra -g -O2 -fno-omit-frame-pointer -o $(OUTPUT_DIR)/bt_test examples/bt_test.c
