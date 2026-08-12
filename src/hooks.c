@@ -22,7 +22,6 @@
 #define _GNU_SOURCE
 #include "mtt_internal.h"
 #include "per_thread.h"
-#include <dlfcn.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -132,25 +131,6 @@ static void first_call_diag(const char *func_name, _Atomic int *flag, int stage_
 /* 深度计数器已迁移至 per_thread.h 槽位数组。
  * mtt_hook_enter/inc/dec 内部通过 mtt_thread_get() 访问。 */
 
-#if defined(__aarch64__)
-/* ARM64: 工具 .so 地址范围(init 阶段填充,hook_enter 纯指针比较)。
- * 用于区分"业务直接调"(LR 在业务代码 → depth 残留 → 重置)
- * vs "工具内部嵌套"(LR 在工具 .so → 保留 SKIP)。
- * init 前 lo=0,hook_enter 不检测(保守,不重置)。 */
-static _Atomic uintptr_t g_tool_lo = 0;
-static _Atomic uintptr_t g_tool_hi = 0;
-
-/* 由 mtt_ensure_init 末尾调用(不在 hook 上下文,dladdr 安全) */
-void mtt_init_tool_range(void)
-{
-    Dl_info info;
-    if (dladdr((void*)&mtt_init_tool_range, &info) && info.dli_fbase) {
-        uintptr_t base = (uintptr_t)info.dli_fbase;
-        atomic_store_explicit(&g_tool_lo, base, memory_order_relaxed);
-        atomic_store_explicit(&g_tool_hi, base + (1 << 20), memory_order_relaxed);
-    }
-}
-#endif
 /** 获取当前 hook 调用深度，首次调用时自动修正脏值。
  * 若槽位满返回 -1（降级：视为递归，直接透传 raw_*）。
  *
@@ -164,7 +144,6 @@ void mtt_init_tool_range(void)
  *        - TLS 缓存跨线程污染(ARM64 __thread 不可靠,B 拿到 A 的 ctx)
  *        - 上次 hook 异常退出(inc 后线程被 cancel)
  *      全部重置为 0,恢复追踪。 */
-__attribute__((always_inline))
 static inline int mtt_hook_enter(void)
 {
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get_cached();
@@ -173,30 +152,25 @@ static inline int mtt_hook_enter(void)
         ctx->hook_depth = 0;
         ctx->depth_inited = 0x2A;
     } else if (ctx->hook_depth > MTT_HOOK_DEPTH_MAX) {
+        /* 脏值超过合理上限:重置 */
         ctx->hook_depth = 0;
     } else if (ctx->hook_depth > 0 && !ctx->in_hook) {
+        /* 关键残留检测:depth > 0 但 in_hook=0,正常情况不可能。
+         * 必是 TID 复用 / TLS 跨线程污染 / 异常退出。重置恢复追踪。
+         * 输出详细上下文定位源头(等级 1)。 */
+        pid_t real_tid = (pid_t)syscall(SYS_gettid);
+        char dbuf[192];
+        int dlen = snprintf(dbuf, sizeof(dbuf),
+            "[MTT] DEPTH_RESIDUAL real_tid=%d slot.tid=%d depth=%d in_hook=%d "
+            "tool_internal=%d in_capture=%d raw_resolving=%d\n",
+            (int)real_tid,
+            (int)atomic_load_explicit(&ctx->tid, memory_order_relaxed),
+            ctx->hook_depth, ctx->in_hook, ctx->tool_internal,
+            ctx->in_capture, ctx->raw_resolving);
+        if (dlen > 0 && dlen < (int)sizeof(dbuf))
+            MTT_LOG_INFO(dbuf, (size_t)dlen);
         ctx->hook_depth = 0;
     }
-#if defined(__aarch64__)
-    else if (ctx->hook_depth > 0) {
-        /* ARM64:depth>0 + 三标志全=0 时,用 LR 区分残留 vs 嵌套。
-         * LR 在工具 .so → 工具内部嵌套 → 保留 SKIP。
-         * LR 不在工具 .so(业务代码/libc)→ depth 残留 → 重置 depth=0。
-         *   - 业务直接调 malloc(LR 在业务代码):重置 → 追踪 ✓
-         *   - libc 嵌套(dlsym/backtrace 之外,LR 在 libc):重置 →
-         *     追踪但 entry 会被 free 移除(临时分配,不是泄漏)。
-         * init 前(g_tool_lo=0)不检测,保守 SKIP。
-         * 只重置 depth,不动 in_hook(避免破坏外层 hook 状态)。 */
-        if (!ctx->raw_resolving && !ctx->in_capture && !ctx->tool_internal) {
-            void *lr = __builtin_return_address(0);
-            uintptr_t lo = atomic_load_explicit(&g_tool_lo, memory_order_relaxed);
-            uintptr_t hi = atomic_load_explicit(&g_tool_hi, memory_order_relaxed);
-            if (lo != 0 && !((uintptr_t)lr >= lo && (uintptr_t)lr < hi)) {
-                ctx->hook_depth = 0;
-            }
-        }
-    }
-#endif
     return ctx->hook_depth;
 }
 
@@ -243,29 +217,6 @@ void* malloc(size_t size)
     {
         int depth = mtt_hook_enter();
         if (depth > 0) {
-#if defined(__aarch64__)
-            if (depth > 0) {
-                mtt_per_thread_t *__rctx = mtt_thread_get_cached();
-                if (__rctx != NULL && !__rctx->raw_resolving &&
-                    !__rctx->in_capture && !__rctx->tool_internal) {
-                    void *__lr = __builtin_return_address(0);
-                    Dl_info __di;
-                    int __in_tool = 0;
-                    int __dl_ok = dladdr(__lr, &__di);
-                    if (__dl_ok && __di.dli_fname != NULL)
-                        __in_tool = (strstr(__di.dli_fname, "libmemorytracetool") != NULL);
-                    /* 诊断:看 LR 检测执行了没有 */
-                    MTT_TRACE(size, "LR_CHECK lr=%p dl_ok=%d in_tool=%d fname=%s",
-                              __lr, __dl_ok, __in_tool,
-                              (__dl_ok && __di.dli_fname) ? __di.dli_fname : "(null)");
-                    if (!__in_tool) {
-                        __rctx->hook_depth = 0;
-                        depth = 0;
-                    }
-                }
-            }
-#endif
-            if (depth > 0) {
             /* 诊断:depth > 0 时输出完整上下文(等级 1),定位 depth 残留源头。
              * 只在 TRACE 跟踪 size 时输出,避免污染日志。 */
             if (MTT_TRACE_TARGET(size)) {
@@ -294,7 +245,6 @@ void* malloc(size_t size)
             MTT_TRACE(size, "SKIP reason=recursion depth=%d", depth);
             mtt_resolve_raw_allocators();
             return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
-            }
         }
     }
     mtt_per_thread_t *ctx = mtt_thread_get_cached();
