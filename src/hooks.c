@@ -54,6 +54,48 @@ static _Atomic int g_first_free_diag    = 1;
 static _Atomic int g_first_calloc_diag  = 1;
 static _Atomic int g_first_realloc_diag = 1;
 
+/* ---- 全流程跟踪(定位"特定 size 的 malloc 被吞"问题) ----
+ * MTT_TRACE_SIZE 环境变量指定要跟踪的 size(默认 0=不跟踪)。
+ * 等级 1 输出,业务每次该 size 的 malloc 都打印一行流程日志:
+ *   [MTT] TRACE64 enter LR=0xAAA
+ *   [MTT] TRACE64 SKIP reason=recursion depth=N
+ *   [MTT] TRACE64 ptr=0xBBB entry=0xCCC frames=N
+ *   [MTT] TRACE64 added bucket=N entry_count=M
+ */
+static size_t g_trace_size = 0;
+static _Atomic int g_trace_resolved = 0;
+
+/* 首次调用时解析 MTT_TRACE_SIZE 环境变量(默认 0=不跟踪) */
+static inline void mtt_resolve_trace_size(void)
+{
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&g_trace_resolved, &expected, 1)) {
+        const char *env = getenv("MTT_TRACE_SIZE");
+        if (env != NULL) {
+            int ts = atoi(env);
+            if (ts > 0) g_trace_size = (size_t)ts;
+        }
+    }
+}
+
+#define MTT_TRACE_TARGET(size) \
+    ((size) == g_trace_size && g_trace_size > 0 && \
+     atomic_load_explicit(&mtt_debug_level, memory_order_relaxed) >= 1)
+
+#define MTT_TRACE(size, fmt, ...) \
+    do { \
+        if (MTT_TRACE_TARGET(size)) { \
+            char __buf[256]; \
+            int __n = snprintf(__buf, sizeof(__buf), \
+                "[MTT] TRACE%zu " fmt "\n", \
+                (size_t)(size), ##__VA_ARGS__); \
+            if (__n > 0) { \
+                if (__n >= (int)sizeof(__buf)) __n = (int)sizeof(__buf) - 1; \
+                MTT_DIAG_WRITE(STDERR_FILENO, __buf, (size_t)__n); \
+            } \
+        } \
+    } while (0)
+
 /** 仅在首次调用时输出诊断（确认 hook 被调用，受 MTT_DEBUG 控制）。
  * 直接读环境变量,不依赖 mtt_debug_level(后者在 init 阶段2 才设置,
  * 而 first_call 通常在 init 之前触发)。
@@ -147,11 +189,14 @@ void* malloc(size_t size)
 {
     /* 首次调用诊断 */
     first_call_diag("malloc", &g_first_malloc_diag, 20);
+    mtt_resolve_trace_size();
+    MTT_TRACE(size, "enter LR=%p", __builtin_return_address(0));
 
     /* 递归保护：__thread 深度计数器（哨兵自动修正脏值） */
     {
         int depth = mtt_hook_enter();
         if (depth > 0) {
+            MTT_TRACE(size, "SKIP reason=recursion depth=%d", depth);
             mtt_resolve_raw_allocators();
             return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
         }
@@ -160,6 +205,7 @@ void* malloc(size_t size)
     if (ctx == NULL) {
         /* 槽位满(512 上限):降级透传,不追踪。
          * MTT_DEBUG=2 时输出 S25,定位"线程太多导致泄漏丢失"场景 */
+        MTT_TRACE(size, "SKIP reason=ctx_null(slot full)");
         mtt_log_stage(25, "malloc ctx==NULL (slot full) size=%zu, NOT tracking", size);
         mtt_resolve_raw_allocators();
         return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
@@ -174,6 +220,7 @@ void* malloc(size_t size)
      * LR 在黑名单库内(lmdb/XML 等),跳过追踪,直接 raw_malloc。
      * 节省 8.5μs/次抓栈开销。用户未配置时几乎零开销(一次 atomic load)。 */
     if (MTT_LR_IN_BLACKLIST()) {
+        MTT_TRACE(size, "SKIP reason=blacklist LR=%p", __builtin_return_address(0));
         void *ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
         mtt_hook_dec_depth();
         ctx->in_hook = saved_hook;
@@ -182,6 +229,7 @@ void* malloc(size_t size)
 
     /* 工具内部线程（reporter/HTTP）：直接透传，不追踪 */
     if (ctx->tool_internal) {
+        MTT_TRACE(size, "SKIP reason=tool_internal(tid 复用残留?)");
         void *ret = (raw_malloc != NULL) ? raw_malloc(size) : NULL;
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
@@ -208,12 +256,14 @@ void* malloc(size_t size)
 
     /* 启动阶段宽限：跳过追踪，直接透传 */
     if (s != NULL && mtt_is_startup_phase(s)) {
+        MTT_TRACE(size, "SKIP reason=startup_phase");
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
         return ret;
     }
     if (s == NULL) {
+        MTT_TRACE(size, "SKIP reason=state_null");
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
@@ -222,6 +272,7 @@ void* malloc(size_t size)
 
     /* 紧急禁用：直接透传 */
     if (atomic_load_explicit(&s->disabled, memory_order_acquire)) {
+        MTT_TRACE(size, "SKIP reason=disabled(黑名单自检误判?)");
         void *ret = raw_malloc(size);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
@@ -236,12 +287,15 @@ void* malloc(size_t size)
         return NULL;
     }
     mtt_log_stage(26, "malloc raw_malloc done ptr=%p size=%zu", ptr, size);
+    MTT_TRACE(size, "raw_malloc done ptr=%p", ptr);
 
     /* 采样与容量检查（不满足条件则放行不追踪） */
     {
         int track_ok = mtt_should_track(s, size);
         int over_cap = mtt_is_over_capacity(s);
         if (!track_ok || over_cap) {
+            MTT_TRACE(size, "SKIP reason=sample/overcap track_ok=%d over_cap=%d",
+                      track_ok, over_cap);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
             return ptr;
@@ -252,11 +306,15 @@ void* malloc(size_t size)
     /* 创建追踪记录（内部使用 raw_malloc） */
     mtt_entry_t *e = mtt_entry_new(ptr, size);
     if (e == NULL) {
+        MTT_TRACE(size, "SKIP reason=entry_new_failed(ptr=%p)", ptr);
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
         return ptr; /* 追踪失败不阻塞业务 */
     }
     mtt_log_stage(28, "malloc entry_new done e=%p frames=%d", (void*)e, e->stack_frames);
+    MTT_TRACE(size, "entry_new done entry=%p frames=%d first=%p",
+              (void*)e, e->stack_frames,
+              e->stack_frames > 0 ? e->stack[0] : NULL);
 
     /* 持锁插入哈希表 + 原子更新计数器 */
     mtt_stripe_lock(s, ptr);
@@ -266,6 +324,7 @@ void* malloc(size_t size)
      * 与其他线程的 free 路径竞争 entry->next 指针,可能 UAF 或双释放。
      * 与 tracker.c:mtt_malloc 路径保持一致的简单跳过策略。 */
     if (atomic_load_explicit(&s->entry_count, memory_order_relaxed) >= MTT_MAX_ENTRIES) {
+        MTT_TRACE(size, "SKIP reason=overcap(entry_count>=MAX)");
         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
         mtt_stripe_unlock(s, ptr);
         mtt_entry_discard(s, e);
@@ -301,6 +360,10 @@ void* malloc(size_t size)
     mtt_entry_add(s, e);
     mtt_stripe_unlock(s, ptr);
     mtt_log_stage(29, "malloc entry_add done, returning ptr=%p", ptr);
+    MTT_TRACE(size, "ADDED entry=%p ptr=%p alloc_num=%llu frames=%d",
+              (void*)e, ptr,
+              (unsigned long long)e->alloc_num,
+              e->stack_frames);
 
     mtt_hook_dec_depth();
     ctx->in_hook = saved_hook;
