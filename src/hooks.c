@@ -244,16 +244,21 @@ void* malloc(size_t size)
         int depth = mtt_hook_enter();
         if (depth > 0) {
 #if defined(__aarch64__)
-            /* ARM64:在 malloc 上下文取 LR(一定是业务调用点,不受 inline 影响)。
-             * depth>0 + 三标志全=0 + LR 不在工具 .so → depth 残留,重置。 */
             if (depth > 0) {
                 mtt_per_thread_t *__rctx = mtt_thread_get_cached();
                 if (__rctx != NULL && !__rctx->raw_resolving &&
                     !__rctx->in_capture && !__rctx->tool_internal) {
                     void *__lr = __builtin_return_address(0);
-                    uintptr_t __lo = atomic_load_explicit(&g_tool_lo, memory_order_relaxed);
-                    uintptr_t __hi = atomic_load_explicit(&g_tool_hi, memory_order_relaxed);
-                    if (__lo != 0 && !((uintptr_t)__lr >= __lo && (uintptr_t)__lr < __hi)) {
+                    Dl_info __di;
+                    int __in_tool = 0;
+                    int __dl_ok = dladdr(__lr, &__di);
+                    if (__dl_ok && __di.dli_fname != NULL)
+                        __in_tool = (strstr(__di.dli_fname, "libmemorytracetool") != NULL);
+                    /* 诊断:看 LR 检测执行了没有 */
+                    MTT_TRACE(size, "LR_CHECK lr=%p dl_ok=%d in_tool=%d fname=%s",
+                              __lr, __dl_ok, __in_tool,
+                              (__dl_ok && __di.dli_fname) ? __di.dli_fname : "(null)");
+                    if (!__in_tool) {
                         __rctx->hook_depth = 0;
                         depth = 0;
                     }
