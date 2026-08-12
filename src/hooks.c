@@ -22,6 +22,7 @@
 #define _GNU_SOURCE
 #include "mtt_internal.h"
 #include "per_thread.h"
+#include "addr_validate.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -134,16 +135,22 @@ static void first_call_diag(const char *func_name, _Atomic int *flag, int stage_
 /** 获取当前 hook 调用深度，首次调用时自动修正脏值。
  * 若槽位满返回 -1（降级：视为递归，直接透传 raw_*）。
  *
- * 残留检测(三重防御,覆盖所有已知残留来源):
+ * ARM32 / x86_64:三重防御(保持原状,不动)
  *   1. depth_inited != 0x2A:首次访问,初始化为 0
- *   2. hook_depth > MTT_HOOK_DEPTH_MAX(8):明显脏值,重置(e1ce48d 原逻辑)
- *   3. hook_depth > 0 && in_hook == 0:不可能的正常状态,必为残留
- *      正常路径:inc_depth 后立刻设 in_hook=1,dec_depth 时同时恢复 in_hook=0。
- *      所以 hook_depth > 0 时 in_hook 必为 1。否则:
- *        - TID 复用残留(线程 A 退出后 hook_depth=1 残留,B 复用 A 的 TID)
- *        - TLS 缓存跨线程污染(ARM64 __thread 不可靠,B 拿到 A 的 ctx)
- *        - 上次 hook 异常退出(inc 后线程被 cancel)
- *      全部重置为 0,恢复追踪。 */
+ *   2. hook_depth > MTT_HOOK_DEPTH_MAX(8):明显脏值,重置(e1ce48d)
+ *   3. hook_depth > 0 && in_hook == 0:不可能状态,残留(e4c1eb5)
+ *
+ * ARM64:加第 4 重 LR 残留检测(本次新增,架构宏隔离)
+ *   4. hook_depth > 0 && LR 不在 libmemorytracetool.so 内:残留
+ *      正常嵌套(dlsym/libunwind 等工具内部调 malloc)的 LR 必在
+ *      libmemorytracetool.so 内。业务直接调 malloc 时 LR 在主程序或
+ *      业务 .so,此时 depth > 0 必然是上次 hook 异常退出残留。
+ *      用户实测铁证:
+ *        TRACE64 SKIP recursion depth=1 real_tid=849 slot_tid=849
+ *          in_hook=1 tool_internal=0 in_capture=0 raw_resolving=0
+ *          LR=0x55690fb450(主程序地址)
+ *      in_hook=1 + 业务 LR = 残留(不是工具内部嵌套)。
+ *      ARM32 不需要此检测(__thread 可靠,实测正常)。 */
 static inline int mtt_hook_enter(void)
 {
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get_cached();
@@ -154,23 +161,29 @@ static inline int mtt_hook_enter(void)
     } else if (ctx->hook_depth > MTT_HOOK_DEPTH_MAX) {
         /* 脏值超过合理上限:重置 */
         ctx->hook_depth = 0;
+        ctx->in_hook = 0;
     } else if (ctx->hook_depth > 0 && !ctx->in_hook) {
-        /* 关键残留检测:depth > 0 但 in_hook=0,正常情况不可能。
-         * 必是 TID 复用 / TLS 跨线程污染 / 异常退出。重置恢复追踪。
-         * 输出详细上下文定位源头(等级 1)。 */
-        pid_t real_tid = (pid_t)syscall(SYS_gettid);
-        char dbuf[192];
-        int dlen = snprintf(dbuf, sizeof(dbuf),
-            "[MTT] DEPTH_RESIDUAL real_tid=%d slot.tid=%d depth=%d in_hook=%d "
-            "tool_internal=%d in_capture=%d raw_resolving=%d\n",
-            (int)real_tid,
-            (int)atomic_load_explicit(&ctx->tid, memory_order_relaxed),
-            ctx->hook_depth, ctx->in_hook, ctx->tool_internal,
-            ctx->in_capture, ctx->raw_resolving);
-        if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_LOG_INFO(dbuf, (size_t)dlen);
+        /* e4c1eb5: depth > 0 + in_hook=0 不可能,残留 */
         ctx->hook_depth = 0;
     }
+#if defined(__aarch64__)
+    else if (ctx->hook_depth > 0) {
+        /* ARM64 only: depth > 0 时通过 LR 区分"工具内部嵌套"vs"残留"。
+         * 工具内部嵌套:LR 在 libmemorytracetool.so 内(dlsym/libunwind 等)
+         * 残留:LR 在业务代码内(主程序或业务 .so),depth 应该=0。
+         * 用 mtt_addr_libname(二分查找静态数组,无 malloc 无锁)判断。
+         * ARM32 __thread 可靠 + 实测正常,不需要此检测。 */
+        void *lr = __builtin_return_address(0);
+        const char *libname = mtt_addr_libname(lr);
+        int is_tool_lr = (libname != NULL &&
+                          strstr(libname, "libmemorytracetool") != NULL);
+        if (!is_tool_lr) {
+            /* 业务调用点 + depth > 0 → 残留,重置 */
+            ctx->hook_depth = 0;
+            ctx->in_hook = 0;
+        }
+    }
+#endif
     return ctx->hook_depth;
 }
 
