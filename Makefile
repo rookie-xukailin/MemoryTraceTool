@@ -29,15 +29,8 @@ endif
 
 CORE_CFLAGS = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
 
-# libunwind 静态链接开关(默认关闭):
-#   MTT_LIBUNWIND_STATIC=1: ARM32 用,链接 libunwind.a,启用 libunwind 集成
-#   默认(空): ARM64 / 本机用,不链接 libunwind,unwind_libunwind.c 走空实现,
-#             capture_stack 自然走 glibc backtrace
-# 原因:libunwind 静态链接(dd1145f)会破坏 glibc backtrace(bt_test 实测验证,
-# 挂工具后 n=0)。ARM64 + 业务 .eh_frame 上 glibc backtrace 本来就工作正常,
-# 不需要 libunwind。ARM32 -fomit-frame-pointer 业务上 glibc backtrace 拿不到
-# 深栈,必须用 libunwind。
-MTT_LIBUNWIND_STATIC ?=
+# libunwind 静态链接:所有平台默认链接(BMC ARM64 glibc backtrace 失效,必须用 libunwind)
+MTT_LIBUNWIND_STATIC ?= 1
 
 ifeq ($(MTT_LIBUNWIND_STATIC),1)
     LIBUNWIND_DEFINES = -DMTT_STATIC_LIBUNWIND
