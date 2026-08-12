@@ -137,28 +137,27 @@ static __thread pid_t mtt_tls_cached_tid = 0;
 static inline mtt_per_thread_t* mtt_thread_get_cached(void)
 {
 #if defined(__aarch64__)
-    /* ARM64:__thread 在 LD_PRELOAD 场景下不可靠(可能跨线程共享返回脏值)。
-     * 现象:线程 B 读到线程 A 的 TLS 缓存,三重校验(c != NULL + cached_tid
-     * == slot->tid + 槽位 tid 匹配)全部通过,但 B 实际拿到 A 的 ctx,
-     * 误读 A 的 hook_depth 残留 → B 的所有 malloc 被递归保护吞掉,
-     * 表现为 site 数暴跌、看不到 main、TRACE64 显示 SKIP reason=recursion。
+    /* ARM64:完全绕开 TLS 缓存,每次走 syscall(SYS_gettid) + 扫槽。
      *
-     * 修复:不信任 TLS 缓存的 tid,用 syscall(SYS_gettid) 拿内核真实 tid,
-     * 与 TLS 缓存 + 槽位 tid 三方比对。TLS 不一致时回退慢路径重扫。
+     * 历史背景:fa87bb8 引入 TLS 缓存(__thread mtt_tls_ctx / cached_tid)优化
+     * 性能,但本文件首部注释自承认"某些 ARM64 设备 __thread 不可靠"。fa87bb8
+     * 之后 BMC ARM64 storageManager 实测出现主进程 malloc 全部被 SKIP(误判
+     * 为递归),site 数从 200+ 跌到 30+。
      *
-     * 开销:每次 hook_enter 加 1 次 syscall(~100ns ARM64),正确性必需。
-     * 详见 commits fa87bb8(引入 TLS 缓存) + 9c607ab/storageManager 实测现象。 */
-    mtt_per_thread_t *c = mtt_tls_ctx;
-    pid_t my_real_tid = (pid_t)syscall(SYS_gettid);
-    if (c != NULL && mtt_tls_cached_tid == my_real_tid &&
-            atomic_load_explicit(&c->tid, memory_order_relaxed) == my_real_tid)
-        return c;
-    mtt_tls_ctx = mtt_thread_get();
-    mtt_tls_cached_tid = my_real_tid;
-    return mtt_tls_ctx;
+     * 已尝试的渐进修复都不彻底:
+     *   - e6b77fc: TLS 缓存 + syscall 校验(管不到 TID 复用)
+     *   - e4c1eb5: hook_enter 加 in_hook 残留检测(兜底防御)
+     *
+     * 治本方案:ARM64 完全不用 __thread,回到 08fac23 模型(几个月前 ARM64 +
+     * backtrace 工作正常的实现)。代价:每次 hook_enter 加 1 次 syscall + 扫
+     * 512 槽(~1-2μs),但 ARM64 正确性必需。
+     *
+     * ARM32 实测正常,__thread 可靠,见 #else 分支保留 fast path。 */
+    return mtt_thread_get();
 #else
     /* ARM32 / x86_64: __thread 可靠,保留 fa87bb8 的 fast path(无 syscall)。
-     * ARM32 实测 storageManager 表现正常,无需此修复。 */
+     * ARM32 实测 storageManager site 200+ + 能看到 main,完全正常。
+     * 架构宏硬隔离,不影响 ARM32 现有行为。 */
     mtt_per_thread_t *c = mtt_tls_ctx;
     if (c != NULL && mtt_tls_cached_tid ==
             atomic_load_explicit(&c->tid, memory_order_relaxed))
