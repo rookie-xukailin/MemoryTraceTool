@@ -439,6 +439,16 @@ void mtt_capture_stack(mtt_entry_t *entry)
             entry->stack_frames = n;
             ctx->in_capture = saved;
             mtt_log_stage(72, "capture_stack done via libunwind frames=%d", n);
+            /* 浅栈警告(等级 1 可见,定位"看不到 main / site 少"问题) */
+            if (n < 4) {
+                char wbuf[160];
+                int wlen = snprintf(wbuf, sizeof(wbuf),
+                    "[MTT] shallow stack: frames=%d mode=%d path=libunwind first=%p\n",
+                    n, g_unwinder_mode,
+                    n > 0 ? entry->stack[0] : NULL);
+                if (wlen > 0 && wlen < (int)sizeof(wbuf))
+                    MTT_LOG_INFO(wbuf, (size_t)wlen);
+            }
             return;
         }
         /* n < 2:重新检查 disabled,因为 mtt_libunwind_capture 内可能刚 mark */
@@ -526,6 +536,18 @@ void mtt_capture_stack(mtt_entry_t *entry)
                 entry->stack[i] = fp_stack[i];
             entry->stack_frames = fp_count;
         }
+    }
+
+    /* 浅栈警告(等级 1 可见):frames<4 时输出,定位"看不到 main / site 少"问题。
+     * 出口路径:backtrace 成功或 FP chain 兜底(覆盖 libunwind 失败 fallback 场景)。 */
+    if (entry->stack_frames < 4) {
+        char wbuf[160];
+        int wlen = snprintf(wbuf, sizeof(wbuf),
+            "[MTT] shallow stack: frames=%d mode=%d path=backtrace/fp first=%p\n",
+            entry->stack_frames, g_unwinder_mode,
+            entry->stack_frames > 0 ? entry->stack[0] : NULL);
+        if (wlen > 0 && wlen < (int)sizeof(wbuf))
+            MTT_LOG_INFO(wbuf, (size_t)wlen);
     }
 
     ctx->in_capture = saved;
