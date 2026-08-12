@@ -260,6 +260,6 @@ sysroot-arm32:
 demo_small_leak: $(SHARED_LIB) examples/demo_small_leak.c | $(OUTPUT_DIR)
 	$(CC) $(CFLAGS) -o $(OUTPUT_DIR)/demo_small_leak examples/demo_small_leak.c
 
-# bt_test:综合 backtrace 诊断(依赖 pthread,9 场景遍历)
+# bt_test:综合 backtrace 诊断(纯单线程,7 场景遍历)
 bt_test: examples/bt_test.c | $(OUTPUT_DIR)
-	$(CC) $(CFLAGS) -pthread -o $(OUTPUT_DIR)/bt_test examples/bt_test.c
+	$(CC) $(CFLAGS) -o $(OUTPUT_DIR)/bt_test examples/bt_test.c
