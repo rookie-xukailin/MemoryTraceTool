@@ -260,7 +260,6 @@ sysroot-arm32:
 demo_small_leak: $(SHARED_LIB) examples/demo_small_leak.c | $(OUTPUT_DIR)
 	$(CC) $(CFLAGS) -o $(OUTPUT_DIR)/demo_small_leak examples/demo_small_leak.c
 
-# bt_test:最小 backtrace 验证(不依赖工具 .so,纯 glibc backtrace 测试)
-# 用途:确认目标平台 glibc backtrace 本身能否工作,排除工具干扰
+# bt_test:综合 backtrace 诊断(依赖 pthread,9 场景遍历)
 bt_test: examples/bt_test.c | $(OUTPUT_DIR)
-	$(CC) $(CFLAGS) -o $(OUTPUT_DIR)/bt_test examples/bt_test.c
+	$(CC) $(CFLAGS) -o $(OUTPUT_DIR)/bt_test examples/bt_test.c -lpthread
