@@ -243,6 +243,24 @@ void* malloc(size_t size)
     {
         int depth = mtt_hook_enter();
         if (depth > 0) {
+#if defined(__aarch64__)
+            /* ARM64:在 malloc 上下文取 LR(一定是业务调用点,不受 inline 影响)。
+             * depth>0 + 三标志全=0 + LR 不在工具 .so → depth 残留,重置。 */
+            if (depth > 0) {
+                mtt_per_thread_t *__rctx = mtt_thread_get_cached();
+                if (__rctx != NULL && !__rctx->raw_resolving &&
+                    !__rctx->in_capture && !__rctx->tool_internal) {
+                    void *__lr = __builtin_return_address(0);
+                    uintptr_t __lo = atomic_load_explicit(&g_tool_lo, memory_order_relaxed);
+                    uintptr_t __hi = atomic_load_explicit(&g_tool_hi, memory_order_relaxed);
+                    if (__lo != 0 && !((uintptr_t)__lr >= __lo && (uintptr_t)__lr < __hi)) {
+                        __rctx->hook_depth = 0;
+                        depth = 0;
+                    }
+                }
+            }
+#endif
+            if (depth > 0) {
             /* 诊断:depth > 0 时输出完整上下文(等级 1),定位 depth 残留源头。
              * 只在 TRACE 跟踪 size 时输出,避免污染日志。 */
             if (MTT_TRACE_TARGET(size)) {
@@ -271,6 +289,7 @@ void* malloc(size_t size)
             MTT_TRACE(size, "SKIP reason=recursion depth=%d", depth);
             mtt_resolve_raw_allocators();
             return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
+            }
         }
     }
     mtt_per_thread_t *ctx = mtt_thread_get_cached();
