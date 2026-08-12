@@ -121,6 +121,7 @@ $(LIBUNWIND_STATIC): $(LIBUNWIND_SRC)/configure
 	        --disable-minidebuginfo \
 	        --disable-zlibdebuginfo \
 	        --disable-documentation \
+	        --disable-weak-backtrace \
 	        CC="$(CC)" CFLAGS="$(ARCH_FLAGS) -O2 -fPIC -fno-omit-frame-pointer"
 	$(MAKE) -C $(LIBUNWIND_BUILD) -j4 V=0
 
