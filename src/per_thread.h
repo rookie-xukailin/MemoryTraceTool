@@ -136,6 +136,29 @@ static __thread pid_t mtt_tls_cached_tid = 0;
 
 static inline mtt_per_thread_t* mtt_thread_get_cached(void)
 {
+#if defined(__aarch64__)
+    /* ARM64:__thread 在 LD_PRELOAD 场景下不可靠(可能跨线程共享返回脏值)。
+     * 现象:线程 B 读到线程 A 的 TLS 缓存,三重校验(c != NULL + cached_tid
+     * == slot->tid + 槽位 tid 匹配)全部通过,但 B 实际拿到 A 的 ctx,
+     * 误读 A 的 hook_depth 残留 → B 的所有 malloc 被递归保护吞掉,
+     * 表现为 site 数暴跌、看不到 main、TRACE64 显示 SKIP reason=recursion。
+     *
+     * 修复:不信任 TLS 缓存的 tid,用 syscall(SYS_gettid) 拿内核真实 tid,
+     * 与 TLS 缓存 + 槽位 tid 三方比对。TLS 不一致时回退慢路径重扫。
+     *
+     * 开销:每次 hook_enter 加 1 次 syscall(~100ns ARM64),正确性必需。
+     * 详见 commits fa87bb8(引入 TLS 缓存) + 9c607ab/storageManager 实测现象。 */
+    mtt_per_thread_t *c = mtt_tls_ctx;
+    pid_t my_real_tid = (pid_t)syscall(SYS_gettid);
+    if (c != NULL && mtt_tls_cached_tid == my_real_tid &&
+            atomic_load_explicit(&c->tid, memory_order_relaxed) == my_real_tid)
+        return c;
+    mtt_tls_ctx = mtt_thread_get();
+    mtt_tls_cached_tid = my_real_tid;
+    return mtt_tls_ctx;
+#else
+    /* ARM32 / x86_64: __thread 可靠,保留 fa87bb8 的 fast path(无 syscall)。
+     * ARM32 实测 storageManager 表现正常,无需此修复。 */
     mtt_per_thread_t *c = mtt_tls_ctx;
     if (c != NULL && mtt_tls_cached_tid ==
             atomic_load_explicit(&c->tid, memory_order_relaxed))
@@ -144,6 +167,7 @@ static inline mtt_per_thread_t* mtt_thread_get_cached(void)
     mtt_tls_cached_tid = (mtt_tls_ctx != NULL)
         ? atomic_load_explicit(&mtt_tls_ctx->tid, memory_order_relaxed) : 0;
     return mtt_tls_ctx;
+#endif
 }
 
 #endif /* MTT_PER_THREAD_H */
