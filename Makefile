@@ -71,11 +71,11 @@ LIB_OBJS = $(BUILD_DIR)/hooks.o $(BUILD_DIR)/tracker.o \
 SHARED_LIB = $(OUTPUT_DIR)/libmemorytracetool.so
 
 .PHONY: all clean distclean demo demo_preload demo_long_running demo_controlled_leak \
-        test test_stability test_all sysroot-arm32 vendor-clean
+        test test_stability test_all sysroot-arm32 vendor-clean bt_test
 
 # 默认目标必须出现在所有 .o/.a 构建规则之前,否则 make 无参数时
 # 会把第一个非 .PHONY 文件目标当作默认
-all: $(SHARED_LIB)
+all: $(SHARED_LIB) bt_test
 
 # ---- libunwind 静态库构建 ----
 # open/libunwind 是 vendored libunwind v1.8.2 源码(MIT 许可,随项目分发)。
@@ -219,3 +219,8 @@ sysroot-arm32:
 
 demo_small_leak: $(SHARED_LIB) examples/demo_small_leak.c | $(OUTPUT_DIR)
 	$(CC) $(CFLAGS) -o $(OUTPUT_DIR)/demo_small_leak examples/demo_small_leak.c
+
+# bt_test:最小 backtrace 验证(不依赖工具 .so,纯 glibc backtrace 测试)
+# 用途:确认目标平台 glibc backtrace 本身能否工作,排除工具干扰
+bt_test: examples/bt_test.c | $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) -o $(OUTPUT_DIR)/bt_test examples/bt_test.c
