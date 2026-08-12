@@ -164,6 +164,7 @@ void mtt_init_tool_range(void)
  *        - TLS 缓存跨线程污染(ARM64 __thread 不可靠,B 拿到 A 的 ctx)
  *        - 上次 hook 异常退出(inc 后线程被 cancel)
  *      全部重置为 0,恢复追踪。 */
+__attribute__((always_inline))
 static inline int mtt_hook_enter(void)
 {
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get_cached();
