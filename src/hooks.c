@@ -134,11 +134,16 @@ static void first_call_diag(const char *func_name, _Atomic int *flag, int stage_
 /** 获取当前 hook 调用深度，首次调用时自动修正脏值。
  * 若槽位满返回 -1（降级：视为递归，直接透传 raw_*）。
  *
- * TID 复用残留修正:槽位永不清零,线程池场景下线程 A 退出后槽位保留
- * A 的 hook_depth 残留值,内核回收 A 的 TID 后被新线程 B 复用,
- * B 命中旧槽位会拿到 A 残留的 hook_depth(>0) → 永远走递归透传分支,
- * B 的所有 malloc 静默丢失。当 depth_inited 已初始化(0x2A)但
- * hook_depth 超过合理上限(MTT_HOOK_DEPTH_MAX)时,判定为残留,重置为 0。 */
+ * 残留检测(三重防御,覆盖所有已知残留来源):
+ *   1. depth_inited != 0x2A:首次访问,初始化为 0
+ *   2. hook_depth > MTT_HOOK_DEPTH_MAX(8):明显脏值,重置(e1ce48d 原逻辑)
+ *   3. hook_depth > 0 && in_hook == 0:不可能的正常状态,必为残留
+ *      正常路径:inc_depth 后立刻设 in_hook=1,dec_depth 时同时恢复 in_hook=0。
+ *      所以 hook_depth > 0 时 in_hook 必为 1。否则:
+ *        - TID 复用残留(线程 A 退出后 hook_depth=1 残留,B 复用 A 的 TID)
+ *        - TLS 缓存跨线程污染(ARM64 __thread 不可靠,B 拿到 A 的 ctx)
+ *        - 上次 hook 异常退出(inc 后线程被 cancel)
+ *      全部重置为 0,恢复追踪。 */
 static inline int mtt_hook_enter(void)
 {
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get_cached();
@@ -147,7 +152,11 @@ static inline int mtt_hook_enter(void)
         ctx->hook_depth = 0;
         ctx->depth_inited = 0x2A;
     } else if (ctx->hook_depth > MTT_HOOK_DEPTH_MAX) {
-        /* TID 复用残留:清零,恢复追踪 */
+        /* 脏值超过合理上限:重置 */
+        ctx->hook_depth = 0;
+    } else if (ctx->hook_depth > 0 && !ctx->in_hook) {
+        /* 关键残留检测:depth > 0 但 in_hook=0,正常情况不可能。
+         * 必是 TID 复用 / TLS 跨线程污染 / 异常退出。重置恢复追踪。 */
         ctx->hook_depth = 0;
     }
     return ctx->hook_depth;
