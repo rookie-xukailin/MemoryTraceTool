@@ -1535,6 +1535,11 @@ void mtt_ensure_init(void)
     static pthread_once_t g_fork_init = PTHREAD_ONCE_INIT;
     pthread_once(&g_fork_init, mtt_register_fork_handlers);
 
+#if defined(__aarch64__)
+    extern void mtt_init_tool_range(void);
+    mtt_init_tool_range();
+#endif
+
     mtt_log_stage(15, "mtt_ensure_init done");
 }
 

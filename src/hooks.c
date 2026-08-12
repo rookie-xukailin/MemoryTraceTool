@@ -22,6 +22,7 @@
 #define _GNU_SOURCE
 #include "mtt_internal.h"
 #include "per_thread.h"
+#include <dlfcn.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -131,6 +132,24 @@ static void first_call_diag(const char *func_name, _Atomic int *flag, int stage_
 /* 深度计数器已迁移至 per_thread.h 槽位数组。
  * mtt_hook_enter/inc/dec 内部通过 mtt_thread_get() 访问。 */
 
+#if defined(__aarch64__)
+/* ARM64: 工具 .so 地址范围(init 阶段填充,malloc SKIP 路径纯比较)。
+ * 用于区分"业务直接调"(LR 在业务代码 → depth 残留 → 重置)
+ * vs "工具内部嵌套"(LR 在工具 .so → 保留 SKIP)。 */
+static _Atomic uintptr_t g_tool_lo = 0;
+static _Atomic uintptr_t g_tool_hi = 0;
+
+void mtt_init_tool_range(void)
+{
+    Dl_info info;
+    if (dladdr((void*)&mtt_init_tool_range, &info) && info.dli_fbase) {
+        uintptr_t base = (uintptr_t)info.dli_fbase;
+        atomic_store_explicit(&g_tool_lo, base, memory_order_relaxed);
+        atomic_store_explicit(&g_tool_hi, base + (1 << 20), memory_order_relaxed);
+    }
+}
+#endif
+
 /** 获取当前 hook 调用深度，首次调用时自动修正脏值。
  * 若槽位满返回 -1（降级：视为递归，直接透传 raw_*）。
  *
@@ -217,34 +236,32 @@ void* malloc(size_t size)
     {
         int depth = mtt_hook_enter();
         if (depth > 0) {
-            /* 诊断:depth > 0 时输出完整上下文(等级 1),定位 depth 残留源头。
-             * 只在 TRACE 跟踪 size 时输出,避免污染日志。 */
-            if (MTT_TRACE_TARGET(size)) {
-                mtt_per_thread_t *__diag_ctx = mtt_thread_get_cached();
-                pid_t __real_tid = (__diag_ctx != NULL) ?
-                    (pid_t)syscall(SYS_gettid) : 0;
-                int __slot_tid = (__diag_ctx != NULL) ?
-                    (int)atomic_load_explicit(&__diag_ctx->tid, memory_order_relaxed) : 0;
-                int __in_hook = (__diag_ctx != NULL) ? __diag_ctx->in_hook : -1;
-                int __tool = (__diag_ctx != NULL) ? __diag_ctx->tool_internal : -1;
-                int __in_cap = (__diag_ctx != NULL) ? __diag_ctx->in_capture : -1;
-                int __raw_res = (__diag_ctx != NULL) ? __diag_ctx->raw_resolving : -1;
-                char __buf[256];
-                int __n = snprintf(__buf, sizeof(__buf),
-                    "[MTT] TRACE%zu SKIP recursion depth=%d real_tid=%d slot_tid=%d "
-                    "in_hook=%d tool_internal=%d in_capture=%d raw_resolving=%d "
-                    "depth_inited=%d\n",
-                    (size_t)size, depth, (int)__real_tid, __slot_tid,
-                    __in_hook, __tool, __in_cap, __raw_res,
-                    __diag_ctx ? __diag_ctx->depth_inited : -1);
-                if (__n > 0) {
-                    if (__n >= (int)sizeof(__buf)) __n = (int)sizeof(__buf) - 1;
-                    MTT_DIAG_WRITE(STDERR_FILENO, __buf, (size_t)__n);
+#if defined(__aarch64__)
+            /* ARM64:depth>0 可能是残留(BMC 系统级问题)。
+             * 用 in_hook + LR 精确区分:
+             *   in_hook=1 + 三标志全=0 + LR 不在工具 .so → 残留 → 重置,继续追踪
+             *   其他 → 真嵌套 → SKIP
+             * LR 在 malloc 函数体内取(__builtin_return_address(0)),100% 正确。
+             * 重置安全:hook 入口会重新设 in_hook=1,嵌套 malloc 看到 in_hook=1 → SKIP
+             * → 不会死锁(与 ef8fb53 不同:ef8fb53 让嵌套也不 SKIP → entry_new 死锁)。 */
+            mtt_per_thread_t *__rctx = mtt_thread_get_cached();
+            if (__rctx != NULL && __rctx->in_hook &&
+                !__rctx->raw_resolving && !__rctx->in_capture && !__rctx->tool_internal) {
+                void *__lr = __builtin_return_address(0);
+                uintptr_t __lo = atomic_load_explicit(&g_tool_lo, memory_order_relaxed);
+                uintptr_t __hi = atomic_load_explicit(&g_tool_hi, memory_order_relaxed);
+                if (__lo != 0 && !((uintptr_t)__lr >= __lo && (uintptr_t)__lr < __hi)) {
+                    __rctx->in_hook = 0;
+                    __rctx->hook_depth = 0;
+                    depth = 0;
                 }
             }
-            MTT_TRACE(size, "SKIP reason=recursion depth=%d", depth);
-            mtt_resolve_raw_allocators();
-            return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
+#endif
+            if (depth > 0) {
+                MTT_TRACE(size, "SKIP reason=recursion depth=%d", depth);
+                mtt_resolve_raw_allocators();
+                return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
+            }
         }
     }
     mtt_per_thread_t *ctx = mtt_thread_get_cached();
