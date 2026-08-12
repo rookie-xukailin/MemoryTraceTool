@@ -250,7 +250,10 @@ void* malloc(size_t size)
                 void *__lr = __builtin_return_address(0);
                 uintptr_t __lo = atomic_load_explicit(&g_tool_lo, memory_order_relaxed);
                 uintptr_t __hi = atomic_load_explicit(&g_tool_hi, memory_order_relaxed);
-                if (__lo != 0 && !((uintptr_t)__lr >= __lo && (uintptr_t)__lr < __hi)) {
+                int __in_tool = (__lo != 0 && (uintptr_t)__lr >= __lo && (uintptr_t)__lr < __hi);
+                MTT_TRACE(size, "LR_CHECK lr=%p lo=0x%lx hi=0x%lx in_tool=%d",
+                          __lr, (unsigned long)__lo, (unsigned long)__hi, __in_tool);
+                if (__lo != 0 && !__in_tool) {
                     __rctx->in_hook = 0;
                     __rctx->hook_depth = 0;
                     depth = 0;
