@@ -1031,6 +1031,38 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
 
         mtt_capture_stack(e);
         mtt_log_stage(41, "entry_new capture_stack done frames=%d", e->stack_frames);
+
+        /* [临时诊断 D7] capture_stack 结果(前 5 次) — 栈帧数是几?
+         * frames=0 → libunwind/backtrace 都失败,栈信息完全丢失
+         * frames<4 → 浅栈,可能缺少 -funwind-tables
+         * frames>=4 → 正常 */
+        {
+            static _Atomic int g_diag_capture_cnt = 0;
+            int cnt = atomic_fetch_add_explicit(&g_diag_capture_cnt, 1, memory_order_relaxed);
+            if (cnt < 5) {
+                char buf[128];
+                int len = snprintf(buf, sizeof(buf),
+                    "[MTT] DIAG D7 capture result: frames=%d size=%zu unwinder_mode=%d tid=%d",
+                    e->stack_frames, size, g_unwinder_mode, (int)syscall(SYS_gettid));
+                if (len > 0 && len < (int)sizeof(buf)) {
+                    if (e->stack_frames > 0 && e->stack_frames < 8) {
+                        /* 附带前 3 帧的原始地址,帮你判断栈是否包含 main */
+                        int plen = len;
+                        for (int fi = 0; fi < e->stack_frames && fi < 3; fi++) {
+                            int sl = snprintf(buf + plen, sizeof(buf) - plen - 2,
+                                " [%d]=%p", fi, e->stack[fi]);
+                            if (sl > 0 && plen + sl < (int)sizeof(buf) - 2) plen += sl;
+                        }
+                        len = plen;
+                        buf[len++] = '\n';
+                    } else {
+                        buf[len++] = '\n';
+                    }
+                    long _w = write(2, buf, (size_t)len); (void)_w;
+                }
+            }
+        }
+
         return e;
     }
 
