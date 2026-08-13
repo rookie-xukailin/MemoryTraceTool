@@ -1509,6 +1509,31 @@ void mtt_ensure_init(void)
         ctx->tool_internal = saved_tool;
     }
 
+    /* [临时诊断 D5] init 完成时的 depth 快照 — 判断 longjmp 残留在 init 之前还是之后。
+     * 如果这里 depth=1,说明 longjmp 在 init 之前发生(init 期间 libc 初始化)。
+     * 如果 depth=0 但后续 D1 仍然报残留,说明 longjmp 在 init 之后发生。 */
+    {
+        static _Atomic int g_diag_init_logged = 1;
+        int expected = 1;
+        if (atomic_compare_exchange_strong(&g_diag_init_logged, &expected, 0)) {
+            mtt_per_thread_t *dctx = mtt_thread_get_cached();
+            char buf[160];
+            int len = snprintf(buf, sizeof(buf),
+                "[MTT] DIAG D5 init DONE: hook_depth=%d in_hook=%d tool_internal=%d "
+                "initialized=1 tid=%d %s\n",
+                dctx ? dctx->hook_depth : -99,
+                dctx ? dctx->in_hook : -99,
+                dctx ? dctx->tool_internal : -99,
+                (int)syscall(SYS_gettid),
+                (dctx && dctx->hook_depth > 0) ?
+                    "(depth>0 at init completion — residual BEFORE init)" :
+                    "(depth=0 at init completion — clean here)");
+            if (len > 0 && len < (int)sizeof(buf)) {
+                long _w = write(2, buf, (size_t)len); (void)_w;
+            }
+        }
+    }
+
     /* fork handler 由 hooks.c 的 fork() 拦截接管,不再用 pthread_atfork */
     mtt_log_stage(15, "mtt_ensure_init done");
 }
