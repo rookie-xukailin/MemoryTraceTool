@@ -1486,13 +1486,15 @@ void mtt_ensure_init(void)
             else if (p == 0)
                 http_port = 0;
         }
-        mtt_http_server_start(http_port);
-        mtt_log_stage(13, "http server started port=%u", (unsigned)http_port);
-        /* HTTP 启动属关键事件,等级 >= 1 输出(与 Reporter/Signal INFO 对齐) */
+        uint16_t actual_port = mtt_http_server_start(http_port);
+        mtt_log_stage(13, "http server started port=%u", (unsigned)actual_port);
+        /* HTTP 启动属关键事件,等级 >= 1 输出(与 Reporter/Signal INFO 对齐)。
+         * 打印 actual_port(实际 bind 的端口),而非 http_port(环境变量请求值)。
+         * fork 场景下子进程可能 bind 到 port+1 等,需让用户知道实际端口。 */
         {
             char hbuf[96];
             int hlen = snprintf(hbuf, sizeof(hbuf),
-                "[MTT] HTTP server started port=%u\n", (unsigned)http_port);
+                "[MTT] HTTP server started port=%u\n", (unsigned)actual_port);
             if (hlen > 0 && hlen < (int)sizeof(hbuf))
                 MTT_LOG_INFO(hbuf, (size_t)hlen);
         }

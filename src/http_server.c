@@ -699,16 +699,16 @@ static void* http_thread_fn(void *arg)
  *                     公共接口                                              *
  * ======================================================================== */
 
-void mtt_http_server_start(uint16_t port)
+uint16_t mtt_http_server_start(uint16_t port)
 {
-    if (port == 0) return;
-    if (atomic_load_explicit(&g_http_server.running, memory_order_acquire)) return;
+    if (port == 0) return 0;
+    if (atomic_load_explicit(&g_http_server.running, memory_order_acquire)) return g_http_server.port;
 
     /* SIGPIPE 已在 mtt_ensure_init() 中通过 sigaction 全局忽略，
      * 无需在此重复设置。 */
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) return;
+    if (listen_fd < 0) return 0;
     int reuse = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
@@ -724,8 +724,8 @@ void mtt_http_server_start(uint16_t port)
             bound = 1; port = (uint16_t)try_port; break;
         }
     }
-    if (!bound) { close(listen_fd); return; }
-    if (listen(listen_fd, MTT_HTTP_BACKLOG) < 0) { close(listen_fd); return; }
+    if (!bound) { close(listen_fd); return 0; }
+    if (listen(listen_fd, MTT_HTTP_BACKLOG) < 0) { close(listen_fd); return 0; }
 
     g_http_server.listen_fd = listen_fd;
     g_http_server.port = port;
@@ -734,14 +734,19 @@ void mtt_http_server_start(uint16_t port)
     pthread_t tid;
     if (pthread_create(&tid, NULL, http_thread_fn, NULL) != 0) {
         atomic_store_explicit(&g_http_server.running, 0, memory_order_release);
-        close(listen_fd); return;
+        close(listen_fd); return 0;
     }
     g_http_server.thread = tid;
 
-    char diag[128];
-    int len = snprintf(diag, sizeof(diag), "[MTT] HTTP dashboard: http://0.0.0.0:%u/\n", (unsigned)port);
-    if (len > 0 && len < (int)sizeof(diag))
-        MTT_DIAG_LOG(diag, (size_t)len);
+    /* 实际端口可能与请求端口不同(fork 场景:父进程占用了请求端口,
+     * 子进程 bind 到 port+1 等)。用 INFO 等级输出,让用户知道实际地址。 */
+    if (port != 0) {
+        char diag[128];
+        int len = snprintf(diag, sizeof(diag), "[MTT] HTTP dashboard: http://0.0.0.0:%u/\n", (unsigned)port);
+        if (len > 0 && len < (int)sizeof(diag))
+            MTT_LOG_INFO(diag, (size_t)len);
+    }
+    return port;
 }
 
 void mtt_http_server_stop(void)

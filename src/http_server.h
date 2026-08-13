@@ -31,11 +31,11 @@ typedef struct {
  *
  * 创建 TCP socket 绑定到 0.0.0.0:port，启动后台线程处理请求。
  * 若 bind 失败则尝试后续 5 个端口（port+1 ~ port+5）。
- * 通过 write 将实际端口号输出到 stderr。
  *
  * @param port  监听端口（0=禁用），来自 MTT_HTTP_PORT 环境变量
+ * @return 实际绑定的端口号；0 表示未启动(port==0)或 bind 全部失败
  */
-void mtt_http_server_start(uint16_t port);
+uint16_t mtt_http_server_start(uint16_t port);
 
 /**
  * 停止 HTTP 服务器。
