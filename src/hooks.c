@@ -56,34 +56,6 @@ static _Atomic int g_first_free_diag    = 1;
 static _Atomic int g_first_calloc_diag  = 1;
 static _Atomic int g_first_realloc_diag = 1;
 
-/* ======================================================================== *
- *  [临时诊断] ARM64 depth=1 残留排查 — 定位 main 栈回溯丢失后删除            *
- *                                                                          *
- *  疑惑点:                                                                  *
- *    Q1. hook_depth 什么时候变成 1?(inc/dec 配对追踪)                       *
- *    Q2. depth=1 残留时各标志位什么值?                                      *
- *    Q3. main 的 malloc 是否走了 SKIP 路径?                                 *
- *    Q4. init 完成时 depth 是多少?(init 之前还是之后残留?)                  *
- *    Q5. 有没有 malloc 走到 capture_stack?栈帧数多少?                       *
- *                                                                          *
- *  所有诊断用计数器限频(前 3~5 次),避免热路径 IO 风暴。MTT_DEBUG>=1 输出。  *
- * ======================================================================== */
-static _Atomic int g_diag_enter_first    = 1;  /* D1b: 首次进入 hook_enter */
-static _Atomic int g_diag_residual       = 0;  /* D1:  残留检测(只输出1次) */
-static _Atomic int g_diag_skip_cnt       = 0;  /* D2:  SKIP 路径(前5次) */
-static _Atomic int g_diag_inc_cnt        = 0;  /* D3:  inc_depth(前5次) */
-static _Atomic int g_diag_dec_cnt        = 0;  /* D4:  dec_depth(前5次) */
-static _Atomic int g_diag_tracked_cnt    = 0;  /* D6:  正常追踪(前3次) */
-static _Atomic int g_diag_init_done      = 1;  /* D5:  init完成(1次,tracker.c用) */
-
-/** 限频诊断输出:计数器达到 max 后不再输出。buf/len 已组装好。 */
-#define MTT_DIAG_LIMITED(counter_var, max_count, buf, len) \
-    do { \
-        int _cnt = atomic_fetch_add_explicit(&(counter_var), 1, memory_order_relaxed); \
-        if (_cnt < (max_count)) \
-            MTT_LOG_INFO((buf), (len)); \
-    } while (0)
-
 /** 仅在首次调用时输出诊断（确认 hook 被调用，受 MTT_DEBUG 控制）。
  * 直接读环境变量,不依赖 mtt_debug_level(后者在 init 阶段2 才设置,
  * 而 first_call 通常在 init 之前触发)。
@@ -138,39 +110,6 @@ static inline int mtt_hook_enter(void)
         /* TID 复用残留:清零,恢复追踪 */
         ctx->hook_depth = 0;
     }
-
-    /* [临时诊断 D1b] 首次进入 hook_enter 的快照 */
-    {
-        int expected = 1;
-        if (atomic_compare_exchange_strong(&g_diag_enter_first, &expected, 0)) {
-            char buf[128];
-            int len = snprintf(buf, sizeof(buf),
-                "[MTT] DIAG D1b hook_enter FIRST: depth=%d in_hook=%d tool_internal=%d tid=%d\n",
-                ctx->hook_depth, ctx->in_hook, ctx->tool_internal, (int)syscall(SYS_gettid));
-            if (len > 0 && len < (int)sizeof(buf))
-                MTT_LOG_INFO(buf, (size_t)len);
-        }
-    }
-
-    /* [临时诊断 D1] depth 残留检测:
-     * 正常递归 hook_depth>0 时 in_hook 必然=1(inc_depth 和 in_hook=1 成对设置)。
-     * 如果 hook_depth>0 但 in_hook==0 && tool_internal==0,说明 dec_depth
-     * 被 longjmp 跳过了(depth 只增不减)。只输出 1 次。 */
-    if (ctx->hook_depth > 0 && ctx->in_hook == 0 && ctx->tool_internal == 0) {
-        int expected = 0;
-        if (atomic_compare_exchange_strong(&g_diag_residual, &expected, 1)) {
-            char buf[192];
-            int len = snprintf(buf, sizeof(buf),
-                "[MTT] DIAG D1 DEPTH_RESIDUAL: hook_depth=%d in_hook=%d tool_internal=%d "
-                "raw_resolving=%d in_capture=%d tid=%d — longjmp skipped dec_depth, "
-                "subsequent mallocs will be SKIPPED (no stack capture)\n",
-                ctx->hook_depth, ctx->in_hook, ctx->tool_internal,
-                ctx->raw_resolving, ctx->in_capture, (int)syscall(SYS_gettid));
-            if (len > 0 && len < (int)sizeof(buf))
-                MTT_LOG_INFO(buf, (size_t)len);
-        }
-    }
-
     return ctx->hook_depth;
 }
 
@@ -180,20 +119,6 @@ static inline void mtt_hook_inc_depth(void)
     if (ctx == NULL) return; /* 降级：无槽位时跳过 */
     int init_ok = (ctx->depth_inited == 0x2A);
     if (!init_ok) { ctx->hook_depth = 0; ctx->depth_inited = 0x2A; }
-
-    /* [临时诊断 D3] inc_depth 配对追踪(前 5 次) */
-    {
-        int before = ctx->hook_depth;
-        if (before < MTT_HOOK_DEPTH_MAX) {
-            char buf[128];
-            int len = snprintf(buf, sizeof(buf),
-                "[MTT] DIAG D3 inc_depth: %d→%d in_hook=%d tool_internal=%d tid=%d\n",
-                before, before + 1, ctx->in_hook, ctx->tool_internal, (int)syscall(SYS_gettid));
-            if (len > 0 && len < (int)sizeof(buf))
-                MTT_DIAG_LIMITED(g_diag_inc_cnt, 5, buf, (size_t)len);
-        }
-    }
-
     if (ctx->hook_depth >= MTT_HOOK_DEPTH_MAX) return; /* 防溢出 + 防残留累积 */
     ctx->hook_depth++;
 }
@@ -202,19 +127,6 @@ static inline void mtt_hook_dec_depth(void)
 {
     mtt_per_thread_t * __restrict__ ctx = mtt_thread_get_cached();
     if (ctx == NULL) return; /* 降级：无槽位时跳过 */
-
-    /* [临时诊断 D4] dec_depth 配对追踪(前 5 次) */
-    {
-        int before = ctx->hook_depth;
-        char buf[128];
-        int len = snprintf(buf, sizeof(buf),
-            "[MTT] DIAG D4 dec_depth: %d→%d in_hook=%d tool_internal=%d tid=%d\n",
-            before, (before > 0) ? before - 1 : 0,
-            ctx->in_hook, ctx->tool_internal, (int)syscall(SYS_gettid));
-        if (len > 0 && len < (int)sizeof(buf))
-            MTT_DIAG_LIMITED(g_diag_dec_cnt, 5, buf, (size_t)len);
-    }
-
     if (ctx->hook_depth > 0)
         ctx->hook_depth--;
     else
@@ -245,14 +157,6 @@ void* malloc(size_t size)
     {
         int depth = mtt_hook_enter();
         if (depth > 0) {
-            /* [临时诊断 D2] malloc 被 SKIP — 如果是 main 的 malloc,这里就是丢失点 */
-            char buf[128];
-            int len = snprintf(buf, sizeof(buf),
-                "[MTT] DIAG D2 malloc SKIPPED: depth=%d size=%zu tid=%d (NO tracking, NO stack)\n",
-                depth, size, (int)syscall(SYS_gettid));
-            if (len > 0 && len < (int)sizeof(buf))
-                MTT_DIAG_LIMITED(g_diag_skip_cnt, 5, buf, (size_t)len);
-
             mtt_resolve_raw_allocators();
             return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
         }
@@ -349,16 +253,6 @@ void* malloc(size_t size)
         }
     }
     mtt_log_stage(27, "malloc past track/cap checks, calling entry_new");
-
-    /* [临时诊断 D6] malloc 走到正常追踪路径 — 与 D2 SKIP 对比,确认是否有 malloc 被追踪 */
-    {
-        char buf[128];
-        int len = snprintf(buf, sizeof(buf),
-            "[MTT] DIAG D6 malloc TRACKED: size=%zu ptr=%p tid=%d (will capture stack)\n",
-            size, ptr, (int)syscall(SYS_gettid));
-        if (len > 0 && len < (int)sizeof(buf))
-            MTT_DIAG_LIMITED(g_diag_tracked_cnt, 3, buf, (size_t)len);
-    }
 
     /* 创建追踪记录（内部使用 raw_malloc） */
     mtt_entry_t *e = mtt_entry_new(ptr, size);

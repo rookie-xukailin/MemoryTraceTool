@@ -1031,38 +1031,6 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
 
         mtt_capture_stack(e);
         mtt_log_stage(41, "entry_new capture_stack done frames=%d", e->stack_frames);
-
-        /* [临时诊断 D7] capture_stack 结果(前 5 次) — 栈帧数是几?
-         * frames=0 → libunwind/backtrace 都失败,栈信息完全丢失
-         * frames<4 → 浅栈,可能缺少 -funwind-tables
-         * frames>=4 → 正常 */
-        {
-            static _Atomic int g_diag_capture_cnt = 0;
-            int cnt = atomic_fetch_add_explicit(&g_diag_capture_cnt, 1, memory_order_relaxed);
-            if (cnt < 5) {
-                char buf[128];
-                int len = snprintf(buf, sizeof(buf),
-                    "[MTT] DIAG D7 capture result: frames=%d size=%zu unwinder_mode=%d tid=%d",
-                    e->stack_frames, size, g_unwinder_mode, (int)syscall(SYS_gettid));
-                if (len > 0 && len < (int)sizeof(buf)) {
-                    if (e->stack_frames > 0 && e->stack_frames < 8) {
-                        /* 附带前 3 帧的原始地址,帮你判断栈是否包含 main */
-                        int plen = len;
-                        for (int fi = 0; fi < e->stack_frames && fi < 3; fi++) {
-                            int sl = snprintf(buf + plen, sizeof(buf) - plen - 2,
-                                " [%d]=%p", fi, e->stack[fi]);
-                            if (sl > 0 && plen + sl < (int)sizeof(buf) - 2) plen += sl;
-                        }
-                        len = plen;
-                        buf[len++] = '\n';
-                    } else {
-                        buf[len++] = '\n';
-                    }
-                    long _w = write(2, buf, (size_t)len); (void)_w;
-                }
-            }
-        }
-
         return e;
     }
 
@@ -1539,31 +1507,6 @@ void mtt_ensure_init(void)
     if (ctx != NULL) {
         ctx->in_hook = saved_hook;
         ctx->tool_internal = saved_tool;
-    }
-
-    /* [临时诊断 D5] init 完成时的 depth 快照 — 判断 longjmp 残留在 init 之前还是之后。
-     * 如果这里 depth=1,说明 longjmp 在 init 之前发生(init 期间 libc 初始化)。
-     * 如果 depth=0 但后续 D1 仍然报残留,说明 longjmp 在 init 之后发生。 */
-    {
-        static _Atomic int g_diag_init_logged = 1;
-        int expected = 1;
-        if (atomic_compare_exchange_strong(&g_diag_init_logged, &expected, 0)) {
-            mtt_per_thread_t *dctx = mtt_thread_get_cached();
-            char buf[160];
-            int len = snprintf(buf, sizeof(buf),
-                "[MTT] DIAG D5 init DONE: hook_depth=%d in_hook=%d tool_internal=%d "
-                "initialized=1 tid=%d %s\n",
-                dctx ? dctx->hook_depth : -99,
-                dctx ? dctx->in_hook : -99,
-                dctx ? dctx->tool_internal : -99,
-                (int)syscall(SYS_gettid),
-                (dctx && dctx->hook_depth > 0) ?
-                    "(depth>0 at init completion — residual BEFORE init)" :
-                    "(depth=0 at init completion — clean here)");
-            if (len > 0 && len < (int)sizeof(buf)) {
-                long _w = write(2, buf, (size_t)len); (void)_w;
-            }
-        }
     }
 
     /* fork handler 由 hooks.c 的 fork() 拦截接管,不再用 pthread_atfork */
