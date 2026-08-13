@@ -148,6 +148,41 @@ void* malloc(size_t size)
     /* 首次调用诊断 */
     first_call_diag("malloc", &g_first_malloc_diag, 20);
 
+    /* fork 检测:getpid() 变化说明 fork 发生了。
+     * 不依赖 pthread_atfork(某些 daemon 化方式不触发 atfork)。
+     * getpid 是 VDSO 调用,开销 ~10ns。 */
+    {
+        static _Atomic pid_t g_known_pid = 0;
+        pid_t cur_pid = getpid();
+        pid_t known = atomic_load_explicit(&g_known_pid, memory_order_relaxed);
+        if (known != 0 && known != cur_pid) {
+            /* PID 变了 → fork 发生!暴力重置。 */
+            atomic_store_explicit(&g_known_pid, cur_pid, memory_order_relaxed);
+            mtt_state_t *fs = mtt_state_get();
+            if (fs != NULL)
+                atomic_store_explicit(&fs->initialized, 0, memory_order_release);
+            /* reporter/http 的"已启动"标志 */
+            extern void mtt_reporter_reset_for_fork(void);
+            extern void mtt_http_reset_for_fork(void);
+            mtt_reporter_reset_for_fork();
+            mtt_http_reset_for_fork();
+            /* 重置当前线程 depth + in_hook */
+            mtt_per_thread_t *fctx = mtt_thread_get_cached();
+            if (fctx != NULL) {
+                fctx->hook_depth = 0;
+                fctx->in_hook = 0;
+            }
+            char fbuf[96];
+            int flen = snprintf(fbuf, sizeof(fbuf),
+                "[MTT] fork detected: pid %d→%d, re-initializing\n",
+                (int)known, (int)cur_pid);
+            if (flen > 0 && flen < (int)sizeof(fbuf))
+                MTT_LOG_INFO(fbuf, (size_t)flen);
+        } else if (known == 0) {
+            atomic_store_explicit(&g_known_pid, cur_pid, memory_order_relaxed);
+        }
+    }
+
     /* 递归保护：__thread 深度计数器（哨兵自动修正脏值） */
     {
         int depth = mtt_hook_enter();
