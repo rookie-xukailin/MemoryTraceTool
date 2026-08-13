@@ -717,11 +717,44 @@ uint16_t mtt_http_server_start(uint16_t port)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
+    /* bind 重试逻辑(解决 daemon fork 端口冲突):
+     *
+     * 场景:进程 fork 后父进程立即退出(daemon 化),子进程成为唯一存活
+     * 进程。但子进程 init 在 fork 后立即触发(第一次 malloc),此时父进程
+     * 可能还没退出,仍占用请求端口(如 8080) → 子进程 bind 失败。
+     *
+     * 策略:对请求端口重试若干次(间隔 0.5 秒),等父进程退出后端口释放。
+     * 重试耗尽才退到 port+1~port+5 的 fallback 逻辑。
+     *
+     * 重试参数:4 次 × 0.5 秒 = 最多等 2 秒,足够父进程退出。
+     * 用 nanosleep(不依赖 SIGALRM,不影响信号处理)。 */
+    #define MTT_HTTP_BIND_RETRIES  4
+    #define MTT_HTTP_BIND_RETRY_NS (500 * 1000 * 1000L)  /* 0.5 秒 */
+
     int bound = 0;
-    for (int try_port = port; try_port < (int)port + 6; try_port++) {
-        addr.sin_port = htons((uint16_t)try_port);
+
+    /* 第一阶段:对请求端口重试(等父进程退出释放端口) */
+    addr.sin_port = htons(port);
+    for (int attempt = 0; attempt < MTT_HTTP_BIND_RETRIES && !bound; attempt++) {
         if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            bound = 1; port = (uint16_t)try_port; break;
+            bound = 1;
+            break;
+        }
+        /* bind 失败:等待 0.5 秒后重试(最后一次失败后不等待,直接进 fallback)。
+         * 非 fork 场景(端口真空闲):attempt=0 就 bind 成功,不会等待。 */
+        if (attempt < MTT_HTTP_BIND_RETRIES - 1) {
+            struct timespec ts = { 0, MTT_HTTP_BIND_RETRY_NS };
+            nanosleep(&ts, NULL);
+        }
+    }
+
+    /* 第二阶段:重试耗尽,尝试 port+1 ~ port+5(fallback) */
+    if (!bound) {
+        for (int try_port = port + 1; try_port < (int)port + 6; try_port++) {
+            addr.sin_port = htons((uint16_t)try_port);
+            if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                bound = 1; port = (uint16_t)try_port; break;
+            }
         }
     }
     if (!bound) { close(listen_fd); return 0; }
