@@ -28,7 +28,9 @@ ifneq ($(MTT_EMBEDDED),)
 endif
 
 CORE_CFLAGS = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
-CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS) $(EMBEDDED_DEFS)
+# MTT_STATIC_LIBUNWIND: 启用静态链接 libunwind(随产物发布,目标机无需预装)
+# 在 src/unwind_libunwind.c 切换为编译期直连 unw_backtrace,跳过 dlopen 探测
+CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS) $(EMBEDDED_DEFS) -DMTT_STATIC_LIBUNWIND
 
 CC       = $(CROSS_COMPILE)gcc
 
@@ -69,12 +71,62 @@ LIB_OBJS = $(BUILD_DIR)/hooks.o $(BUILD_DIR)/tracker.o \
 SHARED_LIB = $(OUTPUT_DIR)/libmemorytracetool.so
 
 .PHONY: all clean distclean demo demo_preload demo_long_running demo_controlled_leak \
-        test test_stability test_all sysroot-arm32
+        test test_stability test_all sysroot-arm32 vendor-clean
 
+# 默认目标必须出现在所有 .o/.a 构建规则之前,否则 make 无参数时
+# 会把第一个非 .PHONY 文件目标当作默认
 all: $(SHARED_LIB)
 
-$(SHARED_LIB): $(LIB_OBJS) | $(OUTPUT_DIR)
-	$(CC) -shared -o $@ $^ $(LDFLAGS)
+# ---- libunwind 静态库构建 ----
+# open/libunwind 是 vendored libunwind v1.8.2 源码(MIT 许可,随项目分发)。
+# configure 等脚本已预生成并 commit,运行时无需 autotools。
+# 在独立 build 目录跑 configure + make,产出 libunwind.a 链入我们的 .so。
+# 目标机零依赖:不需要预装 libunwind8,内网编译无需联网。
+LIBUNWIND_SRC    := open/libunwind
+LIBUNWIND_BUILD  := $(BUILD_DIR)/libunwind-$(or $(ARCH),host)
+LIBUNWIND_STATIC := $(LIBUNWIND_BUILD)/src/.libs/libunwind.a
+# --host 三元组从 CROSS_COMPILE 推导:arm-linux-gnueabihf- → arm-linux-gnueabihf
+# 必须用 $(notdir ...) 剥掉目录前缀,否则 CROSS_COMPILE 是全路径时
+# (如 /home1/x/.../bin/arm-gcc13-linux-gnueabi-)
+# --host 会收到整条路径,config.sub 报 "more than four components"。
+# 本机编译时 CROSS_COMPILE 为空,--host 留空,configure 自动检测
+LIBUNWIND_HOST   := $(patsubst %-,%,$(notdir $(CROSS_COMPILE)))
+
+# libunwind 静态库构建目标:
+#   在独立 build 目录跑 configure(--host 交叉编译 / --enable-static / --disable-shared)
+#   + make 产出 libunwind.a。
+# 注意:cd 进入 build 目录后,$(LIBUNWIND_SRC)/configure 相对路径会失效,
+# 必须用 $(CURDIR) 锚定到项目根。
+$(LIBUNWIND_STATIC): $(LIBUNWIND_SRC)/configure
+	@mkdir -p $(LIBUNWIND_BUILD)
+	@# 暴力自愈: core.autocrlf=true 的环境会把 configure 检出成 CRLF,
+	@# 导致 "/bin/sh^M: bad interpreter"。检测到就 strip,无需用户手动 sed。
+	@if file $(LIBUNWIND_SRC)/configure | grep -q 'CRLF'; then \
+	    echo "[MTT] libunwind autotools 文件含 CRLF,暴力 strip..."; \
+	    find $(LIBUNWIND_SRC) -type f \
+	        \( -name 'configure' -o -name '*.in' -o -name '*.m4' -o -name 'aclocal.m4' \) \
+	        -exec perl -i -pe 's/\r$$//' {} +; \
+	    find $(LIBUNWIND_SRC)/config -type f -exec perl -i -pe 's/\r$$//' {} +; \
+	fi
+	cd $(LIBUNWIND_BUILD) && \
+	    $(CURDIR)/$(LIBUNWIND_SRC)/configure \
+	        $(if $(LIBUNWIND_HOST),--host=$(LIBUNWIND_HOST)) \
+	        --enable-static --disable-shared \
+	        --disable-tests \
+	        --disable-coredump \
+	        --disable-ptrace \
+	        --disable-setjmp \
+	        --disable-nto \
+	        --disable-cxx-exceptions \
+	        --disable-minidebuginfo \
+	        --disable-zlibdebuginfo \
+	        --disable-documentation \
+	        CC="$(CC)" CFLAGS="$(ARCH_FLAGS) -O2 -fPIC -fno-omit-frame-pointer"
+	$(MAKE) -C $(LIBUNWIND_BUILD) -j4 V=0
+
+$(SHARED_LIB): $(LIB_OBJS) $(LIBUNWIND_STATIC) | $(OUTPUT_DIR)
+	$(CC) -shared -o $@ $(LIB_OBJS) $(LIBUNWIND_STATIC) \
+	    -Wl,--exclude-libs,ALL $(LDFLAGS)
 	@rm -f $(BUILD_DIR)/*.o
 
 $(BUILD_DIR)/hooks.o: $(SRC_DIR)/hooks.c $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
@@ -101,8 +153,8 @@ $(BUILD_DIR)/http_server.o: $(SRC_DIR)/http_server.c $(SRC_DIR)/http_server.h $(
 $(BUILD_DIR)/addr_validate.o: $(SRC_DIR)/addr_validate.c $(SRC_DIR)/addr_validate.h $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
-$(BUILD_DIR)/unwind_libunwind.o: $(SRC_DIR)/unwind_libunwind.c $(SRC_DIR)/unwind_libunwind.h $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
+$(BUILD_DIR)/unwind_libunwind.o: $(SRC_DIR)/unwind_libunwind.c $(SRC_DIR)/unwind_libunwind.h $(SRC_DIR)/mtt_internal.h $(LIBUNWIND_STATIC) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INC_SHARED) $(if $(filter -DMTT_STATIC_LIBUNWIND,$(CFLAGS)),-DUNW_LOCAL_ONLY -I$(LIBUNWIND_BUILD)/include -I$(LIBUNWIND_SRC)/include) -c -o $@ $<
 
 $(BUILD_DIR) $(OUTPUT_DIR):
 	mkdir -p $@
@@ -130,13 +182,30 @@ test_stability: $(SHARED_LIB) tests/test_stability.c | $(OUTPUT_DIR)
 		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
 	$(RUN) $(OUTPUT_DIR)/test_stability
 
-test_all: test test_stability
+# 库地址范围黑名单验证测试(MTT_LIB_BLACKLIST_FAST)
+test_blacklist_fast: $(SHARED_LIB) tests/test_blacklist_fast.c | $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_blacklist_fast tests/test_blacklist_fast.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS)
+	$(RUN) $(OUTPUT_DIR)/test_blacklist_fast
+
+# fork handler 验证测试(Type=forking 路径)
+test_fork: $(SHARED_LIB) tests/test_fork.c | $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_fork tests/test_fork.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS) -lpthread
+	$(RUN) $(OUTPUT_DIR)/test_fork
+
+test_all: test test_stability test_blacklist_fast test_fork
 
 clean:
 	rm -rf $(BUILD_DIR) $(OUTPUT_DIR)
 
 distclean: clean
 	rm -rf sysroot/
+
+# 清理 libunwind 构建产物(独立于 clean,避免普通 clean 触发完整 rebuild)
+vendor-clean:
+	rm -rf $(BUILD_DIR)/libunwind-*
+	@cd $(LIBUNWIND_SRC) && git clean -fdx 2>/dev/null || true
 
 sysroot-arm32:
 	@echo "正在从 Docker 提取 ARM32 sysroot..."

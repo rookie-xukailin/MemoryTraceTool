@@ -31,11 +31,11 @@ typedef struct {
  *
  * 创建 TCP socket 绑定到 0.0.0.0:port，启动后台线程处理请求。
  * 若 bind 失败则尝试后续 5 个端口（port+1 ~ port+5）。
- * 通过 write 将实际端口号输出到 stderr。
  *
  * @param port  监听端口（0=禁用），来自 MTT_HTTP_PORT 环境变量
+ * @return 实际绑定的端口号；0 表示未启动(port==0)或 bind 全部失败
  */
-void mtt_http_server_start(uint16_t port);
+uint16_t mtt_http_server_start(uint16_t port);
 
 /**
  * 停止 HTTP 服务器。
@@ -44,5 +44,18 @@ void mtt_http_server_start(uint16_t port);
  *（detach 线程在下一次 accept/select 超时后自行退出）。
  */
 void mtt_http_server_stop(void);
+
+/**
+ * fork 子进程后重置 HTTP server 状态。
+ *
+ * 由 tracker.c 的 mtt_fork_child 调用。fork 后:
+ *   - HTTP 线程不存在(fork 不复制其他线程)
+ *   - running 标志仍为 1(继承)
+ *   - listen_fd 是父进程的 socket fd(子进程不应该共享)
+ *
+ * 本函数关闭继承的 listen_fd + 重置 running 标志,让子进程下次
+ * mtt_http_server_start 能重新 socket/bind/listen。
+ */
+void mtt_http_reset_for_fork(void);
 
 #endif /* MTT_HTTP_SERVER_H */

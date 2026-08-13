@@ -36,6 +36,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <dlfcn.h>
 #if MTT_HAS_BACKTRACE
 #include <execinfo.h>
@@ -417,6 +419,94 @@ mtt_stack_entry_t* mtt_stack_cache_lookup(void **frames, int frame_count)
  *                      符号解析（dladdr + backtrace_symbols 兜底）              *
  * ======================================================================== */
 
+/* ---- addr2line 地址修正：非 PIE 主程序 ---- */
+
+/**
+ * 判断主程序是否 PIE(位置无关可执行)。
+ *
+ * 背景:addr2line 需要的地址分两种:
+ *   - PIE 二进制(.so / -pie 可执行):ELF 虚拟地址从 0 开始,
+ *     addr - dli_fbase 就是 ELF 虚拟地址,addr2line 直接用
+ *   - 非 PIE 可执行(老式 ARM 嵌入式主程序,如 HDM3 storageManager):
+ *     ELF 虚拟地址固定(ARM32 默认 0x40000000 / ARM64 默认 0x400000,
+ *     x86 0x400000 等),addr - dli_fbase 是"相对加载基址的偏移",
+ *     少了 ELF 起始虚拟地址,addr2line 找不到符号 → 全部 ??
+ *
+ * 判断依据:直接读 /proc/self/exe 的 ELF header e_type 字段:
+ *   ET_EXEC(2)= 非 PIE,ET_DYN(3)= PIE/.so
+ * 这是最可靠的判据,不依赖具体架构的加载地址猜测。
+ *
+ * @return 1=非 PIE(addr2line 需要用运行时地址), 0=PIE/未知(用 file_off)
+ */
+static int main_is_non_pie(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+
+    cached = 0;  /* 默认按 PIE 处理 */
+    int fd = open("/proc/self/exe", O_RDONLY);
+    if (fd < 0) return cached;
+
+    unsigned char hdr[64];
+    ssize_t n = read(fd, hdr, sizeof(hdr));
+    close(fd);
+    if (n < 20) return cached;
+
+    /* ELF magic 校验 + e_type(ELF header offset 16, 2 bytes) */
+    if (hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F') {
+        unsigned short e_type = (unsigned short)(hdr[16] | (hdr[17] << 8));
+        if (e_type == 2)  /* ET_EXEC */
+            cached = 1;
+    }
+    return cached;
+}
+
+/**
+ * 判断 dli_fname 是否指向主程序自身。
+ *
+ * dladdr 返回的 dli_fname 是加载时的完整路径(如 /usr/local/bin/storageManager),
+ * 而 /proc/self/exe 是指向它的符号链接,readlink 拿到真实路径。
+ *
+ * @param fname dladdr 返回的 dli_fname
+ * @return 1=是主程序, 0=否
+ */
+static int is_main_exe_path(const char *fname)
+{
+    if (fname == NULL || fname[0] == '\0') return 0;
+
+    static char exe_path[512] = {0};
+    if (exe_path[0] == '\0') {
+        ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (n <= 0) return 0;
+        exe_path[n] = '\0';
+    }
+    return strcmp(fname, exe_path) == 0;
+}
+
+/**
+ * 计算 addr2line 应使用的地址。
+ *
+ * 注意:非 PIE 判断只针对"帧属于主程序"的情况。栈帧可能落在
+ * libc/.so(它们是 PIE),那些帧必须用 file_off(addr - dli_fbase)。
+ *
+ * @param addr      帧返回地址(Thumb bit 已清除)
+ * @param fname     帧所在对象的完整路径(dladdr 返回的 dli_fname)
+ * @param dli_fbase 帧所在对象的加载基址
+ * @return addr2line 应使用的地址
+ */
+static uintptr_t frame_addr2line_addr(void *addr, const char *fname,
+                                      void *dli_fbase)
+{
+    /* 仅当帧属于非 PIE 主程序:运行时地址就是 ELF 虚拟地址(基址链接期
+     * 固定),addr2line 直接吃 addr。其他对象(libc/.so)都是 PIE,
+     * 用 file_off = addr - dli_fbase 才是 ELF 虚拟地址。 */
+    if (main_is_non_pie() && is_main_exe_path(fname))
+        return (uintptr_t)addr;
+    if (dli_fbase != NULL)
+        return (uintptr_t)addr - (uintptr_t)dli_fbase;
+    return (uintptr_t)addr;
+}
+
 /**
  * 解析单个帧地址为可读符号字符串。
  *
@@ -450,14 +540,22 @@ static void resolve_one_frame(void *addr, char *out, size_t out_size)
     memset(&info, 0, sizeof(info));
 
     if (dladdr(addr, &info)) {
-        const char *fname = (info.dli_fname != NULL) ? info.dli_fname : "??";
+        /* full_fname 保留完整路径(frame_addr2line_addr 判断是否主程序用),
+         * fname 取 basename(展示用) */
+        const char *full_fname = (info.dli_fname != NULL) ? info.dli_fname : "";
+        const char *fname = full_fname;
         const char *base  = strrchr(fname, '/');
         if (base != NULL) fname = base + 1;
         lib_name = fname;
 
-        /* 总是计算文件内偏移（addr2line -e 可直接使用此值） */
+        /* 计算 addr2line 可用的地址偏移:
+         *   - PIE(.so / -pie 主程序):addr - dli_fbase = ELF 虚拟地址
+         *   - 非 PIE 主程序(storageManager 这类 ARM 嵌入式):dli_fbase 是
+         *     ELF 起始虚拟地址(0x10000 之类),addr - dli_fbase 会少算起始
+         *     地址,addr2line 找不到符号 → 直接输出运行时地址 addr */
         if (info.dli_fbase != NULL) {
-            file_off = (char*)addr - (char*)info.dli_fbase;
+            file_off = (ptrdiff_t)frame_addr2line_addr(
+                addr, full_fname, info.dli_fbase);
             if (file_off < 0) file_off = 0;
         }
 

@@ -225,7 +225,7 @@ static void test_a7_leak_near_zero(void)
  * ======================================================================== */
 
 #define PAIR_THREADS    10
-#define PAIR_ALLOCS    2000   /* 每个线程最多 2000 指针 = ARM32 8KB，配合 256KB 栈安全 */
+#define PAIR_ALLOCS    1000   /* 10 * 1000 = 10000 < pool_capacity(16384),避免超容量跳过追踪 */
 
 static void* pair_thread_fn(void *arg)
 {
@@ -559,6 +559,62 @@ static void test_k1_thread_churn(void)
 }
 
 /* ======================================================================== *
+ *   L. pool_lock per-stripe 并发压力:高频 alloc/free 不死锁、计数一致      *
+ * ======================================================================== */
+
+#define POOL_STRESS_THREADS    8
+#define POOL_STRESS_ALLOCS     50000   /* 每线程 5 万次,共 40 万次 */
+
+static void* pool_stress_fn(void *arg)
+{
+    unsigned seed = (unsigned)(uintptr_t)arg ^ (unsigned)time(NULL);
+    /* 100 个槽位环形 buffer,alloc 满后批量 free,制造池子高频吞吐 */
+    void *ptrs[100];
+    int count = 0;
+    for (int i = 0; i < POOL_STRESS_ALLOCS; i++) {
+        size_t sz = 16 + (rand_r(&seed) % 496);  /* 16-512 字节 */
+        void *p = mtt_malloc(sz);
+        if (p == NULL) continue;
+        memset(p, (int)(i & 0xff), sz);  /* 写入防优化 */
+        ptrs[count++] = p;
+        if (count == 100) {
+            for (int j = 0; j < 100; j++) { mtt_free(ptrs[j]); ptrs[j] = NULL; }
+            count = 0;
+        }
+    }
+    for (int j = 0; j < count; j++) mtt_free(ptrs[j]);
+    return NULL;
+}
+
+static void test_l1_pool_concurrency(void)
+{
+    TEST("L1. pool_lock per-stripe 8x50000 高频 alloc/free 不死锁");
+    size_t a0 = mtt_get_alloc_count(), f0 = mtt_get_free_count();
+    size_t cur0 = mtt_get_current_usage();
+
+    pthread_t threads[POOL_STRESS_THREADS];
+    for (int i = 0; i < POOL_STRESS_THREADS; i++) {
+        /* 用线程 id 作为 seed 来源,确保各线程走不同 stripe 桶 */
+        create_test_thread(&threads[i], pool_stress_fn,
+                           (void*)(uintptr_t)(i + 1));
+    }
+    for (int i = 0; i < POOL_STRESS_THREADS; i++) pthread_join(threads[i], NULL);
+
+    /* 走到这里 = 无死锁无崩溃 */
+    size_t added = mtt_get_alloc_count() - a0;
+    size_t freed = mtt_get_free_count() - f0;
+    T_ASSERT_GE(added, (size_t)(POOL_STRESS_THREADS * POOL_STRESS_ALLOCS) - 100,
+                "pool 并发下 alloc 计数缺失");
+    T_ASSERT_GE(freed, (size_t)(POOL_STRESS_THREADS * POOL_STRESS_ALLOCS) - 100,
+                "pool 并发下 free 计数缺失");
+    /* 全部归还后 current_bytes 应基本回到基线 */
+    size_t cur_after = mtt_get_current_usage();
+    T_ASSERT_LE(cur_after, cur0 + 1024,
+                "pool 并发后 current_bytes 未回落,entry 泄漏");
+    PASS();
+}
+
+/* ======================================================================== *
  *   main                                                                   *
  * ======================================================================== */
 
@@ -633,6 +689,9 @@ int main(void)
 
     printf("\n--- Phase K: Thread churn ---\n");
     test_k1_thread_churn();
+
+    printf("\n--- Phase L: pool_lock per-stripe concurrency ---\n");
+    test_l1_pool_concurrency();
 
     /* 最终快照 */
     printf("\n--- Final Snapshot ---\n");

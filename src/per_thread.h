@@ -14,9 +14,20 @@
 
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <signal.h>
+#include <errno.h>
 #include <stdatomic.h>
 
-#define MTT_MAX_THREADS 64
+/* 槽位上限:从 64 扩到 512。
+ * 背景:storageManager 等大型 BMC 进程线程数易超 64,晚创建的线程
+ * (如分类线程池动态派生的业务线程)拿不到槽位 → ctx==NULL → malloc
+ * 透传不追踪 → 该线程所有泄漏完全丢失。
+ * 内存成本:512 × sizeof(mtt_per_thread_t) ≈ 32KB,嵌入式可接受。 */
+#define MTT_MAX_THREADS 512
+
+/* hook 深度异常上限:超过视为 TID 复用残留的脏值。
+ * 正常 hook 深度:业务 malloc → raw_*(函数指针直调) → 通常 ≤ 3。 */
+#define MTT_HOOK_DEPTH_MAX 8
 
 typedef struct {
     _Atomic pid_t tid;       /* 0=空闲槽位，否则为所属线程 TID */
@@ -32,15 +43,20 @@ typedef struct {
 } mtt_per_thread_t;
 
 /* 全局槽位数组 — BSS 零初始化。
- * 64 槽位远超过实际需求（通常 <10 线程），每个槽位约 32 字节 */
+ * 512 槽位覆盖大型 BMC 进程(通常 <100 线程),每个槽位约 64 字节 */
 extern mtt_per_thread_t g_threads[MTT_MAX_THREADS];
 
 /**
  * 获取当前线程的上下文指针。
  *
  * 首次调用时通过 CAS 分配空闲槽位并初始化哨兵值。
- * 后续调用通过 TID 匹配直接命中（线性探测，O(N)但 N≤64）。
- * 若槽位满返回 NULL——调用者应安全降级（直接透传 raw_*）。
+ * 后续调用通过 TID 匹配直接命中（线性探测，O(N)但 N≤512）。
+ *
+ * 槽位满时的兜底回收:线程池场景线程动态创建/销毁,已退出线程的槽位
+ * tid 残留。kill(tid,0)==ESRCH 表示该线程已不存在,可安全复用其槽位。
+ * 当前线程必然存活(正在执行本函数),不会被误清。
+ *
+ * @return 槽位指针,全满且无可回收时返回 NULL(调用者应安全降级)
  */
 static inline mtt_per_thread_t* mtt_thread_get(void)
 {
@@ -72,7 +88,62 @@ static inline mtt_per_thread_t* mtt_thread_get(void)
         }
     }
 
-    return NULL; /* 槽位满 — 极为罕见，调用者降级处理 */
+    /* 第三阶段: 槽位全满 — 回收已退出线程的槽位后再试。
+     * kill(tid,0) 成功(0)说明线程存活,保留;ESRCH 说明已退出,复用。 */
+    for (int i = 0; i < MTT_MAX_THREADS; i++) {
+        pid_t owner = atomic_load_explicit(&g_threads[i].tid, memory_order_acquire);
+        if (owner != 0 && owner != tid && kill(owner, 0) != 0 && errno == ESRCH) {
+            if (atomic_compare_exchange_strong_explicit(
+                    &g_threads[i].tid, &owner, tid,
+                    memory_order_acq_rel, memory_order_acquire)) {
+                g_threads[i].hook_depth    = -1;
+                g_threads[i].depth_inited  = -1;
+                g_threads[i].in_hook       = 0;
+                g_threads[i].tool_internal = 0;
+                g_threads[i].raw_resolving = 0;
+                g_threads[i].in_capture    = 0;
+                return &g_threads[i];
+            }
+        }
+    }
+
+    return NULL; /* 槽位全满且无已死线程 — 调用者降级处理 */
+}
+
+/* ======================================================================== *
+ *      1.1 热路径加速:TLS 缓存线程上下文(免每次 syscall + 扫 512 槽)        *
+ * ======================================================================== */
+
+/* TLS 缓存指针:命中免 syscall(SYS_gettid) + 线性扫 512 槽。
+ * 历史问题(某些 ARM64 设备 __thread 不可靠)用"tid 核对"兜底:
+ * 命中后原子核对槽位 tid == 当前 tid,不匹配则回退慢路径重扫。 */
+static __thread mtt_per_thread_t *mtt_tls_ctx = NULL;
+
+/**
+ * 获取当前线程上下文(热路径加速版)。
+ *
+ * 快路径:纯 TLS 读(cache + cached_tid 都在 TLS),零 syscall 零扫描。
+ * 慢路径:TLS 为空 或 缓存 tid 与槽位不一致(线程迁移/槽位回收)时
+ * 回退 mtt_thread_get() 重扫,并刷新 TLS 缓存。
+ *
+ * 注意:快路径不做 syscall 校验(会抵消缓存收益)。用 TLS 存 cached_tid,
+ * 与槽位 tid 比较纯 TLS 读;线程池场景 TID 复用导致槽位被新线程占用时,
+ * cached_tid 仍是旧值,比较失败 → 回退慢路径,正确。
+ *
+ * @return 槽位指针(可能 NULL,调用者应安全降级)
+ */
+static __thread pid_t mtt_tls_cached_tid = 0;
+
+static inline mtt_per_thread_t* mtt_thread_get_cached(void)
+{
+    mtt_per_thread_t *c = mtt_tls_ctx;
+    if (c != NULL && mtt_tls_cached_tid ==
+            atomic_load_explicit(&c->tid, memory_order_relaxed))
+        return c;   /* 快路径:纯 TLS 读,零 syscall */
+    mtt_tls_ctx = mtt_thread_get();       /* 慢路径:syscall + 扫槽 */
+    mtt_tls_cached_tid = (mtt_tls_ctx != NULL)
+        ? atomic_load_explicit(&mtt_tls_ctx->tid, memory_order_relaxed) : 0;
+    return mtt_tls_ctx;
 }
 
 #endif /* MTT_PER_THREAD_H */

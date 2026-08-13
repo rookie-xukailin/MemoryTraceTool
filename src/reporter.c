@@ -501,6 +501,22 @@ static void scan_and_report_locked(void)
             MTT_DIAG_LOG(dbuf, (size_t)dlen);
     }
 
+    /* 累加所有 leak_site.total_size → s->leak_bytes_total,供时序图红线使用。
+     * leak_bytes_total 单调反映"已识别泄漏累积字节",与瞬时 current_bytes 不同:
+     * 即使业务 alloc/free 平衡导致 current 看不出趋势,leak_bytes 仍能直显泄漏增长。
+     * 每次 scan 重新计算(覆盖写),不累计,因为 leak_table 自身记录的是当前未释放站点。 */
+    {
+        size_t leak_total = 0;
+        for (unsigned b = 0; b < MTT_LEAK_DEDUP_SIZE; b++) {
+            mtt_leak_site_t *site = leak_table.entries[b];
+            while (site != NULL) {
+                leak_total += site->total_size;
+                site = site->next;
+            }
+        }
+        atomic_store_explicit(&s->leak_bytes_total, leak_total, memory_order_relaxed);
+    }
+
     /* ---- 阶段 3: 懒解析栈符号（安全网：补解析阶段 2 遗漏的条目） ----
      * 正常情况下阶段 2 已将首次创建缓存条目时所关联栈全部解析完毕，
      * 此阶段仅处理极端边界情况（如哈希碰撞导致 site->stack_hash 匹配了
@@ -917,6 +933,42 @@ static void scan_and_report_locked(void)
         pthread_mutex_unlock(&g_reporter.cache_lock);
     }
 
+    /* 浅栈比例监控:统计本次快照中 frame_count < 4 的比例,
+     * 超过 20% 且样本数 > 100 时一次性 stderr 警告。
+     * 触发场景:目标二进制 -O2 -fomit-frame-pointer 且无 -funwind-tables,
+     * glibc backtrace 拿不到完整栈,即使 FP chain 兜底也补不全。
+     * 警告只在首次满足条件时输出(g_shallow_warned 哨兵),
+     * 避免日志噪声。等级 >= 1 输出(关键诊断)。
+     *
+     * 注意:必须在 cleanup: 释放 snaps 之前访问,否则 use-after-free。 */
+    if (snaps != NULL && snap_count > 100) {
+        size_t shallow = 0;
+        size_t total_with_stack = 0;
+        for (size_t i = 0; i < snap_count; i++) {
+            if (snaps[i].stack_frames > 0) {
+                total_with_stack++;
+                if (snaps[i].stack_frames < 4) shallow++;
+            }
+        }
+        /* 20% 阈值:shallow * 5 > total_with_stack 等价于 shallow/total > 20% */
+        if (total_with_stack > 100 && shallow * 5 > total_with_stack) {
+            static atomic_int g_shallow_warned = 0;
+            int expected = 0;
+            if (atomic_compare_exchange_strong_explicit(&g_shallow_warned,
+                    &expected, 1, memory_order_acq_rel, memory_order_acquire)) {
+                char wbuf[256];
+                int wlen = snprintf(wbuf, sizeof(wbuf),
+                    "[MTT] WARNING: %zu/%zu (%.0f%%) allocations have <4 frames. "
+                    "Backtrace likely truncated by -fomit-frame-pointer. "
+                    "Rebuild target with -funwind-tables -fno-omit-frame-pointer.\n",
+                    shallow, total_with_stack,
+                    (double)shallow * 100.0 / (double)total_with_stack);
+                if (wlen > 0 && wlen < (int)sizeof(wbuf))
+                    MTT_LOG_INFO(wbuf, (size_t)wlen);
+            }
+        }
+    }
+
 cleanup:
     /* 释放快照数组（raw_free 非 NULL 检查，防御性编程） */
     if (snaps != NULL && raw_free != NULL) raw_free(snaps);
@@ -941,52 +993,17 @@ cleanup:
         if (dlen > 0 && dlen < (int)sizeof(dbuf))
             MTT_DIAG_LOG(dbuf, (size_t)dlen);
     }
-
-    /* 浅栈比例监控:统计本次快照中 frame_count < 4 的比例,
-     * 超过 20% 且样本数 > 100 时一次性 stderr 警告。
-     * 触发场景:目标二进制 -O2 -fomit-frame-pointer 且无 -funwind-tables,
-     * glibc backtrace 拿不到完整栈,即使 FP chain 兜底也补不全。
-     * 警告只在首次满足条件时输出(g_shallow_warned 哨兵),
-     * 避免日志噪声。MTT_DEBUG=0 时也输出(WARNING 级,不受静默影响)。 */
-    if (snaps != NULL && snap_count > 100) {
-        size_t shallow = 0;
-        size_t total_with_stack = 0;
-        for (size_t i = 0; i < snap_count; i++) {
-            if (snaps[i].stack_frames > 0) {
-                total_with_stack++;
-                if (snaps[i].stack_frames < 4) shallow++;
-            }
-        }
-        /* 20% 阈值:shallow * 5 > total_with_stack 等价于 shallow/total > 20% */
-        if (total_with_stack > 100 && shallow * 5 > total_with_stack) {
-            static atomic_int g_shallow_warned = 0;
-            int expected = 0;
-            if (atomic_compare_exchange_strong_explicit(&g_shallow_warned,
-                    &expected, 1, memory_order_acq_rel, memory_order_acquire)) {
-                char wbuf[256];
-                int wlen = snprintf(wbuf, sizeof(wbuf),
-                    "[MTT] WARNING: %zu/%zu (%.0f%%) allocations have <4 frames. "
-                    "Backtrace likely truncated by -fomit-frame-pointer. "
-                    "Rebuild target with -funwind-tables -fno-omit-frame-pointer, "
-                    "or set MTT_UNWINDER=libunwind once libunwind integration lands.\n",
-                    shallow, total_with_stack,
-                    (double)shallow * 100.0 / (double)total_with_stack);
-                if (wlen > 0 && wlen < (int)sizeof(wbuf))
-                    MTT_DIAG_WRITE(STDERR_FILENO, wbuf, (size_t)wlen);
-            }
-        }
-    }
     return;
 
 skip_scan:
-    /* 快照分配失败 — 静默跳过本次扫描(WARNING 始终输出) */
+    /* 快照分配失败 — 跳过本次扫描(WARNING 等级 1+ 输出) */
     {
         char err_buf[128] = {0};
         int err_len = snprintf(err_buf, sizeof(err_buf),
             "[MTT] WARNING: snapshot alloc failed for %llu entries, skipping scan\n",
             (unsigned long long)entry_total_orig);
         if (err_len > 0 && err_len < (int)sizeof(err_buf))
-            MTT_DIAG_WRITE(STDERR_FILENO, err_buf, (size_t)err_len);
+            MTT_LOG_INFO(err_buf, (size_t)err_len);
     }
 }
 
@@ -1134,6 +1151,26 @@ static void* reporter_thread_fn(void *arg)
         }
 
         if (atomic_load_explicit(&g_reporter.running, memory_order_acquire)) {
+            /* 心跳日志:每 MTT_REPORT_INTERVAL_SEC(60s) 一条,等级 1 输出。
+             * 用途:串口/控制台长时间无输出会断连,需要工具表明"还在工作"。
+             * 等级 0(MTT_DEBUG=0) 仍静默,文件 heartbeat 继续写到 /var/log/mtt/。
+             * 带 entry_count 让用户能粗略看分配趋势,不必打开 heartbeat 文件 */
+            {
+                mtt_state_t *st = mtt_state_get();
+                uint64_t ec = 0;
+                if (st != NULL) {
+                    ec = atomic_load_explicit(&st->entry_count,
+                                              memory_order_relaxed);
+                }
+                char hbuf[128];
+                int hlen = snprintf(hbuf, sizeof(hbuf),
+                    "[MTT] heartbeat: running ts=%ld entries=%llu interval=%ds\n",
+                    (long)time(NULL),
+                    (unsigned long long)ec,
+                    MTT_REPORT_INTERVAL_SEC);
+                if (hlen > 0 && hlen < (int)sizeof(hbuf))
+                    MTT_LOG_INFO(hbuf, (size_t)hlen);
+            }
             {
                 char dbuf[64];
                 int dlen = snprintf(dbuf, sizeof(dbuf),
@@ -1153,7 +1190,7 @@ static void* reporter_thread_fn(void *arg)
         int dlen = snprintf(dbuf, sizeof(dbuf),
             "[MTT] reporter: final scan before exit\n");
         if (dlen > 0 && dlen < (int)sizeof(dbuf))
-            MTT_DIAG_LOG(dbuf, (size_t)dlen);
+            MTT_LOG_INFO(dbuf, (size_t)dlen);
     }
     scan_and_report();
 
@@ -1231,13 +1268,13 @@ void mtt_reporter_start(void)
         g_atexit_registered = 1;
     }
 
-    /* 首次诊断输出（使用 write 避免 malloc，受 MTT_DEBUG 控制） */
+    /* 首次诊断输出:Reporter 启动属关键事件(等级 >= 1 输出) */
     char diag[256] = {0};
     int len = snprintf(diag, sizeof(diag),
         "[MTT] Reporter thread started (pid=%d, log=%s, interval=%ds)\n",
         (int)getpid(), g_reporter.log_path, MTT_REPORT_INTERVAL_SEC);
     if (len > 0 && len < (int)sizeof(diag))
-        MTT_DIAG_LOG(diag, (size_t)len);
+        MTT_LOG_INFO(diag, (size_t)len);
 }
 
 /**
@@ -1268,4 +1305,34 @@ void mtt_reporter_signal_scan(void)
     pthread_mutex_lock(&g_reporter.scan_mutex);
     scan_and_report_locked();
     pthread_mutex_unlock(&g_reporter.scan_mutex);
+}
+
+/**
+ * fork 子进程后重置 reporter 状态(tracker.c mtt_fork_child 调用)。
+ *
+ * fork 后:
+ *   - reporter 线程不存在(fork 不复制其他线程)
+ *   - g_reporter_started / g_atexit_registered / running 仍为 1(继承的脏值)
+ *   - scan_mutex / cache_lock 状态未定义(其他线程可能 fork 时持锁)
+ *
+ * 本函数重置这些标志和锁,让子进程下次 mtt_reporter_start 走完整启动流程
+ * (包括重新创建 reporter 线程 + 重新注册 atexit + 重新构建 log_path)。
+ *
+ * 注意:本函数在 fork child 上下文中调用,不调 pthread_create(async-signal-safe)。
+ * 实际的 reporter 线程重启由 mtt_ensure_init(子进程下次 malloc 触发)负责。
+ */
+void mtt_reporter_reset_for_fork(void)
+{
+    /* 重置"已启动"标志,让 mtt_reporter_start 不再跳过 */
+    atomic_store(&g_reporter_started, 0);
+    atomic_store_explicit(&g_reporter.running, 0, memory_order_release);
+    g_atexit_registered = 0;
+    g_atexit_done = 0;
+
+    /* fork 后 mutex 状态未定义,重新初始化 */
+    pthread_mutex_init(&g_reporter.scan_mutex, NULL);
+    pthread_mutex_init(&g_reporter.cache_lock, NULL);
+
+    /* 清空 leak_table(子进程从零开始追踪) */
+    memset(&g_reporter.leak_table, 0, sizeof(g_reporter.leak_table));
 }

@@ -39,7 +39,7 @@ static const char g_dashboard_html[] =
 "<head>\n"
 "<meta charset=\"UTF-8\">\n"
 "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
-"<meta http-equiv=\"Cache-Control\" content=\"no-cache\">\n"
+"<meta http-equiv=\"Cache-Control\" content=\"no-store, no-cache\">\n"
 "<title>MemoryTraceTool</title>\n"
 "<style>\n"
 ":root{--bg:#fff;--bg2:#f6f8fa;--text:#24292f;--border:#d0d7de;--accent:#0969da;--orange:#d97706;--green:#16a34a;--warn:#dc2626}\n"
@@ -71,6 +71,10 @@ static const char g_dashboard_html[] =
 ".toggle-btn{font-size:.75rem;padding:4px 10px;border:1px solid var(--border);border-radius:4px;background:var(--bg2);color:var(--text);cursor:pointer;margin-right:6px}\n"
 ".toggle-btn.active{background:var(--accent);color:#fff;border-color:var(--accent)}\n"
 ".toggle-btn:disabled{opacity:.4;cursor:not-allowed}\n"
+".unit-toggle{display:inline-flex;gap:2px;float:right;margin-right:14px;border:1px solid var(--border);border-radius:4px;overflow:hidden}\n"
+".unit-toggle .unit-btn{font-size:.7rem;padding:3px 9px;border:none;background:var(--bg2);color:var(--text);cursor:pointer;border-right:1px solid var(--border)}\n"
+".unit-toggle .unit-btn:last-child{border-right:none}\n"
+".unit-toggle .unit-btn.active{background:var(--accent);color:#fff}\n"
 ".stop-btn{font-size:.75rem;padding:4px 10px;border:1px solid var(--warn);border-radius:4px;background:var(--bg2);color:var(--warn);cursor:pointer}\n"
 "</style>\n"
 "</head>\n"
@@ -79,7 +83,7 @@ static const char g_dashboard_html[] =
 "<h1>MemoryTraceTool</h1>\n"
 "<div class=\"subtitle\" id=\"info\">加载中...</div>\n"
 "<div class=\"card\">\n"
-"  <h2>堆内存趋势 <span class=\"refresh\" id=\"refreshLabel\">每 5 秒刷新</span></h2>\n"
+"  <h2>堆内存趋势 <span class=\"unit-toggle\" id=\"unitToggle\"><button class=\"unit-btn\" data-unit=\"kb\">KB</button><button class=\"unit-btn\" data-unit=\"mb\">MB</button></span><span class=\"refresh\" id=\"refreshLabel\">每 5 秒刷新</span></h2>\n"
 "  <div class=\"stats\" id=\"stats\"></div>\n"
 "  <canvas id=\"chart\" width=\"800\" height=\"400\"></canvas>\n"
 "  <div class=\"tooltip\" id=\"tip\"></div>\n"
@@ -102,48 +106,59 @@ static const char g_dashboard_html[] =
 "var expandedHashes=new Set(); /* 记录展开的泄漏站点 hash，刷新后恢复 */\n"
 "var curPage=1, PAGE_SIZE=50, allLeaks=[];\n"
 "function fb(b){if(b==null)return'0 B';if(b>=1048576)return(b/1048576).toFixed(2)+' MB';if(b>=1024)return(b/1024).toFixed(2)+' KB';return b+' B'}\n"
+"/* 千分位格式化:不用 toLocaleString()(旧版浏览器/嵌入式 webview 会输出\n    带 7 位小数的 0.0000000,导致 Y 轴刻度异常),自实现兼容 */\n"
+"function fmtInt(n){n=Math.round(n);var s=String(n);return s.replace(/\\B(?=(\\d{3})+(?!\\d))/g,',')}\n"
+"var yUnit=(function(){try{var u=localStorage.getItem('mtt_yunit');if(u!=='mb'&&u!=='kb')u='kb';return u}catch(e){return'kb'}})();\n"
+"function fy(b){if(b==null||b<0)b=0;if(yUnit==='mb')return b>=1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB';return b>=1024?fmtInt(b/1024)+' KB':fmtInt(b)+' B'}\n"
+"(function(){var t=document.getElementById('unitToggle');if(!t)return;var btns=t.querySelectorAll('.unit-btn');btns.forEach(function(b){if(b.dataset.unit===yUnit)b.classList.add('active');b.onclick=function(){yUnit=b.dataset.unit;try{localStorage.setItem('mtt_yunit',yUnit)}catch(e){}btns.forEach(function(x){x.classList.toggle('active',x.dataset.unit===yUnit)});draw()}})})();\n"
 "function ft(t){if(!t||t<=0)return'N/A';return new Date(t*1000).toLocaleTimeString()}\n"
 "function draw(){\n"
 "  if(!data||!data.time_series||data.time_series.length===0)return;\n"
 "  var ts=data.time_series,W=chartCanvas.width,H=chartCanvas.height;\n"
 "  ctx.clearRect(0,0,W,H);\n"
-"  var pad={top:30,right:30,bottom:50,left:70};\n"
+"  var pad={top:28,right:28,bottom:48,left:64};\n"
 "  var pw=W-pad.left-pad.right,ph=H-pad.top-pad.bottom;\n"
-"  /* find max */\n"
-"  var maxB=1;\n"
-"  for(var i=0;i<ts.length;i++){var p=ts[i];if(p.peak>maxB)maxB=p.peak;if(p.cur>maxB)maxB=p.cur;}\n"
-"  function x(i){return pad.left+(i/(ts.length-1))*pw}\n"
+"  /* Y 轴范围:只用 total_alloc(单调累计,其他线不再画)(留 20% 顶部) */\n"
+"  var curMax=1;\n"
+"  for(var i=0;i<ts.length;i++){if(ts[i].talloc!=null&&ts[i].talloc>curMax)curMax=ts[i].talloc;}\n"
+"  var maxB=curMax*1.2;\n"
+"  if(maxB<1024)maxB=1024;  /* 下限 1KB:避免全 0 时出现 0.x 小数刻度 */\n"
+"  function x(i){return pad.left+(i/Math.max(1,ts.length-1))*pw}\n"
 "  function y(v){return pad.top+ph-(v/maxB)*ph}\n"
-"  /* grid */\n"
-"  ctx.strokeStyle=getComputedStyle(document.documentElement).getPropertyValue('--border').trim();\n"
-"  ctx.lineWidth=.5;\n"
-"  for(var j=0;j<=4;j++){var val=(maxB/4)*j,yy=y(val);ctx.beginPath();ctx.moveTo(pad.left,yy);ctx.lineTo(W-pad.right,yy);ctx.stroke();ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--text').trim();ctx.font='10px sans-serif';ctx.textAlign='right';ctx.fillText(fb(val),pad.left-6,yy+3)}\n"
-"  /* area */\n"
-"  ctx.beginPath();ctx.moveTo(x(0),pad.top+ph);\n"
-"  for(var i=0;i<ts.length;i++)ctx.lineTo(x(i),y(ts[i].cur));\n"
-"  ctx.lineTo(x(ts.length-1),pad.top+ph);ctx.closePath();\n"
-"  ctx.fillStyle='rgba(9,105,218,.15)';ctx.fill();\n"
-"  /* cur line */\n"
+"  var txtColor=getComputedStyle(document.documentElement).getPropertyValue('--text').trim();\n"
+"  var borderColor=getComputedStyle(document.documentElement).getPropertyValue('--border').trim();\n"
+"  /* 整齐刻度步长:取 1/2/5×10^n 中最接近 maxB/4 的值,避免小数刻度 */\n"
+"  var rawStep=maxB/4;\n"
+"  var mag=Math.pow(10,Math.floor(Math.log10(rawStep)));\n"
+"  var step=mag;\n"
+"  if(rawStep/step>=5)step*=5;else if(rawStep/step>=2)step*=2;\n"
+"  /* grid: 极浅,不抢戏 */\n"
+"  ctx.strokeStyle=borderColor;ctx.globalAlpha=0.35;ctx.lineWidth=1;\n"
+"  for(var v=0;v<=maxB;v+=step){var yy=y(v);ctx.beginPath();ctx.moveTo(pad.left,yy);ctx.lineTo(W-pad.right,yy);ctx.stroke()}\n"
+"  ctx.globalAlpha=1;\n"
+"  /* Y labels: 按 yUnit(KB/MB)切换 */\n"
+"  ctx.fillStyle=txtColor;ctx.globalAlpha=0.65;ctx.font='10px -apple-system,BlinkMacSystemFont,sans-serif';ctx.textAlign='right';\n"
+"  for(var v=0;v<=maxB;v+=step){var yy=y(v);ctx.fillText(fy(v),pad.left-8,yy+3)}\n"
+"  ctx.globalAlpha=1;\n"
+"  /* total_alloc line: 累计堆申请字节(monotonic,唯一一条线) */\n"
 "  ctx.beginPath();\n"
-"  for(var i=0;i<ts.length;i++){if(i===0)ctx.moveTo(x(i),y(ts[i].cur));else ctx.lineTo(x(i),y(ts[i].cur))}\n"
-"  ctx.strokeStyle='#0969da';ctx.lineWidth=2;ctx.stroke();\n"
-"  /* peak line */\n"
-"  ctx.beginPath();ctx.setLineDash([4,4]);\n"
-"  for(var i=0;i<ts.length;i++){if(i===0)ctx.moveTo(x(i),y(ts[i].peak));else ctx.lineTo(x(i),y(ts[i].peak))}\n"
-"  ctx.strokeStyle='#d97706';ctx.lineWidth=1.5;ctx.stroke();ctx.setLineDash([]);\n"
-"  /* legend */\n"
-"  ctx.fillStyle='#0969da';ctx.fillRect(pad.left+10,10,12,12);\n"
-"  ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--text').trim();\n"
-"  ctx.font='11px sans-serif';ctx.textAlign='left';\n"
-"  ctx.fillText('current_bytes',pad.left+26,20);\n"
-"  ctx.strokeStyle='#d97706';ctx.setLineDash([4,4]);\n"
-"  ctx.beginPath();ctx.moveTo(pad.left+120,16);ctx.lineTo(pad.left+150,16);ctx.stroke();ctx.setLineDash([]);\n"
-"  ctx.fillText('peak_bytes',pad.left+156,20);\n"
+"  if(ts.length>0&&ts[0].talloc!=null){\n"
+"    ctx.moveTo(x(0),y(ts[0].talloc));\n"
+"    for(var i=1;i<ts.length;i++){if(ts[i].talloc==null)continue;var mx=(x(i-1)+x(i))/2,my=(y(ts[i-1].talloc)+y(ts[i].talloc))/2;ctx.quadraticCurveTo(x(i-1),y(ts[i-1].talloc),mx,my)}\n"
+"    ctx.lineTo(x(ts.length-1),y(ts[ts.length-1].talloc));\n"
+"    ctx.strokeStyle='#22c55e';ctx.lineWidth=2;ctx.lineJoin='round';ctx.lineCap='round';ctx.stroke();\n"
+"  }\n"
+"  /* legend: 绿色圆点 + total_alloc */\n"
+"  ctx.font='11px -apple-system,BlinkMacSystemFont,sans-serif';ctx.textAlign='left';\n"
+"  ctx.fillStyle='#22c55e';ctx.beginPath();ctx.arc(pad.left+8,16,3.5,0,2*Math.PI);ctx.fill();\n"
+"  ctx.fillStyle=txtColor;ctx.fillText('total_alloc',pad.left+16,20);\n"
 "  /* X labels */\n"
-"  var steps=Math.min(10,ts.length);\n"
-"  for(var i=0;i<=steps;i++){var idx=Math.floor((ts.length-1)*i/steps);if(idx>=ts.length)idx=ts.length-1;var xx=x(idx);ctx.fillStyle=getComputedStyle(document.documentElement).getPropertyValue('--text').trim();ctx.font='10px sans-serif';ctx.textAlign='center';ctx.fillText(ft(ts[idx].ts),xx,H-pad.bottom+20)}\n"
+"  var steps=Math.min(8,ts.length);\n"
+"  ctx.fillStyle=txtColor;ctx.globalAlpha=0.65;ctx.font='10px -apple-system,BlinkMacSystemFont,sans-serif';ctx.textAlign='center';\n"
+"  for(var i=0;i<=steps;i++){var idx=Math.floor((ts.length-1)*i/steps);if(idx>=ts.length)idx=ts.length-1;var xx=x(idx);ctx.fillText(ft(ts[idx].ts),xx,H-pad.bottom+18)}\n"
+"  ctx.globalAlpha=1;\n"
 "  /* hover */\n"
-"  chartCanvas.onmousemove=function(e){var r=chartCanvas.getBoundingClientRect();var sx=chartCanvas.width/r.width;var mx=(e.clientX-r.left)*sx;for(var i=0;i<ts.length;i++){if(Math.abs(mx-x(i))<5){var pt=ts[i];tip.style.display='block';tip.style.left=(e.clientX+15)+'px';tip.style.top=(e.clientY-30)+'px';tip.textContent=ft(pt.ts)+' | cur:'+fb(pt.cur)+' | peak:'+fb(pt.peak)+' | allocs:'+pt.allocs+' | frees:'+pt.frees;return}}tip.style.display='none'}\n"
+"  chartCanvas.onmousemove=function(e){var r=chartCanvas.getBoundingClientRect();var sx=chartCanvas.width/r.width;var mx=(e.clientX-r.left)*sx;for(var i=0;i<ts.length;i++){if(Math.abs(mx-x(i))<5){var pt=ts[i];tip.style.display='block';tip.style.left=(e.clientX+15)+'px';tip.style.top=(e.clientY-30)+'px';tip.textContent=ft(pt.ts)+' | total_alloc:'+fb(pt.talloc!=null?pt.talloc:0);return}}tip.style.display='none'}\n"
 "}\n"
 "function renderStats(st){\n"
 "  var s=st||{};\n"
@@ -174,7 +189,7 @@ static const char g_dashboard_html[] =
 "    '<div class=\"stat\"><div class=\"val\">'+fb(s.total_allocated||0)+'</div><div class=\"lbl\">累计分配总量</div></div>'+\n"
 "    '<div class=\"stat\">'+poolHtml+'</div>';\n"
 "}\n"
-"function alCmd(frame){var m1=frame.match(/\\((.+)\\)$/);var m2=frame.match(/\\+(0x[0-9a-fA-F]+)/);if(m1&&m2)return'addr2line -e '+m1[1]+' -f -C '+m2[1];return''}\n"
+"function alCmd(frame){var m=frame.match(/\\((.+)\\+(0x[0-9a-fA-F]+)\\)$/);if(m)return'addr2line -e '+m[1]+' -f -C '+m[2];return''}\n"
 "function renderLeaks(leaks){\n"
 "  allLeaks=leaks||[];\n"
 "  var total=Math.ceil(allLeaks.length/PAGE_SIZE)||1;\n"
@@ -269,7 +284,7 @@ static void handle_root(int client_fd)
     const char *header =
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
-        "Cache-Control: no-cache\r\n"
+        "Cache-Control: no-store, no-cache, max-age=0\r\n"
         "Connection: close\r\n"
         "\r\n";
     MTT_DIAG_WRITE(client_fd, header, strlen(header));
@@ -424,7 +439,7 @@ static void handle_api_data(int client_fd)
     const char *header =
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: application/json; charset=utf-8\r\n"
-        "Cache-Control: no-cache\r\n"
+        "Cache-Control: no-store, no-cache, max-age=0\r\n"
         "Connection: close\r\n"
         "\r\n";
     MTT_DIAG_WRITE(client_fd, header, strlen(header));
@@ -501,11 +516,12 @@ static void handle_api_data(int client_fd)
                 if (wrote_first) MTT_DIAG_WRITE(client_fd, ",", 1);
                 wrote_first = 1;
                 len = snprintf(buf, sizeof(buf),
-                    "{\"ts\":%lld,\"cur\":%zu,\"peak\":%zu,\"allocs\":%zu,\"frees\":%zu,\"entries\":%zu,\"rss\":%zu}",
+                    "{\"ts\":%lld,\"cur\":%zu,\"peak\":%zu,\"allocs\":%zu,\"frees\":%zu,\"entries\":%zu,\"rss\":%zu,\"leak\":%zu,\"talloc\":%zu}",
                     (long long)ts_buf[i].timestamp, ts_buf[i].current_bytes,
                     ts_buf[i].peak_bytes, ts_buf[i].alloc_count,
                     ts_buf[i].free_count, ts_buf[i].entry_count,
-                    ts_buf[i].rss_bytes);
+                    ts_buf[i].rss_bytes, ts_buf[i].leak_bytes,
+                    ts_buf[i].total_alloc_bytes);
                 if (len < 0) len = 0;
                 else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
                 MTT_DIAG_WRITE(client_fd, buf, (size_t)len);
@@ -547,7 +563,7 @@ static void handle_api_leaks(int client_fd)
     const char *header =
         "HTTP/1.0 200 OK\r\n"
         "Content-Type: application/json; charset=utf-8\r\n"
-        "Cache-Control: no-cache\r\n"
+        "Cache-Control: no-store, no-cache, max-age=0\r\n"
         "Connection: close\r\n"
         "\r\n";
     MTT_DIAG_WRITE(client_fd, header, strlen(header));
@@ -683,16 +699,16 @@ static void* http_thread_fn(void *arg)
  *                     公共接口                                              *
  * ======================================================================== */
 
-void mtt_http_server_start(uint16_t port)
+uint16_t mtt_http_server_start(uint16_t port)
 {
-    if (port == 0) return;
-    if (atomic_load_explicit(&g_http_server.running, memory_order_acquire)) return;
+    if (port == 0) return 0;
+    if (atomic_load_explicit(&g_http_server.running, memory_order_acquire)) return g_http_server.port;
 
     /* SIGPIPE 已在 mtt_ensure_init() 中通过 sigaction 全局忽略，
      * 无需在此重复设置。 */
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) return;
+    if (listen_fd < 0) return 0;
     int reuse = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
@@ -701,15 +717,48 @@ void mtt_http_server_start(uint16_t port)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
+    /* bind 重试逻辑(解决 daemon fork 端口冲突):
+     *
+     * 场景:进程 fork 后父进程立即退出(daemon 化),子进程成为唯一存活
+     * 进程。但子进程 init 在 fork 后立即触发(第一次 malloc),此时父进程
+     * 可能还没退出,仍占用请求端口(如 8080) → 子进程 bind 失败。
+     *
+     * 策略:对请求端口重试若干次(间隔 0.5 秒),等父进程退出后端口释放。
+     * 重试耗尽才退到 port+1~port+5 的 fallback 逻辑。
+     *
+     * 重试参数:4 次 × 0.5 秒 = 最多等 2 秒,足够父进程退出。
+     * 用 nanosleep(不依赖 SIGALRM,不影响信号处理)。 */
+    #define MTT_HTTP_BIND_RETRIES  4
+    #define MTT_HTTP_BIND_RETRY_NS (500 * 1000 * 1000L)  /* 0.5 秒 */
+
     int bound = 0;
-    for (int try_port = port; try_port < (int)port + 6; try_port++) {
-        addr.sin_port = htons((uint16_t)try_port);
+
+    /* 第一阶段:对请求端口重试(等父进程退出释放端口) */
+    addr.sin_port = htons(port);
+    for (int attempt = 0; attempt < MTT_HTTP_BIND_RETRIES && !bound; attempt++) {
         if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            bound = 1; port = (uint16_t)try_port; break;
+            bound = 1;
+            break;
+        }
+        /* bind 失败:等待 0.5 秒后重试(最后一次失败后不等待,直接进 fallback)。
+         * 非 fork 场景(端口真空闲):attempt=0 就 bind 成功,不会等待。 */
+        if (attempt < MTT_HTTP_BIND_RETRIES - 1) {
+            struct timespec ts = { 0, MTT_HTTP_BIND_RETRY_NS };
+            nanosleep(&ts, NULL);
         }
     }
-    if (!bound) { close(listen_fd); return; }
-    if (listen(listen_fd, MTT_HTTP_BACKLOG) < 0) { close(listen_fd); return; }
+
+    /* 第二阶段:重试耗尽,尝试 port+1 ~ port+5(fallback) */
+    if (!bound) {
+        for (int try_port = port + 1; try_port < (int)port + 6; try_port++) {
+            addr.sin_port = htons((uint16_t)try_port);
+            if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                bound = 1; port = (uint16_t)try_port; break;
+            }
+        }
+    }
+    if (!bound) { close(listen_fd); return 0; }
+    if (listen(listen_fd, MTT_HTTP_BACKLOG) < 0) { close(listen_fd); return 0; }
 
     g_http_server.listen_fd = listen_fd;
     g_http_server.port = port;
@@ -718,14 +767,19 @@ void mtt_http_server_start(uint16_t port)
     pthread_t tid;
     if (pthread_create(&tid, NULL, http_thread_fn, NULL) != 0) {
         atomic_store_explicit(&g_http_server.running, 0, memory_order_release);
-        close(listen_fd); return;
+        close(listen_fd); return 0;
     }
     g_http_server.thread = tid;
 
-    char diag[128];
-    int len = snprintf(diag, sizeof(diag), "[MTT] HTTP dashboard: http://0.0.0.0:%u/\n", (unsigned)port);
-    if (len > 0 && len < (int)sizeof(diag))
-        MTT_DIAG_LOG(diag, (size_t)len);
+    /* 实际端口可能与请求端口不同(fork 场景:父进程占用了请求端口,
+     * 子进程 bind 到 port+1 等)。用 INFO 等级输出,让用户知道实际地址。 */
+    if (port != 0) {
+        char diag[128];
+        int len = snprintf(diag, sizeof(diag), "[MTT] HTTP dashboard: http://0.0.0.0:%u/\n", (unsigned)port);
+        if (len > 0 && len < (int)sizeof(diag))
+            MTT_LOG_INFO(diag, (size_t)len);
+    }
+    return port;
 }
 
 void mtt_http_server_stop(void)
@@ -735,4 +789,22 @@ void mtt_http_server_stop(void)
         close(g_http_server.listen_fd);
         g_http_server.listen_fd = -1;
     }
+}
+
+/**
+ * fork 子进程后重置 HTTP server 状态。
+ *
+ * 由 tracker.c 的 mtt_fork_child 调用(async-signal-safe 上下文)。
+ * 与 stop 的差异:重置 thread/port,让子进程下次 mtt_http_server_start
+ * 重新走完整 socket/bind/listen 流程。
+ */
+void mtt_http_reset_for_fork(void)
+{
+    atomic_store_explicit(&g_http_server.running, 0, memory_order_release);
+    if (g_http_server.listen_fd > 0) {
+        close(g_http_server.listen_fd);
+        g_http_server.listen_fd = -1;
+    }
+    g_http_server.thread = 0;
+    g_http_server.port = 0;
 }

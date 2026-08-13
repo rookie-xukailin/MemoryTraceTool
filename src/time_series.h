@@ -24,6 +24,8 @@ typedef struct {
     size_t   free_count;     /* 累计释放次数 */
     size_t   entry_count;    /* 哈希表中活跃条目数 */
     size_t   rss_bytes;      /* 进程 RSS（驻留集大小，来自 /proc/self/statm） */
+    size_t   leak_bytes;     /* 已识别泄漏站点累积字节(sum of site->total_size) */
+    size_t   total_alloc_bytes; /* 累计堆申请字节(monotonic, hook 每次 alloc += size) */
 } mtt_ts_point_t;
 
 /** 时序数据环形缓冲区 */

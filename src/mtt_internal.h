@@ -60,8 +60,9 @@
  * ======================================================================== */
 
 #define MTT_BUCKETS             4096    /* 哈希桶数量（必须为 2 的幂，用于位掩码取模） */
-#define MTT_MAX_ENTRIES         65536   /* 分配追踪表最大条目数（同时是池子上限） */
-#define MTT_STACK_DEPTH         64      /* 调用栈最大深度（RPC 回调链 + 多层 .so 嵌套场景需要） */
+#define MTT_MAX_ENTRIES         131072  /* 分配追踪表最大条目数(同时是池子上限,扩到 2^17 让 ARM32 也能用 20MB pool) */
+#define MTT_STACK_DEPTH         64      /* 调用栈数组容量(编译期固定,entry->stack[64] 大小)。
+                                         * 运行时实际回溯深度由 MTT_MAX_STACK_FRAMES 控制(默认 8)。 */
 
 /* FP chain（帧指针链）兜底触发阈值：
  *   - backtrace() 返回的帧数 < 此阈值时，启用 FP chain 补全
@@ -72,10 +73,16 @@
  *   - ARM64 上 bt_frames 通常 >> 4，FP chain 不触发，零开销 */
 #define MTT_FP_FALLBACK_THRESHOLD 4
 
+/* entry 池目标内存占用(运行时按 sizeof(mtt_entry_t) 反推 entry 数):
+ *   ARM32 sizeof(mtt_entry_t)=288 → 72817 entries × 288B = 20MB
+ *   ARM64 sizeof(mtt_entry_t)=560 → 37449 entries × 560B = 20MB
+ * 实际值还会被 MTT_POOL_ENTRIES_MIN/MAX 夹紧,可被 MTT_POOL_ENTRIES 环境变量覆盖 */
+#define MTT_POOL_TARGET_BYTES   (20 * 1024 * 1024)
+
 /* entry 池配置 */
-#define MTT_POOL_ENTRIES_DEFAULT 16384  /* 池子默认 entry 数（约 10MB，可被环境变量 MTT_POOL_ENTRIES 覆盖） */
+#define MTT_POOL_ENTRIES_DEFAULT 0      /* 0=按 MTT_POOL_TARGET_BYTES 自动算(init 时算) */
 #define MTT_POOL_ENTRIES_MIN     1024   /* 池子最小 entry 数 */
-#define MTT_POOL_ENTRIES_MAX     65536  /* 池子最大 entry 数（与 MTT_MAX_ENTRIES 一致，避免改 hash 硬上限） */
+#define MTT_POOL_ENTRIES_MAX     131072 /* 池子最大 entry 数(与 MTT_MAX_ENTRIES 一致) */
 
 /* 池子模式标识（atomic_int 存储于 mtt_state_t.pool_mode） */
 #define MTT_POOL_MODE_NONE       0      /* 尚未初始化 */
@@ -93,6 +100,13 @@
 #define MTT_SAMPLE_RATE_DEFAULT 0       /* 默认不启用字节采样（全量追踪），>0 时启用 */
 #define MTT_SAMPLE_RATE_MAX     30      /* 最大采样率（2^30 = 1GB） */
 #define MTT_BIG_ALLOC_THRESHOLD (1024 * 1024)  /* 大分配阈值（1MB），大分配总是追踪 */
+/* 采样豁免阈值(1KB):size >= 此值 时直接全量追踪,不参与字节采样累加。
+ * 设计目的:
+ *   1. 中等对象(1KB~1MB)100% 追踪,不漏检真实业务泄漏
+ *   2. 大对象吃掉累加器配额的问题消除(>=1KB 不进 sample_bytes_accum)
+ *   3. 小对象(<1KB)采样率更稳定(只统计小对象的累积)
+ * 适用场景:采样模式下(MTT_SAMPLE_RATE>0),希望中等对象不漏检 */
+#define MTT_SAMPLE_EXEMPT_THRESHOLD 1024  /* 1KB,>=此值豁免采样 */
 
 /* 时序数据采集 */
 #define MTT_TS_MAX_POINTS       3600    /* 环形缓冲区容量（1 小时 @ 1Hz） */
@@ -106,6 +120,14 @@
 
 /* SIGUSR1 信号触发即时报告 */
 #define MTT_SIGNAL_REPORT       SIGUSR1 /* 触发即时报告的信号 */
+
+/* 阶段标记日志(MTT_DEBUG=1 时输出,定位崩溃用)。定义在 tracker.c */
+void mtt_log_stage(int stage_id, const char *fmt, ...);
+
+/* 栈回溯模式(0=auto, 1=libunwind only, 2=backtrace only)。
+ * 由 MTT_UNWINDER 环境变量控制。定义在 tracker.c */
+extern int g_unwinder_mode;
+extern int g_max_stack_frames;
 
 /* 诊断日志开关（MTT_DEBUG=1 开, =0 关）。
  * 默认打开; 关闭后只保留泄漏报告写到 /var/log/mtt 下、
@@ -215,12 +237,17 @@ typedef struct {
     /* entry 池：启动时一次性申请的大块内存，所有 entry 复用槽位。
      * 设计目标：减少 libc malloc/free 调用频次，工具自身内存占用可视化。
      * 关键不变量：池子在用数 == entry_count == 桶链表总节点数；
-     *            free list 长度 == pool_capacity - pool_used。
+     *            free list 总长(64 桶求和) == pool_capacity - pool_used。
      * entry->next 在桶链表里指向同桶下一个；在 free list 里指向下一个空闲
-     * （同一时刻 entry 只在其中一个链中，语义复用安全）。 */
+     * （同一时刻 entry 只在其中一个链中，语义复用安全）。
+     *
+     * 锁分散(per-stripe free list):
+     *   原 pool_lock 单锁在多线程高频 alloc 下成为串行瓶颈,改 64 桶独立
+     *   free_list + 64 把独立锁(缓存行对齐防伪共享)。归还按 entry 地址算
+     *   stripe idx,取用按 ptr 算 idx,平均分布到 64 桶降低竞争 64x。 */
     mtt_entry_t        *pool;                           /* 池子起始地址（raw_malloc 大块） */
-    mtt_entry_t        *pool_free_list;                 /* 空闲 entry 链头（用 entry->next 串） */
-    pthread_mutex_t     pool_lock;                      /* free list 操作互斥锁 */
+    mtt_entry_t        *pool_free_lists[MTT_LOCK_STRIPES]; /* 空闲 entry 链头数组(用 entry->next 串) */
+    mtt_aligned_mutex_t pool_locks[MTT_LOCK_STRIPES];   /* free list 分段锁数组(缓存行对齐) */
     size_t              pool_capacity;                  /* 池子总 entry 数（启动时确定） */
     size_t              pool_raw_size;                  /* 池子原始字节数 = capacity * sizeof(mtt_entry_t) */
     _Atomic size_t      pool_used;                      /* 当前在用 entry 数（无锁读取） */
@@ -235,6 +262,7 @@ typedef struct {
     _Atomic size_t      current_bytes;              /* 当前仍未释放的字节数 */
     _Atomic size_t      peak_bytes;                 /* 历史峰值 current_bytes */
     _Atomic size_t      total_bytes;                /* 累计分配字节总数 */
+    _Atomic size_t      leak_bytes_total;           /* 已识别泄漏站点累积字节(reporter 每次 scan 后刷新) */
     _Atomic uint64_t    entry_count;                /* 当前哈希表条目数（64-bit 防回绕） */
     _Atomic unsigned    sample_period;              /* 采样周期：0=全量, N>0=每N次记录1次 */
     _Atomic uint64_t    sample_counter;             /* 采样计数器（64-bit 防回绕） */
@@ -312,14 +340,46 @@ static inline void mtt_stripe_unlock(mtt_state_t *s, const void *ptr)
 }
 
 /* ======================================================================== *
+ *                  时间戳获取(VDSO 优化,规避 time(NULL) 系统调用)             *
+ * ======================================================================== */
+
+#ifndef CLOCK_REALTIME_COARSE
+#define CLOCK_REALTIME_COARSE 5
+#endif
+
+/**
+ * 获取当前 wall-clock 秒数(语义等价 time(NULL))。
+ *
+ * 走 CLOCK_REALTIME_COARSE:Linux VDSO 实现,无 syscall 切换,
+ * ARM32 上较 time(NULL) 省约 1-2μs/次。多线程高频 alloc/free 路径
+ * 每次都要打时间戳(entry->timestamp、临时分配寿命判定),开销显著。
+ *
+ * 内核粗粒度:HZ=1000 → 1ms;HZ=100 → 10ms。对 entry->timestamp /
+ * first_seen / last_seen / 临时分配寿命(<=1s)判定均足够。
+ *
+ * 兼容性:失败回退 time(NULL),保证语义不变。
+ */
+static inline time_t mtt_now_sec(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME_COARSE, &ts) == 0)
+        return ts.tv_sec;
+    return time(NULL);
+}
+
+/* ======================================================================== *
  *                  共享函数声明（跨模块调用）                                  *
  * ======================================================================== */
 
 /* tracker.c */
 void         mtt_ensure_init(void);
 void         mtt_resolve_raw_allocators(void);
+void         mtt_fork_child(void);    /* fork 后子进程状态重置(hooks.c fork 拦截调用) */
+void         mtt_fork_prepare(void);  /* fork 前加锁(hooks.c fork 拦截调用) */
+void         mtt_fork_parent(void);   /* fork 后父进程解锁(hooks.c fork 拦截调用) */
 mtt_entry_t* mtt_entry_new(void *ptr, size_t size);
 void         mtt_entry_add(mtt_state_t *s, mtt_entry_t *e);
+void         mtt_entry_discard(mtt_state_t *s, mtt_entry_t *e);   /* 归还未入表的 entry(pool 模式回 free_list,raw 模式 raw_free) */
 mtt_entry_t* mtt_entry_find(mtt_state_t *s, const void *ptr);
 void         mtt_entry_remove(mtt_state_t *s, const void *ptr);
 int          mtt_should_track(mtt_state_t *s, size_t size);
@@ -329,19 +389,67 @@ int          mtt_is_blacklisted(mtt_state_t *s, const char *symbol);
 void         mtt_capture_stack(mtt_entry_t *entry);
 int          mtt_pool_contains(const void *ptr);   /* 判断 ptr 是否落在 entry 池范围内（防止误 free） */
 
-/* 诊断日志开关（tracker.c 定义）。
- * =1: 输出 init 状态/scan 进度等诊断信息到 stderr
- * =0: 静默运行,只输出 leak 报告 + heartbeat
- * 由环境变量 MTT_DEBUG 控制,默认开。
- * 所有非热路径的诊断打印都应判断此标志。 */
-extern _Atomic int mtt_debug_enabled;
+/* ======================================================================== *
+ *     库地址范围黑名单(MTT_LIB_BLACKLIST_FAST,精准跳过 lmdb/XML 等库)      *
+ * ======================================================================== *
+ *  启动时解析 /proc/self/maps,记录黑名单库的地址范围。
+ *  热路径 hook 用 LR(__builtin_return_address(0))快速判断"在不在黑名单库内",
+ *  命中则跳过抓栈(节省 8.5μs/次),不命中则正常追踪。
+ *
+ *  与现有 MTT_LIB_BLACKLIST 的区别:
+ *    - 现有:reporter scan 时按 symbol 字符串过滤(只影响显示,不省抓栈开销)
+ *    - 本次:热路径按地址范围过滤(直接跳过抓栈,省 CPU)
+ *
+ *  完全不碰 sigaction/mutex/handler/TLS,规避前 4 次失败的根因。
+ */
+#define MTT_BLACKLIST_RANGES_MAX 64   /* 地址范围上限,够 8 个库 × 8 段使用 */
 
-/* 工具自身的 stderr 诊断打印宏(仅非热路径用)。
- * 默认开,关闭时编译期不消除但运行时短路(单次分支判断,可忽略)。
- * pool init 日志、关键 ERROR/WARNING 不受此开关控制(始终输出)。 */
+/** 地址范围(启动时从 /proc/self/maps 解析) */
+typedef struct {
+    void *start;
+    void *end;
+} mtt_addr_range_t;
+
+/* 全局变量(tracker.c 定义,hooks.c 通过宏读取)。
+ * extern 声明让 hooks.c 的 MTT_LR_IN_BLACKLIST 宏可见 */
+extern mtt_addr_range_t g_blacklist_ranges[MTT_BLACKLIST_RANGES_MAX];
+extern int              g_blacklist_range_count;
+extern int              g_blacklist_fast_enabled;
+
+/**
+ * 判断 LR(直接调用者的 PC)是否落在黑名单库地址范围内。
+ *
+ * 热路径调用,开销 20~50 纳秒(几次比较)。命中的 malloc 跳过抓栈,
+ * 不建 entry,直接 raw_malloc 返回。
+ *
+ * @param lr  __builtin_return_address(0) 取的直接 caller PC
+ * @return    1=在黑名单库内(跳过追踪),0=不在(正常追踪)
+ */
+int          mtt_is_lr_in_blacklist(void *lr);
+
+/* 三档日志等级(tracker.c 定义,由环境变量 MTT_DEBUG 控制)。
+ *   0 = 静默:只输出 leak 报告 + heartbeat + HTTP API + SIGUSR1
+ *   1 = 关键:启动/退出事件、libunwind 崩溃、WARNING(最少日志)
+ *   2 = 全量:等级 1 + 阶段日志 S1-S74 + scan enter/dedup/done 等调试细节
+ * 默认 1。生产部署建议 0 降低开销,调试崩溃用 2。 */
+extern _Atomic int mtt_debug_level;
+
+/* 关键事件日志(等级 >= 1 输出):hook first call、Reporter 启动、
+ * Signal 线程就绪、pool init、final scan、libunwind 崩溃、WARNING。
+ * 用法与 MTT_DIAG_LOG 一致:buf/len 已组装好的字符串。 */
+#define MTT_LOG_INFO(buf, len) \
+    do { \
+        if (atomic_load_explicit(&mtt_debug_level, memory_order_relaxed) >= 1) { \
+            long __mtt_w = (long)write(STDERR_FILENO, (buf), (len)); \
+            (void)__mtt_w; \
+        } \
+    } while (0)
+
+/* 调试事件日志(等级 >= 2 输出):scan 进度、dedup 详情、阶段日志等。
+ * 等级 0/1 静默,默认 1 时不输出,需要完整诊断时设 MTT_DEBUG=2。 */
 #define MTT_DIAG_LOG(buf, len) \
     do { \
-        if (atomic_load_explicit(&mtt_debug_enabled, memory_order_relaxed)) { \
+        if (atomic_load_explicit(&mtt_debug_level, memory_order_relaxed) >= 2) { \
             long __mtt_w = (long)write(STDERR_FILENO, (buf), (len)); \
             (void)__mtt_w; \
         } \

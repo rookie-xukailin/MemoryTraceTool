@@ -1,0 +1,18 @@
+# 强制全仓库使用 LF 行尾,避免 core.autocrlf=true 的环境
+# (如某些公司统一镜像的 HDM3 build 机)把文本文件检出成 CRLF
+# 导致 #!/bin/sh\r 的 "bad interpreter" 错误。
+* text=auto eol=lf
+
+# 这些是可执行脚本,必须保持 LF + 可执行位
+*.sh       text eol=lf
+configure  text eol=lf
+config/*   text eol=lf
+
+# 二进制文件不做行尾转换
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.zip  binary
+*.so   binary
+*.a    binary
+*.o    binary
