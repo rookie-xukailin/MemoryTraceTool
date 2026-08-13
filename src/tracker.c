@@ -1572,6 +1572,18 @@ static void mtt_fork_child(void)
     mtt_tls_ctx = NULL;
     mtt_tls_cached_tid = 0;
 
+    /* 3.5 重置当前线程槽位的 hook_depth + in_hook。
+     * ARM64 BMC 上 libc 初始化可能 longjmp 跳过 dec_depth,导致 depth=1 残留。
+     * fork 后子进程继承这个残留 → 子进程所有 malloc 被 SKIP → 不走 init → 不跟踪。
+     * ARM32 depth=0(不残留),重置为 0 没变化。 */
+    for (int i = 0; i < MTT_MAX_THREADS; i++) {
+        if (atomic_load_explicit(&g_threads[i].tid, memory_order_acquire) == my_tid) {
+            g_threads[i].hook_depth = 0;
+            g_threads[i].in_hook = 0;
+            break;
+        }
+    }
+
     /* 4. 重新初始化所有分段锁 + pool 锁(fork 后 mutex 状态未定义) */
     for (int i = 0; i < MTT_LOCK_STRIPES; i++) {
         pthread_mutex_init(&s->bucket_locks[i].lock, NULL);
