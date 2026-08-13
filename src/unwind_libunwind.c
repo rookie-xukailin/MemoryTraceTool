@@ -52,54 +52,6 @@
 #include "mtt_internal.h"   /* MTT_FIX_THUMB_ADDR, mtt_log_stage */
 
 /* ======================================================================== *
- *           模式 0: 无 libunwind 集成(MTT_NO_LIBUNWIND)                       *
- * ======================================================================== *
- * ARM64 / 本机默认走此路径(由 Makefile MTT_LIBUNWIND_STATIC 控制)。
- *
- * 原因:libunwind 静态链接进 .so(dd1145f)会破坏 glibc backtrace — bt_test
- * 实测铁证,挂工具后 n=0(原本 n=6)。ARM64 + 业务二进制 .eh_frame 完整时,
- * glibc backtrace 工作正常,不需要 libunwind。
- *
- * 此模式下:
- *   - mtt_libunwind_available() 恒返回 0 → mtt_capture_stack 自然走 backtrace
- *   - mtt_libunwind_capture() 永不被调
- *   - SIGSEGV handler / per-thread 降级 / mutex 等机制不编译(零开销)
- *
- * ARM32 仍走 libunwind 集成路径(compile-arm32.sh 传 MTT_LIBUNWIND_STATIC=1),
- * 因为 ARM32 -fomit-frame-pointer 业务上 glibc backtrace 拿不到深栈。 */
-#ifdef MTT_NO_LIBUNWIND
-
-int mtt_libunwind_available(void) { return 0; }
-
-int mtt_libunwind_capture(void **frames, int max_frames)
-{
-    (void)frames; (void)max_frames;
-    return -1;
-}
-
-int mtt_libunwind_thread_disabled(void) { return 0; }
-
-/* 简单 backtrace 包装(无信号保护,因为无 libunwind 不会触发 SIGSEGV handler)。
- * MTT_NO_LIBUNWIND 模式下,thread_disabled 恒返回 0,capture_stack 永不调用
- * 本函数(disabled 路径)。保留实现仅为链接通过。 */
-#if MTT_HAS_BACKTRACE
-#include <execinfo.h>
-int mtt_safe_backtrace(void **frames, int max_frames)
-{
-    if (frames == NULL || max_frames <= 0) return 0;
-    return backtrace(frames, max_frames);
-}
-#else
-int mtt_safe_backtrace(void **frames, int max_frames)
-{
-    (void)frames; (void)max_frames;
-    return 0;
-}
-#endif
-
-#else  /* !MTT_NO_LIBUNWIND — 以下代码仅在 libunwind 集成时编译 */
-
-/* ======================================================================== *
  *        共享:SIGSEGV/SIGBUS 信号保护 + per-thread 降级                     *
  * ======================================================================== */
 
@@ -563,5 +515,3 @@ int mtt_safe_backtrace(void **frames, int max_frames)
 }
 
 #endif /* MTT_HAS_BACKTRACE */
-
-#endif /* !MTT_NO_LIBUNWIND */

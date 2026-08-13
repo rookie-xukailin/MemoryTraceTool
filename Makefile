@@ -28,23 +28,9 @@ ifneq ($(MTT_EMBEDDED),)
 endif
 
 CORE_CFLAGS = -Wall -Wextra -g -O1 -fPIC -funwind-tables -fno-omit-frame-pointer
-
-# libunwind 静态链接:所有平台默认链接(BMC ARM64 glibc backtrace 失效,必须用 libunwind)
-MTT_LIBUNWIND_STATIC ?= 1
-
-ifeq ($(MTT_LIBUNWIND_STATIC),1)
-    LIBUNWIND_DEFINES = -DMTT_STATIC_LIBUNWIND
-    LIBUNWIND_DEPS    = $(LIBUNWIND_STATIC)
-    LIBUNWIND_LINK    = $(LIBUNWIND_STATIC)
-    LIBUNWIND_INC     = -DUNW_LOCAL_ONLY -I$(LIBUNWIND_BUILD)/include -I$(LIBUNWIND_SRC)/include
-else
-    LIBUNWIND_DEFINES = -DMTT_NO_LIBUNWIND
-    LIBUNWIND_DEPS    =
-    LIBUNWIND_LINK    =
-    LIBUNWIND_INC     =
-endif
-
-CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS) $(EMBEDDED_DEFS) $(LIBUNWIND_DEFINES)
+# MTT_STATIC_LIBUNWIND: 启用静态链接 libunwind(随产物发布,目标机无需预装)
+# 在 src/unwind_libunwind.c 切换为编译期直连 unw_backtrace,跳过 dlopen 探测
+CFLAGS   ?= $(CORE_CFLAGS) $(ARCH_FLAGS) $(EMBEDDED_DEFS) -DMTT_STATIC_LIBUNWIND
 
 CC       = $(CROSS_COMPILE)gcc
 
@@ -85,30 +71,11 @@ LIB_OBJS = $(BUILD_DIR)/hooks.o $(BUILD_DIR)/tracker.o \
 SHARED_LIB = $(OUTPUT_DIR)/libmemorytracetool.so
 
 .PHONY: all clean distclean demo demo_preload demo_long_running demo_controlled_leak \
-        test test_stability test_all sysroot-arm32 vendor-clean bt_test \
-        arm32 arm64
+        test test_stability test_all sysroot-arm32 vendor-clean
 
 # 默认目标必须出现在所有 .o/.a 构建规则之前,否则 make 无参数时
 # 会把第一个非 .PHONY 文件目标当作默认
-all: $(SHARED_LIB) bt_test
-
-# 架构伪目标(用户捷径):
-#   make arm32          → ARM32 编译(链接 libunwind + 嵌入式优化)
-#   make arm64          → ARM64 编译(不链接 libunwind)
-#   make                → 本机默认编译(不链接 libunwind)
-#
-# 不强制设 ARCH(避免与工具链默认 -march/-mfloat-abi 冲突),让 CROSS_COMPILE
-# 指定的工具链自己决定目标架构。仅设 MTT_LIBUNWIND_STATIC + MTT_EMBEDDED。
-#
-# 用户用法:
-#   export CROSS_COMPILE=arm-linux-gnueabihf-   # 或其他 ARM32 工具链前缀
-#   make arm32                                   # 编译 ARM32 + libunwind
-#   make arm64                                   # 编译 ARM64 + 纯 glibc backtrace
-arm32:
-	$(MAKE) MTT_LIBUNWIND_STATIC=1 MTT_EMBEDDED=1
-
-arm64:
-	$(MAKE) MTT_LIBUNWIND_STATIC=
+all: $(SHARED_LIB)
 
 # ---- libunwind 静态库构建 ----
 # open/libunwind 是 vendored libunwind v1.8.2 源码(MIT 许可,随项目分发)。
@@ -154,12 +121,11 @@ $(LIBUNWIND_STATIC): $(LIBUNWIND_SRC)/configure
 	        --disable-minidebuginfo \
 	        --disable-zlibdebuginfo \
 	        --disable-documentation \
-	        --disable-weak-backtrace \
 	        CC="$(CC)" CFLAGS="$(ARCH_FLAGS) -O2 -fPIC -fno-omit-frame-pointer"
 	$(MAKE) -C $(LIBUNWIND_BUILD) -j4 V=0
 
-$(SHARED_LIB): $(LIB_OBJS) $(LIBUNWIND_DEPS) | $(OUTPUT_DIR)
-	$(CC) -shared -o $@ $(LIB_OBJS) $(LIBUNWIND_LINK) \
+$(SHARED_LIB): $(LIB_OBJS) $(LIBUNWIND_STATIC) | $(OUTPUT_DIR)
+	$(CC) -shared -o $@ $(LIB_OBJS) $(LIBUNWIND_STATIC) \
 	    -Wl,--exclude-libs,ALL $(LDFLAGS)
 	@rm -f $(BUILD_DIR)/*.o
 
@@ -187,8 +153,8 @@ $(BUILD_DIR)/http_server.o: $(SRC_DIR)/http_server.c $(SRC_DIR)/http_server.h $(
 $(BUILD_DIR)/addr_validate.o: $(SRC_DIR)/addr_validate.c $(SRC_DIR)/addr_validate.h $(SRC_DIR)/mtt_internal.h | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INC_SHARED) -c -o $@ $<
 
-$(BUILD_DIR)/unwind_libunwind.o: $(SRC_DIR)/unwind_libunwind.c $(SRC_DIR)/unwind_libunwind.h $(SRC_DIR)/mtt_internal.h $(LIBUNWIND_DEPS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(INC_SHARED) $(LIBUNWIND_INC) -c -o $@ $<
+$(BUILD_DIR)/unwind_libunwind.o: $(SRC_DIR)/unwind_libunwind.c $(SRC_DIR)/unwind_libunwind.h $(SRC_DIR)/mtt_internal.h $(LIBUNWIND_STATIC) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) $(INC_SHARED) $(if $(filter -DMTT_STATIC_LIBUNWIND,$(CFLAGS)),-DUNW_LOCAL_ONLY -I$(LIBUNWIND_BUILD)/include -I$(LIBUNWIND_SRC)/include) -c -o $@ $<
 
 $(BUILD_DIR) $(OUTPUT_DIR):
 	mkdir -p $@
@@ -252,7 +218,3 @@ sysroot-arm32:
 
 demo_small_leak: $(SHARED_LIB) examples/demo_small_leak.c | $(OUTPUT_DIR)
 	$(CC) $(CFLAGS) -o $(OUTPUT_DIR)/demo_small_leak examples/demo_small_leak.c
-
-# bt_test:综合 backtrace 诊断(纯单线程,7 场景遍历)
-bt_test: examples/bt_test.c | $(OUTPUT_DIR)
-	$(CC) -Wall -Wextra -g -O2 -fno-omit-frame-pointer -o $(OUTPUT_DIR)/bt_test examples/bt_test.c

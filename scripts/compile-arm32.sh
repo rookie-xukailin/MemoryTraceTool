@@ -10,4 +10,4 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 docker run --platform linux/arm/v7 --rm \
   -v "$PROJECT_ROOT":/work -w /work \
   arm32-builder:latest \
-  make MTT_LIBUNWIND_STATIC=1 "$@"
+  make "$@"

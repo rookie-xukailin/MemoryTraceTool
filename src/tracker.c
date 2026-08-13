@@ -439,16 +439,6 @@ void mtt_capture_stack(mtt_entry_t *entry)
             entry->stack_frames = n;
             ctx->in_capture = saved;
             mtt_log_stage(72, "capture_stack done via libunwind frames=%d", n);
-            /* 浅栈警告(等级 1 可见,定位"看不到 main / site 少"问题) */
-            if (n < 4) {
-                char wbuf[160];
-                int wlen = snprintf(wbuf, sizeof(wbuf),
-                    "[MTT] shallow stack: frames=%d mode=%d path=libunwind first=%p\n",
-                    n, g_unwinder_mode,
-                    n > 0 ? entry->stack[0] : NULL);
-                if (wlen > 0 && wlen < (int)sizeof(wbuf))
-                    MTT_LOG_INFO(wbuf, (size_t)wlen);
-            }
             return;
         }
         /* n < 2:重新检查 disabled,因为 mtt_libunwind_capture 内可能刚 mark */
@@ -518,10 +508,8 @@ void mtt_capture_stack(mtt_entry_t *entry)
             void *lr      = fp[1];
             if (lr == NULL) break;
             if (prev_fp == NULL) break;
-#if !defined(__aarch64__)
-            /* ARM32 / x86:LR 必须落在可执行段内,过滤栈垃圾误判 */
+            /* LR 必须落在可执行段内,过滤栈垃圾误判 */
             if (!mtt_addr_is_executable(MTT_FIX_THUMB_ADDR(lr))) break;
-#endif
             /* 严格校验:父帧地址必须严格递增,且跨度 <= 64KB。
              * 防止无帧指针二进制上 prev_fp 为栈垃圾导致跳到无效地址。 */
             uintptr_t prev_addr = (uintptr_t)prev_fp;
@@ -538,18 +526,6 @@ void mtt_capture_stack(mtt_entry_t *entry)
                 entry->stack[i] = fp_stack[i];
             entry->stack_frames = fp_count;
         }
-    }
-
-    /* 浅栈警告(等级 1 可见):frames<4 时输出,定位"看不到 main / site 少"问题。
-     * 出口路径:backtrace 成功或 FP chain 兜底(覆盖 libunwind 失败 fallback 场景)。 */
-    if (entry->stack_frames < 4) {
-        char wbuf[160];
-        int wlen = snprintf(wbuf, sizeof(wbuf),
-            "[MTT] shallow stack: frames=%d mode=%d path=backtrace/fp first=%p\n",
-            entry->stack_frames, g_unwinder_mode,
-            entry->stack_frames > 0 ? entry->stack[0] : NULL);
-        if (wlen > 0 && wlen < (int)sizeof(wbuf))
-            MTT_LOG_INFO(wbuf, (size_t)wlen);
     }
 
     ctx->in_capture = saved;
@@ -1534,20 +1510,6 @@ void mtt_ensure_init(void)
     /* 注册 fork 安全处理器（仅需注册一次） */
     static pthread_once_t g_fork_init = PTHREAD_ONCE_INIT;
     pthread_once(&g_fork_init, mtt_register_fork_handlers);
-
-#if defined(__aarch64__)
-    extern void mtt_init_tool_range(void);
-    mtt_init_tool_range();
-
-    /* ARM64:BMC 上 libc 初始化可能 longjmp 跳过 dec_depth,导致 depth=1 残留。
-     * init 完成后强制清零,让后续 malloc 正常追踪。
-     * ARM32 不需要(libc 不 longjmp,depth 正常 balance)。 */
-    if (ctx != NULL) {
-        ctx->hook_depth = 0;
-        ctx->in_hook = 0;
-    }
-#endif
-
     mtt_log_stage(15, "mtt_ensure_init done");
 }
 
