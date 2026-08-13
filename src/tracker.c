@@ -1136,7 +1136,7 @@ static void get_process_name(char *buf, size_t size)
  * 致命错误处理：若桶表分配失败，设置 disabled=1 + initialized=1，
  * 后续所有 hook 调用直接透传到 raw_*，不再重试初始化。
  */
-static void mtt_register_fork_handlers(void);
+/* fork handler 注册已移除,改由 hooks.c fork() 拦截接管 */
 
 void mtt_ensure_init(void)
 {
@@ -1507,9 +1507,7 @@ void mtt_ensure_init(void)
         ctx->tool_internal = saved_tool;
     }
 
-    /* 注册 fork 安全处理器（仅需注册一次） */
-    static pthread_once_t g_fork_init = PTHREAD_ONCE_INIT;
-    pthread_once(&g_fork_init, mtt_register_fork_handlers);
+    /* fork handler 由 hooks.c 的 fork() 拦截接管,不再用 pthread_atfork */
     mtt_log_stage(15, "mtt_ensure_init done");
 }
 
@@ -1517,8 +1515,9 @@ void mtt_ensure_init(void)
  *                 fork() 安全处理（防止子进程死锁）                             *
  * ======================================================================== */
 
-/** fork 前：尝试获取所有分段锁，阻塞直到 reporter 完成当前扫描 */
-static void mtt_fork_prepare(void)
+/** fork 前：尝试获取所有分段锁，阻塞直到 reporter 完成当前扫描。
+ *  非 static:hooks.c fork 拦截调用(等价 atfork prepare)。 */
+void mtt_fork_prepare(void)
 {
     mtt_state_t *s = mtt_state_get();
     if (s == NULL) return;
@@ -1527,8 +1526,9 @@ static void mtt_fork_prepare(void)
         pthread_mutex_lock(&s->bucket_locks[i].lock);
 }
 
-/** fork 后（父进程）：释放所有锁 */
-static void mtt_fork_parent(void)
+/** fork 后（父进程）：释放所有锁。
+ *  非 static:hooks.c fork 拦截调用(等价 atfork parent)。 */
+void mtt_fork_parent(void)
 {
     mtt_state_t *s = mtt_state_get();
     if (s == NULL) return;
@@ -1541,8 +1541,11 @@ static void mtt_fork_parent(void)
  *
  *  本函数在 fork child 上下文中调用,只能用 async-signal-safe 操作
  *  (pthread_mutex_init / close / syscall / memset 都是 safe)。
- *  不调 pthread_create(不保证 safe),改用 initialized=0 让下次 malloc 触发 init。 */
-static void mtt_fork_child(void)
+ *  不调 pthread_create(不保证 safe),改用 initialized=0 让下次 malloc 触发 init。
+ *
+ *  调用路径:hooks.c 的 fork() 拦截(子进程返回后直接调用)。
+ *  非 static:hooks.c 需跨文件调用。 */
+void mtt_fork_child(void)
 {
     mtt_state_t *s = mtt_state_get();
     if (s == NULL) return;
@@ -1632,11 +1635,11 @@ static void mtt_fork_child(void)
     atomic_store_explicit(&s->initialized, 0, memory_order_release);
 }
 
-/** 注册 pthread_atfork 处理器 */
-static void mtt_register_fork_handlers(void)
-{
-    pthread_atfork(mtt_fork_prepare, mtt_fork_parent, mtt_fork_child);
-}
+/* fork handler 已改由 hooks.c 的 fork() 拦截接管(完整替代 pthread_atfork)。
+ * 原因:某些 ARM64 BMC 上 pthread_atfork 符号解析失败(undefined symbol),
+ * 导致 .so 加载崩溃。fork 拦截不依赖 pthread_atfork,且注册时机更可靠
+ * (在任何 fork 调用时天然生效,不受 init 是否完成影响)。
+ * hooks.c:fork() 内部调用 mtt_fork_prepare/parent/child 三个阶段。 */
 
 /* ======================================================================== *
  *                 信号处理线程（SIGUSR1 触发即时报告）                         *

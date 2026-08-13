@@ -29,7 +29,9 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <sys/types.h>   /* pid_t (fork 拦截) */
 #include <sys/syscall.h>
+#include <dlfcn.h>       /* dlsym/RTLD_NEXT (fork 拦截的 raw_fork 解析) */
 #include <errno.h>
 
 /*
@@ -148,40 +150,8 @@ void* malloc(size_t size)
     /* 首次调用诊断 */
     first_call_diag("malloc", &g_first_malloc_diag, 20);
 
-    /* fork 检测:getpid() 变化说明 fork 发生了。
-     * 不依赖 pthread_atfork(某些 daemon 化方式不触发 atfork)。
-     * getpid 是 VDSO 调用,开销 ~10ns。 */
-    {
-        static _Atomic pid_t g_known_pid = 0;
-        pid_t cur_pid = getpid();
-        pid_t known = atomic_load_explicit(&g_known_pid, memory_order_relaxed);
-        if (known != 0 && known != cur_pid) {
-            /* PID 变了 → fork 发生!暴力重置。 */
-            atomic_store_explicit(&g_known_pid, cur_pid, memory_order_relaxed);
-            mtt_state_t *fs = mtt_state_get();
-            if (fs != NULL)
-                atomic_store_explicit(&fs->initialized, 0, memory_order_release);
-            /* reporter/http 的"已启动"标志 */
-            extern void mtt_reporter_reset_for_fork(void);
-            extern void mtt_http_reset_for_fork(void);
-            mtt_reporter_reset_for_fork();
-            mtt_http_reset_for_fork();
-            /* 重置当前线程 depth + in_hook */
-            mtt_per_thread_t *fctx = mtt_thread_get_cached();
-            if (fctx != NULL) {
-                fctx->hook_depth = 0;
-                fctx->in_hook = 0;
-            }
-            char fbuf[96];
-            int flen = snprintf(fbuf, sizeof(fbuf),
-                "[MTT] fork detected: pid %d→%d, re-initializing\n",
-                (int)known, (int)cur_pid);
-            if (flen > 0 && flen < (int)sizeof(fbuf))
-                MTT_LOG_INFO(fbuf, (size_t)flen);
-        } else if (known == 0) {
-            atomic_store_explicit(&g_known_pid, cur_pid, memory_order_relaxed);
-        }
-    }
+    /* fork 检测由 hooks.c 的 fork() 符号拦截处理(见文件末尾 fork() 函数)。
+     * 不需要在 malloc 热路径做 getpid() 轮询,fork 拦截更精确且零热路径开销。 */
 
     /* 递归保护：__thread 深度计数器（哨兵自动修正脏值） */
     {
@@ -934,4 +904,87 @@ int vasprintf(char **strp, const char *fmt, va_list ap)
     }
     *strp = buf;
     return written;
+}
+
+/* ======================================================================== *
+ *                     fork() 拦截                                            *
+ * ======================================================================== *
+ *
+ * 为什么拦截 fork 而不用 pthread_atfork:
+ *   某些 ARM64 BMC(glibc)上 pthread_atfork 符号解析失败(undefined symbol),
+ *   导致 .so 加载即崩溃。改用 LD_PRELOAD 直接拦截 fork() 符号,彻底绕开
+ *   pthread_atfork 的符号依赖。
+ *
+ * fork 拦截天然在任何 fork 调用时生效(无论 init 是否完成),比 atfork
+ * 注册时机更可靠。子进程返回后直接调 mtt_fork_child() 重置状态。
+ *
+ * 线程安全:raw_fork 解析用 CAS 保证只做一次,解析完成后的读路径无锁。
+ * 不需要 in_hook/depth 递归保护:fork 不触发 malloc hook。
+ */
+
+/* 真实 fork 函数指针(dlsym 懒解析) */
+typedef pid_t (*raw_fork_fn)(void);
+static raw_fork_fn volatile g_raw_fork = NULL;
+static _Atomic int g_fork_resolved = 0;
+
+/* 懒解析真实 fork,与 mtt_resolve_raw_allocators 同模式(CAS 保证单次)。
+ * fork 不会触发 malloc,无需 bootstrap 缓冲区。 */
+static void resolve_raw_fork(void)
+{
+    int expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&g_fork_resolved, &expected, 1,
+            memory_order_acq_rel, memory_order_acquire)) {
+        g_raw_fork = (raw_fork_fn)dlsym(RTLD_NEXT, "fork");
+    }
+    /* CAS 失败的线程等 winner 完成 */
+    while (g_raw_fork == NULL &&
+           atomic_load_explicit(&g_fork_resolved, memory_order_acquire) == 1) {
+        /* 极短自旋:winner 在微秒级完成 dlsym */
+    }
+}
+
+/**
+ * LD_PRELOAD 拦截的 fork。
+ *
+ * 完整替代 pthread_atfork 的三个阶段(prepare/parent/child),
+ * 解决 BMC 上 pthread_atfork 符号解析失败(undefined symbol)的问题。
+ *
+ * 执行流程:
+ *   1. dlsym 解析真实 fork
+ *   2. fork 前:mtt_fork_prepare() — 加锁所有分段锁(防止 fork 时刻
+ *      其他线程在临界区内导致子进程锁状态损坏)
+ *   3. 调用真实 fork
+ *   4a. 父进程返回(pid>0):mtt_fork_parent() — 解锁所有分段锁
+ *   4b. 子进程返回(pid==0):mtt_fork_child() — 重置工具状态
+ *      (重置 hook_depth=0 解决 ARM64 depth=1 残留 + initialized=0
+ *       让子进程重新 init → reporter/HTTP/signal 线程启动)
+ *
+ * 安全性:prepare/parent 只做锁操作,child 全程 async-signal-safe
+ * (无 malloc/无锁等待/无 pthread_create)。
+ */
+pid_t fork(void)
+{
+    resolve_raw_fork();
+    if (g_raw_fork == NULL) {
+        /* dlsym 失败:保证 fork 基本功能可用 */
+        errno = ENOSYS;
+        return -1;
+    }
+
+    /* fork 前:加锁(等价 atfork prepare) */
+    mtt_fork_prepare();
+
+    pid_t pid = g_raw_fork();
+
+    if (pid == 0) {
+        /* 子进程:重置工具状态,让子进程下次 malloc 时重新走完整 init。
+         * mtt_fork_child 内部有 NULL 检查,init 未完成时也安全。 */
+        mtt_fork_child();
+    } else {
+        /* 父进程(pid>0)或 fork 失败(pid<0):解锁(等价 atfork parent)。
+         * fork 失败也必须解锁,否则分段锁永久持有 → 死锁。 */
+        mtt_fork_parent();
+    }
+
+    return pid;
 }
