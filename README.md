@@ -23,6 +23,17 @@ LD_PRELOAD=./output/libmemorytracetool.so MTT_HTTP_PORT=8080 ./output/demo_contr
 make                    # 本机架构原生编译
 make ARCH=arm32         # ARM32 (arm-linux-gnueabihf)
 make ARCH=arm64         # ARM64 (aarch64-linux-gnu)
+make ARCH=riscv64       # RISC-V64 (riscv64-linux-gnu)
+```
+
+自定义工具链前缀（如玄铁 Xuantie-900，三元组 `riscv64-unknown-linux-gnu`）：
+
+```bash
+# CROSS_COMPILE 必须是完整路径前缀，以三元组加中划线结尾
+make ARCH=riscv64 CROSS_COMPILE=/path/to/Xuantie-900-gcc-linux-5.10.4-glibc-x86_64-V3.1.0/bin/riscv64-unknown-linux-gnu-
+
+# 编译前可先用 dry-run 检查 gcc 命令行是否正确
+make -n ARCH=riscv64 CROSS_COMPILE=<同上> | head -2
 ```
 
 Docker 一键编译（推荐，免装交叉工具链）：

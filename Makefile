@@ -1,6 +1,7 @@
-# 架构: arm32 / arm64 (空=本机)
+# 架构: arm32 / arm64 / riscv64 (空=本机)
 #   用法: ARCH=arm32 make
 #         ARCH=arm64 make test
+#         ARCH=riscv64 make
 #   CROSS_COMPILE 可单独指定工具链前缀，结合 ARCH 使用时 ARCH 仅设置默认值
 ARCH ?=
 CROSS_COMPILE ?=
@@ -20,6 +21,15 @@ ifeq ($(ARCH),arm64)
     QEMU_EXEC      ?= qemu-aarch64
     QEMU_SYSROOT   ?= sysroot/arm64
     ARCH_FLAGS     := -march=armv8-a
+endif
+
+ifeq ($(ARCH),riscv64)
+    CROSS_COMPILE ?= riscv64-linux-gnu-
+    QEMU_EXEC      ?= qemu-riscv64
+    QEMU_SYSROOT   ?= sysroot/riscv64
+    # 默认目标即 rv64gc(lp64d),无需 -march/-mabi;
+    # -fno-omit-frame-pointer 已在 CORE_CFLAGS 中
+    ARCH_FLAGS     :=
 endif
 
 # 嵌入式配置：减半栈缓存和符号长度，节省 ~25MB 内存
