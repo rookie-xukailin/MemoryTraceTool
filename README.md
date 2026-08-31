@@ -57,9 +57,18 @@ make test               # 基础功能 36 用例
 make test_stability     # 并发压力 18 用例
 ```
 
+## ARM32 缺陷与使用建议
+
+**如果问题不区分平台，尽量不要用 ARM32 排查**——优先在 ARM64（或 x86_64）上复现和定位，ARM32 上工具能力最弱、坑最多：
+
+- **栈回溯最弱（核心缺陷）**：ARM32 栈回溯依赖 `.ARM.exidx` unwind 表，目标二进制 `-O2 -fomit-frame-pointer` 且未加 `-funwind-tables` 时通常只能拿到 1-2 帧，泄漏调用链基本不可见；ARM64 走 DWARF，对同类优化更鲁棒
+- **嵌入式模式降配**：`ARCH=arm32` 自动启用 `MTT_EMBEDDED`，栈缓存减半（512 条）、符号长度减半（128 字节），长函数名可能被截断
+- 需链接 `-latomic`（64-bit 原子操作）；`time_t` 为 4 字节（2038 问题）
+- soft-float 环境（如 HDM3 的 `gnueabi`）必须用匹配 ABI 的工具链编译工具 `.so`
+
+仅在问题只在 ARM32 上出现时才在 ARM32 排查，且建议目标工程加 `-funwind-tables -fno-omit-frame-pointer` 重编后再测。
+
 ## 已知限制
 
-- 目标二进制 `-O2 -fomit-frame-pointer` 且未加 `-funwind-tables` 时，ARM32 栈回溯只有 1-2 帧；建议目标工程 CFLAGS 加 `-funwind-tables -fno-omit-frame-pointer` 重建
 - entry 池满后新分配静默跳过追踪（`MTT_POOL_ENTRIES` 可调）
-- ARM32 需链接 `-latomic`
 - 业务变慢排查顺序：`MTT_DEBUG=0` 关诊断 → 目标加 unwind tables 重编 → 仍慢则 `MTT_SAMPLE_RATE=15`（约每 32KB 采一次）
