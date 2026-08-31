@@ -34,6 +34,19 @@ MTT_HTTP_PORT=8080 LD_PRELOAD=/tmp/libmemorytracetool.so <daemon_path> &
 - 每帧格式 `func+0xOFFSET (libname)`，用 `addr2line -e <daemon>.debug -f -C 0xOFFSET` 定位源码行
 - `Growth > 0` → 正在泄漏；`is_expired = 1` → probable leak
 
+## 延时敏感场景（RPC 等）：建议开启采样
+
+默认全量追踪，每次 malloc 都要抓栈（微秒级），RPC 等对延时敏感的场景可能被拖慢。这类场景建议开启字节采样，**牺牲小对象的采集密度，换取业务延时不受影响**：
+
+```bash
+MTT_SAMPLE_RATE=15 LD_PRELOAD=/tmp/libmemorytracetool.so <daemon_path>
+```
+
+- 机制：小于 1KB 的分配按字节累加，**攒满 2^N 字节才采集一次**，其余跳过抓栈，大幅降低 CPU 开销
+- 兜底：>=1KB 的分配不受采样影响，仍然全量追踪，中等/大对象泄漏不会漏检
+- N 越大越省 CPU：15 ≈ 每 32KB 采一次，20 ≈ 每 1MB 采一次
+- 代价：小对象泄漏的调用量和精确字节数是采样估算值，看趋势和热点站点够用
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
