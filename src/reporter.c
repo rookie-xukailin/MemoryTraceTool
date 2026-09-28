@@ -114,22 +114,28 @@ mtt_reporter_t* mtt_reporter_get(void)
  */
 
 typedef struct {
-    uint64_t hash;   /* 申请栈 hash（free hook 从 entry->stack 计算） */
+    _Atomic uint64_t hash;   /* 申请栈 hash。原子存储：ARM32 上普通 64-bit
+                              * 写会被拆成两条 STR，消费者可能读到撕裂值，
+                              * 垃圾 hash 会污染站点历史表（走读 P2） */
     size_t   size;   /* 分配字节数（跨调用栈变化的周期匹配兜底键） */
 } late_free_ev_t;
 
 static late_free_ev_t g_late_free_ring[MTT_LATE_FREE_RING_SIZE];
 static _Atomic uint64_t g_late_free_head = 0;
 
-/** free hook 生产者入口：记录一次老化释放（栈 hash + size，无锁、无分配） */
+/** free hook 生产者入口：记录一次老化释放（栈 hash + size，无锁、无分配）。
+ * release 序发布槽位内容；消费者 acquire 读取。固有的"发布后覆盖"窗口
+ * （生产者拿到 idx 但 exchange 已发生）只会延迟/丢失证据，不会错乱。 */
 void mtt_late_free_note(uint64_t stack_hash, size_t size)
 {
     if (stack_hash == 0) return;
     uint64_t idx = atomic_fetch_add_explicit(&g_late_free_head, 1,
                                              memory_order_relaxed);
     if (idx < MTT_LATE_FREE_RING_SIZE) {
-        g_late_free_ring[idx].hash = stack_hash;
+        atomic_store_explicit(&g_late_free_ring[idx].hash, stack_hash,
+                              memory_order_relaxed);
         g_late_free_ring[idx].size = size;
+        atomic_thread_fence(memory_order_release);
     }
     /* else: 环满丢弃（reporter 消费慢），可接受：证据随周期重复出现 */
 }
@@ -196,8 +202,10 @@ static void late_free_drain(void)
                                           memory_order_relaxed);
     if (n > MTT_LATE_FREE_RING_SIZE)
         n = MTT_LATE_FREE_RING_SIZE; /* 溢出部分已丢弃 */
+    atomic_thread_fence(memory_order_acquire);
     for (uint64_t i = 0; i < n; i++) {
-        uint64_t h = g_late_free_ring[i].hash;
+        uint64_t h = atomic_load_explicit(&g_late_free_ring[i].hash,
+                                          memory_order_relaxed);
         size_t sz = g_late_free_ring[i].size;
         if (h == 0) continue;
         g_pending_ev[g_pending_head].hash = h;
@@ -241,6 +249,26 @@ const char* mtt_conf_str(int conf)
  *   - 周期作用域内存全量释放后重新出现，count 回到原水位不超过峰值
  *     → late-free 证据生效 → session_scoped。
  */
+/* long_lived 嫌疑阈值（字节，0=禁用）。tracker init 解析
+ * MTT_LONG_LIVED_SUSPECT_BYTES；reporter 读取缓存。 */
+static size_t ll_suspect_threshold(void)
+{
+    mtt_state_t *st = mtt_state_get();
+    return (st != NULL)
+        ? atomic_load_explicit(&st->ll_suspect_bytes, memory_order_relaxed)
+        : MTT_LONG_LIVED_SUSPECT_DEFAULT;
+}
+
+/** long_lived 是否够格升级为"嫌疑级"（大字节且从未观察到释放）：
+ * 平台期真泄漏（泄漏源耗尽后 count 走平）的分类不会把它放走——
+ * 文本报告保留全栈显示并标 long_lived(suspect)，前端红色系提示。 */
+static int long_lived_suspect(const mtt_leak_site_t *site)
+{
+    size_t threshold = ll_suspect_threshold();
+    if (threshold == 0) return 0;
+    return site->total_size >= threshold && site->late_free_count == 0;
+}
+
 static void classify_site(mtt_leak_site_t *site, int classic)
 {
     mtt_site_hist_t *hist = site_hist_get(site->stack_hash, 1);
@@ -290,12 +318,17 @@ static void classify_site(mtt_leak_site_t *site, int classic)
             }
         }
 
-        /* 周期作用域确认：历史上有释放证据，且当前存活数不超过历史峰值
-         * ——"同一处申请又释放"的证据优先于老化判定（不等阈值），
-         * 消除"释放后下一周期再申请"在年轻期重新刷 possible 的回归窗。
-         * 增长仍压过一切：count 刷历史峰值（真泄漏特征）→ probable。 */
+        /* 周期作用域确认（配比证据）：释放证据数需覆盖历史峰值的全部槽位
+         * （late_free_count >= peak_count）——"每个曾经同时存活的分配都
+         * 被观察到释放过"才算完整闭环。防误放走：100 个存活的真泄漏里
+         * 偶发释放 1 个（late_free=1 < peak=100）不满足，不会把整个站点
+         * 永久打成 session_scoped；用户场景（1 申请 1 释放，每周期重复）
+         * peak=1、late_free≥1 每周期都满足。证据优先于老化判定（不等
+         * 阈值），消除"释放后下一周期再申请"的年轻期回归窗。
+         * 增长仍压过一切：count 刷历史峰值 → probable。 */
         int session_confirmed = has_prior && (hist != NULL)
                              && (hist->late_free_count > 0)
+                             && (hist->late_free_count >= (uint32_t)hist->peak_count)
                              && (site->count <= hist->peak_count);
 
         if (exceeds_peak)
@@ -879,7 +912,9 @@ static void scan_and_report_locked(void)
                 mtt_leak_site_t *site = leak_table.entries[b];
                 while (site != NULL) {
                     if (site->conf == MTT_CONF_PROBABLE ||
-                        site->conf == MTT_CONF_POSSIBLE)
+                        site->conf == MTT_CONF_POSSIBLE ||
+                        (site->conf == MTT_CONF_LONG_LIVED &&
+                         long_lived_suspect(site)))
                         leak_total += site->total_size;
                     site = site->next;
                 }
@@ -1077,8 +1112,10 @@ static void scan_and_report_locked(void)
             for (size_t i = 0; i < site_count; i++) {
                 mtt_leak_site_t *site = pairs[i].site;
                 if (site == NULL || site->count == 0) continue;
-                if (site->conf == MTT_CONF_SESSION_SCOPED ||
-                    site->conf == MTT_CONF_LONG_LIVED)
+                if (site->conf == MTT_CONF_SESSION_SCOPED)
+                    continue;
+                if (site->conf == MTT_CONF_LONG_LIVED &&
+                    !long_lived_suspect(site))
                     continue;
 
                 suspect_idx++;
@@ -1113,9 +1150,15 @@ static void scan_and_report_locked(void)
                 /* 存活时间判定（借鉴 libleak LEAK_EXPIRE）。
                  * probable 对应旧格式 "probable leak"，其余 "possible leak"，
                  * 保持旧报告解析脚本的兼容性 */
-                fprintf(fp, "Confidence:   %s\n",
-                        (site->conf == MTT_CONF_PROBABLE)
-                            ? "probable leak" : "possible leak");
+                if (site->conf == MTT_CONF_LONG_LIVED && long_lived_suspect(site)) {
+                    fprintf(fp, "Confidence:   long_lived (SUSPECT: %zu bytes"
+                            " held, never observed freed)\n",
+                            site->total_size);
+                } else {
+                    fprintf(fp, "Confidence:   %s\n",
+                            (site->conf == MTT_CONF_PROBABLE)
+                                ? "probable leak" : "possible leak");
+                }
                 if (site->late_free_count > 0) {
                     fprintf(fp, "Evidence:     late_free=%u (observed released)\n",
                             site->late_free_count);
@@ -1184,9 +1227,10 @@ static void scan_and_report_locked(void)
                 for (size_t i = 0; i < site_count; i++) {
                     mtt_leak_site_t *site = pairs[i].site;
                     if (site == NULL || site->count == 0) continue;
-                    if (site->conf == MTT_CONF_LONG_LIVED)
+                    if (site->conf == MTT_CONF_LONG_LIVED) {
+                        if (long_lived_suspect(site)) continue; /* 已在嫌疑区 */
                         longlived_count++;
-                    else if (site->conf == MTT_CONF_SESSION_SCOPED) {
+                    } else if (site->conf == MTT_CONF_SESSION_SCOPED) {
                         session_count++;
                         session_total += site->total_size;
                     }
@@ -1211,7 +1255,8 @@ static void scan_and_report_locked(void)
                     for (size_t i = 0; i < site_count; i++) {
                         mtt_leak_site_t *site = pairs[i].site;
                         if (site == NULL || site->count == 0) continue;
-                        if (site->conf != MTT_CONF_LONG_LIVED)
+                        if (site->conf != MTT_CONF_LONG_LIVED ||
+                            long_lived_suspect(site))
                             continue;
                         info_idx++;
                         fprintf(fp,
@@ -1271,8 +1316,10 @@ static void scan_and_report_locked(void)
                 if (fg_sites != NULL && fg_pairs != NULL) {
                     for (size_t i = 0; i < site_count; i++) {
                         if (sorted[i] == NULL) continue;
-                        if (sorted[i]->conf == MTT_CONF_SESSION_SCOPED ||
-                            sorted[i]->conf == MTT_CONF_LONG_LIVED)
+                        if (sorted[i]->conf == MTT_CONF_SESSION_SCOPED)
+                            continue;
+                        if (sorted[i]->conf == MTT_CONF_LONG_LIVED &&
+                            !long_lived_suspect(sorted[i]))
                             continue;
                         fg_sites[fg_count] = sorted[i];
                         fg_pairs[fg_count] = pairs[i];
@@ -1320,12 +1367,28 @@ static void scan_and_report_locked(void)
                         fprintf(jf,
                                 "%s{\"count\":%zu,\"size\":%zu,"
                                 "\"hash\":\"%llx\",\"conf\":\"%s\","
-                                "\"late_free\":%u,\"is_expired\":%d}",
+                                "\"late_free\":%u,\"is_expired\":%d,\"stack\":[",
                                 jw ? "," : "",
                                 site->count, site->total_size,
                                 (unsigned long long)site->stack_hash,
                                 mtt_conf_str(site->conf),
                                 site->late_free_count, site->is_expired);
+                        /* 栈帧字符串：addr2line 全链路验收与离线分析依赖 */
+                        if (pairs != NULL) {
+                            mtt_stack_entry_t *se = pairs[i].stack_entry;
+                            if (se != NULL && se->is_resolved) {
+                                int fw = 0;
+                                for (int k = 0; k < se->frame_count; k++) {
+                                    const char *sym = se->resolved[k];
+                                    if (sym == NULL || sym[0] == '\0')
+                                        continue;
+                                    fprintf(jf, "%s\"%s\"",
+                                            fw ? "," : "", sym);
+                                    fw = 1;
+                                }
+                            }
+                        }
+                        fprintf(jf, "]}");
                         jw = 1;
                     }
                     fprintf(jf, "]}\n");

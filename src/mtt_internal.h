@@ -155,6 +155,11 @@ extern int g_max_stack_frames;
  * 记录"释放时已超阈值"的分配栈 hash，作为周期作用域识别的证据。 */
 #define MTT_LATE_FREE_RING_SIZE 8192
 
+/* long_lived 嫌疑通道：长存活且从未释放、但单站字节数超过该阈值时，
+ * 保留全栈显示并标注 long_lived(suspect)，防止"平台期真泄漏"被
+ * 分类降级放走。0=禁用。默认 1MB，MTT_LONG_LIVED_SUSPECT_BYTES 可调。 */
+#define MTT_LONG_LIVED_SUSPECT_DEFAULT (1024 * 1024)
+
 /* 离线报告 */
 #define MTT_REPORT_FILE_DEFAULT NULL     /* 默认不启用离线 JSON 报告 */
 #define MTT_REPORT_HTML_DEFAULT NULL     /* 默认不启用离线 HTML 报告 */
@@ -286,6 +291,7 @@ typedef struct {
     _Atomic int         peak_updated;               /* peak_bytes 刚更新时为1（reporter 秒级检查） */
     _Atomic time_t      leak_threshold_sec;          /* 泄漏阈值（秒）：存活超过此值→probable leak */
     _Atomic int         classic_leak;                /* 1=回退纯时间两级判定（MTT_CLASSIC_LEAK=1） */
+    _Atomic size_t      ll_suspect_bytes;            /* long_lived 嫌疑阈值字节（0=禁用） */
     _Atomic time_t      startup_until;              /* 启动阶段结束时间：此时刻之前不追踪 */
     _Atomic size_t      temp_alloc_count;           /* 临时分配计数（短生命周期） */
     _Atomic size_t      expired_alloc_count;        /* 过期但未释放的分配计数 */

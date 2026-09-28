@@ -1216,6 +1216,7 @@ void mtt_ensure_init(void)
     if (want_pool_entries > MTT_POOL_ENTRIES_MAX) want_pool_entries = MTT_POOL_ENTRIES_MAX;
     int      want_debug    = MTT_DEBUG_DEFAULT;
     int      want_classic_leak = 0;   /* MTT_CLASSIC_LEAK=1 → 纯时间两级判定回退 */
+    size_t   want_ll_suspect   = MTT_LONG_LIVED_SUSPECT_DEFAULT; /* long_lived 嫌疑阈值(字节) */
 
     {
         const char *env_disable = getenv("MTT_DISABLE");
@@ -1270,6 +1271,14 @@ void mtt_ensure_init(void)
             const char *env_classic = getenv("MTT_CLASSIC_LEAK");
             if (env_classic != NULL && strcmp(env_classic, "1") == 0)
                 want_classic_leak = 1;
+        }
+
+        /* long_lived 嫌疑阈值（MTT_LONG_LIVED_SUSPECT_BYTES=N，0=禁用。
+         * 超过 N 字节且从未观察到释放的长存活站点保留嫌疑显示） */
+        {
+            const char *env_ll = getenv("MTT_LONG_LIVED_SUSPECT_BYTES");
+            if (env_ll != NULL)
+                want_ll_suspect = (size_t)atol(env_ll);
         }
 
         /* 跳过启动阶段（MTT_SKIP_STARTUP_SEC=N，进程启动 N 秒后再开始追踪） */
@@ -1418,6 +1427,7 @@ void mtt_ensure_init(void)
     atomic_store_explicit(&s->peak_updated,       0, memory_order_relaxed);
     atomic_store_explicit(&s->leak_threshold_sec, want_leak_threshold, memory_order_relaxed);
     atomic_store_explicit(&s->classic_leak,       want_classic_leak, memory_order_relaxed);
+    atomic_store_explicit(&s->ll_suspect_bytes,   (size_t)want_ll_suspect, memory_order_relaxed);
     atomic_store_explicit(&s->temp_alloc_count,   0, memory_order_relaxed);
     atomic_store_explicit(&s->expired_alloc_count, 0, memory_order_relaxed);
     atomic_store_explicit(&s->free_expired_count,  0, memory_order_relaxed);
@@ -1507,12 +1517,57 @@ void mtt_ensure_init(void)
      *      线程（reporter/HTTP/signal 及本线程派生的业务线程）继承屏蔽
      *      掩码，进程定向信号只能被 signal 线程的 sigtimedwait 消费。 */
     {
-        struct sigaction sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = mtt_sigusr1_noop;
-        sa.sa_flags = SA_RESTART;
-        sigaction(MTT_SIGNAL_REPORT, &sa, NULL);
+        /* MTT_TAKEOVER_USR1=0：跳过 SIGUSR1 接管（业务进程自带 SIGUSR1
+         * handler 时的退路）。代价：kill -USR1 即时报告降级为不可用，
+         * 周期扫描(60s)与 peak 触发扫描不受影响。 */
+        int takeover = 1;
+        {
+            const char *env_takeover = getenv("MTT_TAKEOVER_USR1");
+            if (env_takeover != NULL && strcmp(env_takeover, "0") == 0)
+                takeover = 0;
+        }
 
+        if (takeover) {
+            /* 接管前检查业务已有 handler：BMC 守护进程常用 SIGUSR1 做
+             * 日志轮转等内部控制（snmpd 等）。双向冲突都要告警：
+             *   - 业务先注册 → 被我们覆盖 → 业务内部控制丢失（WARN 让用户
+             *     立即用 MTT_TAKEOVER_USR1=0 退避）；
+             *   - 业务后注册 → 覆盖 noop → 工具即时报告静默失效（无法在此
+             *     检测，README 说明 + 接管日志便于事后定位）。 */
+            struct sigaction old_sa;
+            memset(&old_sa, 0, sizeof(old_sa));
+            if (sigaction(MTT_SIGNAL_REPORT, NULL, &old_sa) == 0 &&
+                old_sa.sa_handler != NULL &&
+                old_sa.sa_handler != SIG_DFL &&
+                old_sa.sa_handler != mtt_sigusr1_noop) {
+                char wbuf[192];
+                int wlen = snprintf(wbuf, sizeof(wbuf),
+                    "[MTT] WARNING: SIGUSR1 already has a handler (%p); "
+                    "taking over for instant-report. Set MTT_TAKEOVER_USR1=0 "
+                    "to keep the application handler.\n",
+                    (void*)(uintptr_t)old_sa.sa_handler);
+                if (wlen > 0 && wlen < (int)sizeof(wbuf))
+                    MTT_LOG_INFO(wbuf, (size_t)wlen);
+            }
+
+            struct sigaction sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = mtt_sigusr1_noop;
+            sa.sa_flags = SA_RESTART;
+            sigaction(MTT_SIGNAL_REPORT, &sa, NULL);
+
+            char ibuf[96];
+            int ilen = snprintf(ibuf, sizeof(ibuf),
+                "[MTT] SIGUSR1 taken over for instant report "
+                "(kill -USR1 <pid>)\n");
+            if (ilen > 0 && ilen < (int)sizeof(ibuf))
+                MTT_LOG_INFO(ibuf, (size_t)ilen);
+        }
+
+        /* 屏蔽始终执行：即使不接管，屏蔽可保护后续创建的工具线程
+         * 不被业务信号处理路径打断（RT 信号未阻塞，业务不受影响）；
+         * 不接管时 signal 线程的 sigtimedwait 只等业务发来的 SIGUSR1，
+         * 行为无害（收到即触发扫描，与 handler 并存时最多双触发）。 */
         sigset_t block_set;
         sigemptyset(&block_set);
         sigaddset(&block_set, MTT_SIGNAL_REPORT);

@@ -232,7 +232,16 @@ test_archive: $(SHARED_LIB) tests/test_archive.c | $(OUTPUT_DIR)
 		MTT_REPORT_FILE=/tmp/mtt_test_archive.json \
 		$(RUN) $(OUTPUT_DIR)/test_archive
 
-test_all: test test_stability test_blacklist_fast test_fork test_leak_class test_integrity test_archive
+# addr2line 全链路验收(用户门禁:不能找回原文=失败):泄漏帧 dump 后逐帧 addr2line
+test_addr2line: $(SHARED_LIB) tests/test_addr2line.c tests/test_addr2line.sh | $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_addr2line tests/test_addr2line.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS) -lpthread -Wl,--export-dynamic
+	MTT_LEAK_THRESHOLD_SEC=2 MTT_DEBUG=0 MTT_ARCHIVE=0 \
+		MTT_REPORT_FILE=/tmp/mtt_addr2line.json \
+		$(RUN) $(OUTPUT_DIR)/test_addr2line
+	./tests/test_addr2line.sh $(OUTPUT_DIR)/test_addr2line leak_site_alloc
+
+test_all: test test_stability test_blacklist_fast test_fork test_leak_class test_integrity test_archive test_addr2line
 
 clean:
 	rm -rf $(BUILD_DIR) $(OUTPUT_DIR)
