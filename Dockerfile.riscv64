@@ -1,0 +1,12 @@
+# riscv64 交叉编译镜像（宿主任意架构，容器内跑 riscv64 交叉 gcc）
+# 构建镜像：docker build -f Dockerfile.riscv64 -t riscv64-builder .
+# 使用：./scripts/compile-riscv64.sh [make 目标...]
+# 注：FROM arm64-builder 复用本地缓存（其基础即 arm64v8/ubuntu:22.04 + build-essential）；
+#     需从零构建时把 FROM 换回 arm64v8/ubuntu:22.04 并补装 build-essential。
+FROM arm64-builder:latest
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc-riscv64-linux-gnu \
+    g++-riscv64-linux-gnu \
+    qemu-user \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /work

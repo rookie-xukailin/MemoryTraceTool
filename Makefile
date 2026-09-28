@@ -3,8 +3,11 @@
 #         ARCH=arm64 make test
 #         ARCH=riscv64 make
 #   CROSS_COMPILE 可单独指定工具链前缀，结合 ARCH 使用时 ARCH 仅设置默认值
+# ARCH ?=  (空=本机)
+# 注意：不能写 "CROSS_COMPILE ?=" 空值预定义 —— ?= 只在变量未定义时生效，
+#   空值预定义会让下面所有分支的 ?= 失效（交叉工具链永不生效，静默落回本机 gcc）。
+#   2026-09 修复：riscv64 是第一个真正走交叉路径的架构，此前 arm32/arm64 均为容器原生编译，故未暴露。
 ARCH ?=
-CROSS_COMPILE ?=
 
 # ARCH 自动推导 CROSS_COMPILE 和 QEMU 参数
 ifeq ($(ARCH),arm32)
@@ -14,16 +17,12 @@ ifeq ($(ARCH),arm32)
     ARCH_FLAGS     := -march=armv7-a -fno-omit-frame-pointer
     # 嵌入式 ARM32：减半栈缓存和符号长度，节省内存
     MTT_EMBEDDED   ?= 1
-endif
-
-ifeq ($(ARCH),arm64)
+else ifeq ($(ARCH),arm64)
     CROSS_COMPILE ?= aarch64-linux-gnu-
     QEMU_EXEC      ?= qemu-aarch64
     QEMU_SYSROOT   ?= sysroot/arm64
     ARCH_FLAGS     := -march=armv8-a
-endif
-
-ifeq ($(ARCH),riscv64)
+else ifeq ($(ARCH),riscv64)
     CROSS_COMPILE ?= riscv64-linux-gnu-
     QEMU_EXEC      ?= qemu-riscv64
     QEMU_SYSROOT   ?= sysroot/riscv64
