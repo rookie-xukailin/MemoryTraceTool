@@ -11,3 +11,10 @@ examples/realistic/demo_realistic
 output/sim/
 
 # HDM3-sim 编译产物
+
+# examples/apps 编译产物
+examples/apps/*/
+!examples/apps/*/src/
+!examples/apps/*/c_core/
+!examples/apps/*/cpp_app/
+examples/apps/**/build/
