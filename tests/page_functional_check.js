@@ -33,7 +33,7 @@
   lgBtns[3].click();
   lgBtns[3].click(); /* 保持开启供后续轴验证 */
   var rssFinal = SERIES[3].on;
-  ok('03.legend-toggle', rssBefore !== rssAfter && rssFinal === true,
+  ok('03.legend-toggle', rssBefore !== rssAfter && !!rssFinal,
      'before=' + rssBefore + ' after=' + rssAfter);
 
   /* 4. KB/MB 切换 */

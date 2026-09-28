@@ -122,8 +122,18 @@ int main(void)
 
     int frames = dump_frames(rpt, frames_path);
     if (frames <= 0) {
-        printf("FAIL: leak site (size=%d) not found in JSON or has no stack\n",
-               LEAK_SIZE);
+        printf("FAIL: leak site (size=%d) not found in JSON or has no stack\n"
+               "  dump_frames ret=%d (json_path=%s)\n",
+               LEAK_SIZE, frames, rpt);
+        /* 诊断：打印 JSON 前 200 字节 */
+        FILE *fp = fopen(rpt, "r");
+        if (fp) {
+            char buf[201] = {0};
+            size_t n = fread(buf, 1, 200, fp);
+            fclose(fp);
+            buf[n] = 0;
+            printf("  json head: %s\n", buf);
+        }
         return 1;
     }
     printf("  frames dumped: %d -> %s\n", frames, frames_path);
