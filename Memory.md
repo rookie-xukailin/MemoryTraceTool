@@ -82,6 +82,8 @@ LD_PRELOAD=/tmp/libmemorytracetool.so ./my_daemon
 | MTT_LEAK_THRESHOLD_SEC | 300 | 老化阈值：存活超过此秒数→进入四级分类候选 |
 | MTT_SKIP_STARTUP_SEC | 0 | 启动后跳过 N 秒不追踪 |
 | MTT_CLASSIC_LEAK | 0 | 设为 1 回退纯时间两级判定（新旧行为 A/B 对比） |
+| MTT_LONG_LIVED_SUSPECT_BYTES | 1MB | long_lived 嫌疑阈值（0=禁用），超限保留嫌疑区全栈显示 |
+| MTT_TAKEOVER_USR1 | 1 | 0=跳过 SIGUSR1 接管（业务自带 handler 时用） |
 | MTT_ARCHIVE | 1 | 扫描历史 JSONL 归档开关（/var/log/mtt/<pid>_<name>.archive.jsonl） |
 | MTT_MAX_STACK_FRAMES | 64 | 栈回溯深度 [1, 64] |
 | MTT_UNWINDER | auto | auto / libunwind / backtrace |
@@ -116,6 +118,18 @@ LD_PRELOAD=/tmp/libmemorytracetool.so ./my_daemon
    - gateway-mixed（C++调C .so）: C `-Os -Wall -Werror -fPIC -fsigned-char`，
      C++ `-Os -Wall -fPIC -std=c++17`
    - 其余参数交给平台默认；测试前必须 `make clean && make`（防产物架构污染）
+
+## 测试套件（2026-09 更新）
+
+| 目标 | 用例数 | 覆盖 |
+|------|-------|------|
+| make test | 36 | 基础 API/计数 |
+| make test_stability | 18 | 60s 并发压力 |
+| make test_leak_class | 4+3 | 四级分类(智能+classic 回退) |
+| make test_integrity | 2 | 池耗尽计数可见性 |
+| make test_archive | 5 | JSONL 归档 |
+| make test_addr2line | 逐帧 | 栈→addr2line→源码找回(全平台门禁) |
+| test_frontend_html/json.py | 52/42 | 仪表盘 HTML/JSON API |
 
 ## 线程模型
 

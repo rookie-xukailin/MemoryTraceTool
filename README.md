@@ -45,8 +45,11 @@ MTT_HTTP_PORT=8080 LD_PRELOAD=/tmp/libmemorytracetool.so <daemon_path> &
 | `long_lived` | 长存活稳定，信息级 | 已老化但数量稳定、从未观察到释放（单例/缓存；一次性泄漏与此无法区分，人工复核） |
 | `possible` | 待观察 | 未老化，或首次出现在扫描中（首扫不判 probable，压掉周期开头的误报） |
 
-- 压测场景收益：重启主机压力测试中"申请后长期持有、收到重启 RPC 信号才释放"的内存不再被当作泄漏刷屏——文本报告将其移入"Long-lived allocations"精简信息区（单行摘要 + 栈顶 1 帧），`.folded` 火焰图只包含疑似泄漏站点
-- 报告/JSON/仪表盘中 `conf` 字段为上述四级；`late_free` 为该站点观察到的老化释放次数（周期作用域证据）
+- 压测场景收益：重启主机压力测试中"申请后长期持有、收到重启 RPC 信号才释放"的内存，确认周期作用域后**从页面完全移除**（默认视图/嫌疑区/信息区都不出现，"周期作用域"筛选按钮可主动查看），文本报告只留一行汇总计数
+- 报告/JSON/仪表盘中 `conf` 字段为上述四级；`late_free` 为该站点观察到的老化释放次数（周期作用域证据）；`stack_kind` 标识无栈成因（1=按大小聚合/2=栈缓存满/3=未解析——"数量涨但栈空"时可诊断）
+- **`is_expired` 语义迁移（外部脚本必读）**：旧版 `is_expired==1` 即泄漏；新版它只表示"存活超阈值（老化）"，`long_lived` 站点也是 1。是否泄漏以 `conf` 为准，统计泄漏请用 `conf=='probable'`
+- `MTT_LONG_LIVED_SUSPECT_BYTES`（默认 1MB，0=禁用）：长存活且从未释放、字节数超阈值的站点保留嫌疑区全栈显示并标 SUSPECT——防止平台期真泄漏被分类放走
+- `MTT_TAKEOVER_USR1=0`：业务进程自带 SIGUSR1 handler（如日志轮转）时跳过接管，工具即时报告随之不可用（周期扫描不受影响）；接管已有 handler 时工具会打 WARN
 - `MTT_CLASSIC_LEAK=1` 回退旧的纯时间两级判定（存活超阈值一律 probable），用于新旧行为 A/B 对比
 - 扫描历史：`/var/log/mtt/<pid>_<name>.archive.jsonl` 每次扫描追加一行站点级快照（count/size/conf/late_free/增长），覆盖写报告只保留最新一次，归档让数小时压测后可回溯每一轮；单文件 8MB 轮转保留 2 代，`MTT_ARCHIVE=0` 关闭
 
