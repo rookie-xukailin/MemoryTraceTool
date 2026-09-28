@@ -15,6 +15,12 @@
 
 /* ---- 泄漏去重记录 ---- */
 
+/** 栈回溯状态（"数量涨但栈空"的成因标识，贯穿 JSON/前端/文本报告） */
+#define MTT_STACK_FULL            0  /* 栈完整 */
+#define MTT_STACK_SIZE_AGGREGATED 1  /* 抓栈失败：按 size 聚合的伪站点（同尺寸不同调用点糊合） */
+#define MTT_STACK_CACHE_FULL      2  /* 栈缓存(4096)满：新栈不再缓存，符号不可得 */
+#define MTT_STACK_UNRESOLVED      3  /* 已捕获但符号未解析（stripped/无 unwind 表） */
+
 /** 单条泄漏站点记录（按调用栈 hash 去重） */
 typedef struct mtt_leak_site {
     uint64_t  stack_hash;      /* 关联的栈帧 hash */
@@ -27,6 +33,7 @@ typedef struct mtt_leak_site {
     int       is_expired;      /* 是否存活超过阈值（1=老化；兼容字段，语义=aged） */
     int       conf;            /* 四级分类 MTT_CONF_*（probable/session_scoped/long_lived/possible） */
     uint32_t  late_free_count; /* 该站点历史上观察到的老化释放次数（周期作用域证据） */
+    int       stack_kind;      /* 栈回溯状态 MTT_STACK_*（无栈成因可诊断） */
     struct mtt_leak_site *next; /* 哈希碰撞链表 */
 } mtt_leak_site_t;
 

@@ -113,17 +113,24 @@ mtt_reporter_t* mtt_reporter_get(void)
  * 交换瞬间的生产者写入会丢失 — 良性竞态：周期作用域证据会随周期重现。
  */
 
-static uint64_t g_late_free_ring[MTT_LATE_FREE_RING_SIZE];
+typedef struct {
+    uint64_t hash;   /* 申请栈 hash（free hook 从 entry->stack 计算） */
+    size_t   size;   /* 分配字节数（跨调用栈变化的周期匹配兜底键） */
+} late_free_ev_t;
+
+static late_free_ev_t g_late_free_ring[MTT_LATE_FREE_RING_SIZE];
 static _Atomic uint64_t g_late_free_head = 0;
 
-/** free hook 生产者入口：记录一次老化释放的栈 hash（无锁、无分配） */
-void mtt_late_free_note(uint64_t stack_hash)
+/** free hook 生产者入口：记录一次老化释放（栈 hash + size，无锁、无分配） */
+void mtt_late_free_note(uint64_t stack_hash, size_t size)
 {
     if (stack_hash == 0) return;
     uint64_t idx = atomic_fetch_add_explicit(&g_late_free_head, 1,
                                              memory_order_relaxed);
-    if (idx < MTT_LATE_FREE_RING_SIZE)
-        g_late_free_ring[idx] = stack_hash;
+    if (idx < MTT_LATE_FREE_RING_SIZE) {
+        g_late_free_ring[idx].hash = stack_hash;
+        g_late_free_ring[idx].size = size;
+    }
     /* else: 环满丢弃（reporter 消费慢），可接受：证据随周期重复出现 */
 }
 
@@ -167,7 +174,22 @@ static mtt_site_hist_t* site_hist_get(uint64_t hash, int create)
     return NULL; /* 表满 */
 }
 
-/** drain late-free 环，把证据归并到历史表（仅 reporter 线程调用） */
+/* 待认领证据池：周期作用域内存"释放栈"与"重建申请栈"往往不同
+ * （清理路径 vs 初始化路径，栈深/调用点天然不同），全栈 hash 精确
+ * 匹配会断链。证据先落池，classify 时站点先精确匹配 hash，未命中
+ * 再按同 size 认领（每条证据只认领一次）。池持久（跨扫描保留），
+ * 容量满覆盖最旧。仅 reporter 线程访问。 */
+#define MTT_PENDING_EV_MAX 2048
+typedef struct {
+    uint64_t hash;
+    size_t   size;
+    uint8_t  consumed;
+} pending_ev_t;
+static pending_ev_t g_pending_ev[MTT_PENDING_EV_MAX];
+static size_t g_pending_head = 0;   /* 下一写入位（环形） */
+static size_t g_pending_live = 0;   /* 有效数（<= MAX） */
+
+/** drain late-free 环 → 待认领池（仅 reporter 线程调用） */
 static void late_free_drain(void)
 {
     uint64_t n = atomic_exchange_explicit(&g_late_free_head, 0,
@@ -175,17 +197,20 @@ static void late_free_drain(void)
     if (n > MTT_LATE_FREE_RING_SIZE)
         n = MTT_LATE_FREE_RING_SIZE; /* 溢出部分已丢弃 */
     for (uint64_t i = 0; i < n; i++) {
-        uint64_t h = g_late_free_ring[i];
+        uint64_t h = g_late_free_ring[i].hash;
+        size_t sz = g_late_free_ring[i].size;
         if (h == 0) continue;
-        mtt_site_hist_t *hist = site_hist_get(h, 1);
-        if (hist != NULL && hist->late_free_count < UINT32_MAX)
-            hist->late_free_count++;
+        g_pending_ev[g_pending_head].hash = h;
+        g_pending_ev[g_pending_head].size = sz;
+        g_pending_ev[g_pending_head].consumed = 0;
+        g_pending_head = (g_pending_head + 1) % MTT_PENDING_EV_MAX;
+        if (g_pending_live < MTT_PENDING_EV_MAX) g_pending_live++;
     }
     if (n > 0) {
         char dbuf[96];
         int dlen = snprintf(dbuf, sizeof(dbuf),
-            "[MTT] classify: drained %llu late-free events\n",
-            (unsigned long long)n);
+            "[MTT] classify: drained %llu late-free events (pool live=%zu)\n",
+            (unsigned long long)n, g_pending_live);
         if (dlen > 0 && dlen < (int)sizeof(dbuf))
             MTT_DIAG_LOG(dbuf, (size_t)dlen);
     }
@@ -228,14 +253,59 @@ static void classify_site(mtt_leak_site_t *site, int classic)
         int has_prior = (hist != NULL) && (hist->scans_seen >= 1);
         int exceeds_peak = has_prior && (site->count > hist->peak_count);
 
-        if (!site->is_expired)
+        /* 释放证据认领：
+         * 1) 精确：历史表本 hash 已有 late_free（同一调用栈闭环）；
+         * 2) 兜底：待认领池中找同 size 的未消费证据 —— 周期作用域内存
+         *    "清理路径释放、初始化路径重建"两端调用栈不同，全栈 hash
+         *    断链时以分配 size 认领（每条证据只认领一次，误配受控）。
+         * 认领后写回站点自身的历史条目，长期有效。 */
+        if (hist != NULL && hist->late_free_count == 0 && site->count > 0) {
+            for (size_t pi = 0; pi < MTT_PENDING_EV_MAX; pi++) {
+                if (g_pending_ev[pi].consumed ||
+                    g_pending_ev[pi].hash == 0 ||
+                    g_pending_ev[pi].size != site->per_leak_size)
+                    continue;
+                int hash_known = 0;
+                /* 该证据 hash 若正是本站点 hash，属精确匹配路径（上面已处理）；
+                 * 只认领"hash 未知"的证据，避免同 size 的精确站点误领 */
+                mtt_site_hist_t *ev_hist = site_hist_get(
+                    g_pending_ev[pi].hash, 0);
+                if (ev_hist != NULL && ev_hist->late_free_count > 0)
+                    hash_known = 1;   /* 证据已被其原生站点记录 */
+                if (hash_known) continue;
+                g_pending_ev[pi].consumed = 1;
+                hist->late_free_count++;
+                if (hist->late_free_count == 1) {
+                    /* 首次认领：诊断输出便于观察跨栈匹配 */
+                    char dbuf[128];
+                    int dlen = snprintf(dbuf, sizeof(dbuf),
+                        "[MTT] classify: site %llx claimed same-size(%zu) "
+                        "late-free evidence (cross-stack cycle)\n",
+                        (unsigned long long)site->stack_hash,
+                        site->per_leak_size);
+                    if (dlen > 0 && dlen < (int)sizeof(dbuf))
+                        MTT_DIAG_LOG(dbuf, (size_t)dlen);
+                }
+                break; /* 每站点每轮至多认领一条 */
+            }
+        }
+
+        /* 周期作用域确认：历史上有释放证据，且当前存活数不超过历史峰值
+         * ——"同一处申请又释放"的证据优先于老化判定（不等阈值），
+         * 消除"释放后下一周期再申请"在年轻期重新刷 possible 的回归窗。
+         * 增长仍压过一切：count 刷历史峰值（真泄漏特征）→ probable。 */
+        int session_confirmed = has_prior && (hist != NULL)
+                             && (hist->late_free_count > 0)
+                             && (site->count <= hist->peak_count);
+
+        if (exceeds_peak)
+            site->conf = MTT_CONF_PROBABLE;
+        else if (session_confirmed)
+            site->conf = MTT_CONF_SESSION_SCOPED;
+        else if (!site->is_expired)
             site->conf = MTT_CONF_POSSIBLE;
         else if (!has_prior)
             site->conf = MTT_CONF_POSSIBLE; /* 首次观测不判 probable，压首扫误报 */
-        else if (exceeds_peak)
-            site->conf = MTT_CONF_PROBABLE;
-        else if (hist->late_free_count > 0)
-            site->conf = MTT_CONF_SESSION_SCOPED;
         else
             site->conf = MTT_CONF_LONG_LIVED;
 
@@ -448,6 +518,37 @@ static void fmt_frequency(double leaks_per_sec, char *buf, size_t buf_size)
 }
 
 /** 判断帧是否为内部帧（应被过滤） */
+/* C++ 分配器适配帧：C++ 代码的泄漏栈顶几乎必然是这些帧
+ * （operator new → STL 内部分配 → 业务代码），LEAK HERE 标记
+ * 落在它们上面会让"泄漏在哪"的第一眼信息失真——业务调用点在下一帧。
+ * 仅用于标记选帧（跳过标记），帧本身仍然显示。
+ * 匹配 demangle 后的函数名段（"+0x" 之前），避免误伤含这些子串的路径名。 */
+static int is_allocator_shim_frame(const char *symbol)
+{
+    if (symbol == NULL || symbol[0] == '\0') return 0;
+    /* 只取函数名段（到 "+0x" 或 " (" 为止）做前缀/包含匹配 */
+    char fn[128];
+    const char *cut = strstr(symbol, "+0x");
+    size_t n = cut ? (size_t)(cut - symbol) : strlen(symbol);
+    if (n >= sizeof(fn)) n = sizeof(fn) - 1;
+    memcpy(fn, symbol, n);
+    fn[n] = '\0';
+
+    if (strncmp(fn, "operator new", 12) == 0) return 1;   /* operator new/new[] */
+    if (strncmp(fn, "operator delete", 15) == 0) return 1;
+    if (strncmp(fn, "std::", 5) == 0) return 1;            /* std::string::_M_create 等 */
+    if (strncmp(fn, "__gnu_cxx::", 11) == 0) return 1;
+    if (strncmp(fn, "__cxa_", 6) == 0) return 1;           /* 异常/静态初始化内部分配 */
+    if (strstr(fn, "_M_create") != NULL) return 1;
+    if (strstr(fn, "_M_mutate") != NULL) return 1;
+    if (strstr(fn, "_M_append") != NULL) return 1;
+    if (strstr(fn, "_M_construct") != NULL) return 1;
+    if (strncmp(fn, "_Znwm", 5) == 0) return 1;            /* 未 demangle 的 mangled 名 */
+    if (strncmp(fn, "_Znam", 5) == 0) return 1;
+    if (strncmp(fn, "_ZdlPv", 6) == 0) return 1;
+    return 0;
+}
+
 static int is_internal_frame(const char *symbol)
 {
     if (symbol == NULL) return 1;
@@ -641,6 +742,7 @@ static void scan_and_report_locked(void)
         mtt_alloc_snap_t *sn = &snaps[i];
 
         uint64_t hash;
+        int stack_kind = MTT_STACK_FULL;
         if (sn->stack_frames > 0) {
             /* 获取栈缓存条目（含 hash），同步解析符号。
              * 在条目首次创建时立即调用 mtt_stack_resolve，而非延迟到 Stage 3。
@@ -657,14 +759,19 @@ static void scan_and_report_locked(void)
             if (stack_entry != NULL) {
                 hash = stack_entry->hash;
             } else {
-                /* 缓存满或分配失败，直接计算 hash（不去重缓存但不影响去重） */
+                /* 缓存满或分配失败：直接计算 hash（去重不受影响），
+                 * 但符号不可得 —— 站点标记为"栈缓存满"，与"抓栈失败"可区分 */
                 hash = mtt_stack_hash_compute(sn->stack, sn->stack_frames);
+                stack_kind = MTT_STACK_CACHE_FULL;
             }
         } else {
             /* 无栈回溯可用（musl/bionic无backtrace平台的兜底策略）：
              * 按分配大小生成hash键，同大小分配归入同一泄漏站点。
-             * 虽然丢失调用栈信息，但能按大小维度展示泄漏分布。 */
+             * 注意这不是"同一调用点"——是所有 size 相同、抓栈失败的分配
+             * 的合计，站点标记为"按大小聚合"供前端/报告醒目区分。 */
             hash = (uint64_t)sn->size * UINT64_C(0x9E3779B97F4A7C15);
+            if (hash == 0) hash = 1;   /* size=0 时避免与 hash==0 豁免链冲突 */
+            stack_kind = MTT_STACK_SIZE_AGGREGATED;
         }
 
         /* 查/插泄漏站点 */
@@ -708,6 +815,7 @@ static void scan_and_report_locked(void)
             new_site->per_leak_size = sn->size;
             new_site->total_size    = sn->size;
             new_site->diff_size     = 0;
+            new_site->stack_kind    = stack_kind;
             /* 存活时间判定（单调时钟差值） */
             {
                 time_t threshold = atomic_load_explicit(&s->leak_threshold_sec, memory_order_relaxed);
@@ -741,21 +849,9 @@ static void scan_and_report_locked(void)
             MTT_DIAG_LOG(dbuf, (size_t)dlen);
     }
 
-    /* 累加所有 leak_site.total_size → s->leak_bytes_total,供时序图红线使用。
-     * leak_bytes_total 单调反映"已识别泄漏累积字节",与瞬时 current_bytes 不同:
-     * 即使业务 alloc/free 平衡导致 current 看不出趋势,leak_bytes 仍能直显泄漏增长。
-     * 每次 scan 重新计算(覆盖写),不累计,因为 leak_table 自身记录的是当前未释放站点。 */
-    {
-        size_t leak_total = 0;
-        for (unsigned b = 0; b < MTT_LEAK_DEDUP_SIZE; b++) {
-            mtt_leak_site_t *site = leak_table.entries[b];
-            while (site != NULL) {
-                leak_total += site->total_size;
-                site = site->next;
-            }
-        }
-        atomic_store_explicit(&s->leak_bytes_total, leak_total, memory_order_relaxed);
-    }
+    /* （leak_bytes_total 统计已移至阶段 2.5 分类之后：
+     *  只累计嫌疑站点（probable/possible），确认周期作用域/长存活
+     *  的内存不再永久抬高仪表盘"已识别泄漏"红线 —— 口径与嫌疑区一致。） */
 
     /* ---- 阶段 2.5: 泄漏分类（late-free 证据 + 跨扫描站点历史） ----
      * 先 drain free hook 上报的老化释放证据，再对每个站点做四级分类。
@@ -771,6 +867,24 @@ static void scan_and_report_locked(void)
                 classify_site(site, classic);
                 site = site->next;
             }
+        }
+
+        /* 累加嫌疑站点 total_size → s->leak_bytes_total（时序图红线）。
+         * 只计 probable/possible：确认周期作用域（session_scoped）与
+         * 长存活稳定（long_lived）的内存不再永久抬高红线，
+         * 口径与文本报告嫌疑区/火焰图完全一致。 */
+        {
+            size_t leak_total = 0;
+            for (unsigned b = 0; b < MTT_LEAK_DEDUP_SIZE; b++) {
+                mtt_leak_site_t *site = leak_table.entries[b];
+                while (site != NULL) {
+                    if (site->conf == MTT_CONF_PROBABLE ||
+                        site->conf == MTT_CONF_POSSIBLE)
+                        leak_total += site->total_size;
+                    site = site->next;
+                }
+            }
+            atomic_store_explicit(&s->leak_bytes_total, leak_total, memory_order_relaxed);
         }
     }
 
@@ -1018,59 +1132,93 @@ static void scan_and_report_locked(void)
                     fmt_time(site->first_seen, time_buf1, sizeof(time_buf1)),
                     fmt_time(site->last_seen,  time_buf2, sizeof(time_buf2)));
 
-                /* 输出栈帧（跳过内部帧） */
+                /* 输出栈帧（跳过内部帧）；LEAK HERE 标记第一个真实业务帧
+                 * （跳过 C++ 分配器适配帧 operator new/STL，业务调用点在它们下面） */
                 mtt_stack_entry_t *stack_entry = pairs[i].stack_entry;
                 if (stack_entry != NULL && stack_entry->is_resolved) {
-                    int frame_idx = 0;
+                    int frame_idx = 0, marked = 0;
                     for (int j = 0; j < stack_entry->frame_count; j++) {
                         const char *sym = stack_entry->resolved[j];
                         if (is_internal_frame(sym)) continue;
 
-                        const char *marker = (frame_idx == 0)
-                            ? "  <-- LEAK HERE" : "";
+                        int is_shim = is_allocator_shim_frame(sym);
+                        const char *marker = "";
+                        if (!marked && !is_shim) {
+                            marker = "  <-- LEAK HERE";
+                            marked = 1;
+                        }
                         fprintf(fp, "  #%-2d %s%s\n", frame_idx, sym, marker);
                         frame_idx++;
                     }
+                    /* 全部是分配器帧的极端情况：退回标记首帧（有标记好过没有） */
+                    if (!marked && frame_idx > 0) {
+                        /* 重打一遍代价高；改用追加提示行说明 */
+                        fprintf(fp,
+                            "  (all frames are allocator/std internals — "
+                            "rebuild with -rdynamic or check mangled names)\n");
+                    }
                 } else {
-                    fprintf(fp, "  (symbols not resolved)\n");
+                    /* 无栈三种成因可诊断化（不再一律误报"未解析"） */
+                    if (site->stack_kind == MTT_STACK_SIZE_AGGREGATED)
+                        fprintf(fp,
+                            "  (no stack captured — this site AGGREGATES all"
+                            " size=%zu allocations; not a single call site)\n",
+                            site->per_leak_size);
+                    else if (site->stack_kind == MTT_STACK_CACHE_FULL)
+                        fprintf(fp,
+                            "  (no stack — symbol cache full (4096);"
+                            " restart tracking to reclaim)\n");
+                    else
+                        fprintf(fp, "  (symbols not resolved)\n");
                 }
                 fprintf(fp, "\n");
             }
 
-            /* 精简信息区：周期作用域（观察到释放）与长存活稳定分配。
-             * 每站点单行摘要 + 栈顶 1 帧，供人工复核，不参与泄漏计数 */
+            /* 精简信息区：只列 long_lived（长存活、从未观察到释放），
+             * 每站点单行摘要 + 栈顶 1 帧，供人工复核，不参与泄漏计数。
+             * session_scoped（已确认"同一处申请又释放"的周期作用域内存）
+             * 不再逐站展示 —— 只汇总一行计数：确认非泄漏后不应继续占据页面；
+             * 需要核查时通过 /api/leaks JSON（conf=session_scoped）过滤。 */
             {
-                size_t info_count = 0;
+                size_t longlived_count = 0, session_count = 0, session_total = 0;
                 for (size_t i = 0; i < site_count; i++) {
                     mtt_leak_site_t *site = pairs[i].site;
                     if (site == NULL || site->count == 0) continue;
-                    if (site->conf != MTT_CONF_SESSION_SCOPED &&
-                        site->conf != MTT_CONF_LONG_LIVED)
-                        continue;
-                    info_count++;
+                    if (site->conf == MTT_CONF_LONG_LIVED)
+                        longlived_count++;
+                    else if (site->conf == MTT_CONF_SESSION_SCOPED) {
+                        session_count++;
+                        session_total += site->total_size;
+                    }
                 }
-                if (info_count > 0) {
+                if (session_count > 0) {
+                    char st_buf[32] = {0};
+                    fprintf(fp,
+                        "Session-scoped sites: %zu (confirmed alloc/free cycles, "
+                        "hidden — total %s held)\n\n",
+                        session_count,
+                        fmt_bytes(session_total, st_buf, sizeof(st_buf)));
+                }
+                if (longlived_count > 0) {
                     char total_buf[32] = {0};
                     char time_buf1[32] = {0};
                     char time_buf2[32] = {0};
                     fprintf(fp,
                         "=== Long-lived allocations (not classified as leaks) ===\n"
-                        "Sites: %zu  (session_scoped = 观察到过释放; "
-                        "long_lived = 数量稳定未观察过释放)\n\n",
-                        info_count);
+                        "Sites: %zu  (数量稳定且从未观察到释放，请人工确认)\n\n",
+                        longlived_count);
                     size_t info_idx = 0;
                     for (size_t i = 0; i < site_count; i++) {
                         mtt_leak_site_t *site = pairs[i].site;
                         if (site == NULL || site->count == 0) continue;
-                        if (site->conf != MTT_CONF_SESSION_SCOPED &&
-                            site->conf != MTT_CONF_LONG_LIVED)
+                        if (site->conf != MTT_CONF_LONG_LIVED)
                             continue;
                         info_idx++;
                         fprintf(fp,
-                            "--- LongLived #%zu ---  class=%s  count=%zu  "
+                            "--- LongLived #%zu ---  count=%zu  "
                             "total=%s  late_free=%u\n"
                             "First seen:   %s  Last seen: %s\n",
-                            info_idx, mtt_conf_str(site->conf),
+                            info_idx,
                             site->count,
                             fmt_bytes(site->total_size, total_buf, sizeof(total_buf)),
                             site->late_free_count,
@@ -1086,7 +1234,7 @@ static void scan_and_report_locked(void)
                                 break;
                             }
                         } else {
-                            fprintf(fp, "  top: (symbols not resolved)\n\n");
+                            fprintf(fp, "  top: (no stack captured or symbols not resolved)\n\n");
                         }
                     }
                 }
@@ -1727,6 +1875,10 @@ void mtt_reporter_reset_for_fork(void)
      * 无意义;归档路径含父进程 pid,由 mtt_reporter_start 重建) */
     memset(g_site_history, 0, sizeof(g_site_history));
     g_site_history_used = 0;
+    memset(g_late_free_ring, 0, sizeof(g_late_free_ring));
+    memset(g_pending_ev, 0, sizeof(g_pending_ev));
+    g_pending_head = 0;
+    g_pending_live = 0;
     atomic_store_explicit(&g_late_free_head, 0, memory_order_relaxed);
     g_reporter.scan_seq = 0;
     g_reporter.archive_path[0] = '\0';

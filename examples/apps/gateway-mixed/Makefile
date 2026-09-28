@@ -15,8 +15,8 @@ endif
 
 CC      := $(CROSS_COMPILE)gcc
 CXX     := $(CROSS_COMPILE)g++
-CFLAGS  := -Os -Wall -Wextra -fPIC -fno-omit-frame-pointer -funwind-tables -std=gnu11 $(ARCH_FLAGS)
-CXXFLAGS := -Os -Wall -Wextra -fPIC -fno-omit-frame-pointer -funwind-tables -std=c++17 $(ARCH_FLAGS) -Ic_core
+CFLAGS  := -Os -Wall -Werror -fPIC -fsigned-char -std=gnu11 $(ARCH_FLAGS)
+CXXFLAGS := -Os -Wall -fPIC -std=c++17 $(ARCH_FLAGS) -Ic_core
 LDFLAGS  := -lpthread
 
 BUILD := build

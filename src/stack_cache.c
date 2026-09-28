@@ -43,14 +43,39 @@
 #include <execinfo.h>
 #endif
 
-/* ---- C++ 符号反修饰（借鉴 heaptrack Demangler） ---- */
-/** 检测 __cxa_demangle 是否可用（需要链接 libstdc++ 或 libc++） */
-#if defined(__has_include) && __has_include(<cxxabi.h>)
-    #define MTT_HAS_CXXABI 1
-    #include <cxxabi.h>
-#else
-    #define MTT_HAS_CXXABI 0
-#endif
+/* ---- C++ 符号反修饰（借鉴 heaptrack Demangler） ----
+ *
+ * 2026-09 重写：改用运行时 dlsym(RTLD_DEFAULT, "__cxa_demangle") 懒解析。
+ * 旧实现用 __has_include(<cxxabi.h>) 编译期探测 + abi::__cxa_demangle 直接调用，
+ * 存在三个问题：
+ *   1. 交叉工具链的 C 头文件路径没有 cxxabi.h（它在 C++ 专属 include 目录）→
+ *      MTT_HAS_CXXABI=0，demangle 整体编译掉 —— 所有真实构建都是死代码；
+ *   2. 即使 -I 进 C++ 头目录，abi:: 命名空间在 C 模式下无法编译（构建直接失败）；
+ *   3. 纯 C 进程若开 LD_BIND_NOW 会因 undefined symbol 加载失败。
+ *
+ * dlsym 方案：目标进程是 C++ 时其已加载 libstdc++/libc++abi，全局命名空间
+ * 必有 __cxa_demangle（零链接依赖）；纯 C 进程解析失败，优雅降级为不 demangle。
+ * dlsym 在 reporter 线程调用（tool_internal=1），其内部 malloc 不递归进 hook。
+ * 结果缓存（成功/失败各一次），避免每帧重复 dlsym。 */
+typedef char *(*cxa_demangle_fn)(const char *, char *, size_t *, int *);
+
+/** 懒解析 __cxa_demangle（缓存：NULL=不可用，0x1 占位表示"已尝试但失败"） */
+static cxa_demangle_fn get_cxa_demangle(void)
+{
+    /* 状态编码：NULL=未尝试；0x1=已尝试且不可用；其他=函数指针 */
+    static _Atomic uintptr_t s_cached = 0;
+
+    uintptr_t cached = atomic_load_explicit(&s_cached, memory_order_relaxed);
+    if (cached == 0) {
+        cxa_demangle_fn fn = (cxa_demangle_fn)dlsym(RTLD_DEFAULT, "__cxa_demangle");
+        uintptr_t store = (fn != NULL) ? (uintptr_t)fn : 0x1;
+        atomic_compare_exchange_strong_explicit(&s_cached, &cached, store,
+                                                memory_order_relaxed,
+                                                memory_order_relaxed);
+        cached = store;
+    }
+    return (cached == 0x1) ? NULL : (cxa_demangle_fn)cached;
+}
 
 /* ---- 全局栈缓存单例 ---- */
 
@@ -292,25 +317,25 @@ static void demangle_symbol(const char *mangled, char *buf, size_t buf_size)
     if (mangled == NULL || buf == NULL || buf_size == 0) return;
     buf[0] = '\0';
 
-#if MTT_HAS_CXXABI
     /* 仅对 C++ mangled 名称进行反修饰（以 _Z 开头是 Itanium C++ ABI 的特征） */
     if (mangled[0] == '_' && mangled[1] == 'Z') {
-        int status = 0;
-        char *demangled = abi::__cxa_demangle(mangled, NULL, NULL, &status);
-        if (status == 0 && demangled != NULL) {
-            size_t n = strlen(demangled);
-            if (n >= buf_size) n = buf_size - 1;
-            memcpy(buf, demangled, n);
-            buf[n] = '\0';
-            free(demangled);
-            return;
+        cxa_demangle_fn demangle = get_cxa_demangle();
+        if (demangle != NULL) {
+            int status = 0;
+            char *demangled = demangle(mangled, NULL, NULL, &status);
+            if (status == 0 && demangled != NULL) {
+                size_t n = strlen(demangled);
+                if (n >= buf_size) n = buf_size - 1;
+                memcpy(buf, demangled, n);
+                buf[n] = '\0';
+                free(demangled);
+                return;
+            }
+            /* demangle 失败（status != 0 或 demangled == NULL）：fallthrough 到原始名称 */
+            if (demangled != NULL) free(demangled);
         }
-        /* demangle 失败（status != 0 或 demangled == NULL）：fallthrough 到原始名称 */
-        if (demangled != NULL) free(demangled);
+        /* __cxa_demangle 不可用（纯 C 进程）：fallthrough 到原始名称 */
     }
-#else
-    (void)mangled;
-#endif
 
     /* 不需要反修饰或反修饰失败：复制原始名称 */
     size_t n = strlen(mangled);

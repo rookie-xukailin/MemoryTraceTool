@@ -18,8 +18,9 @@ else ifeq ($(ARCH),riscv64)
 endif
 
 CC      := $(CROSS_COMPILE)gcc
-CFLAGS  := -O2 -Wall -Wextra -fno-omit-frame-pointer -funwind-tables -std=gnu11 $(ARCH_FLAGS)
-LDFLAGS := -lpthread
+CFLAGS  := -O2 -g -Wall -Werror -fsigned-char -fgnu89-inline -funwind-tables -std=gnu11 $(ARCH_FLAGS)
+# --export-dynamic: 对齐 STORAGE，主程序符号导出后 dladdr 可解析业务帧（栈回溯可读）
+LDFLAGS := -lpthread -Wl,--export-dynamic
 
 SRC := src/main.c src/config.c src/session.c src/sensor.c src/storage.c src/log.c
 OBJ := $(SRC:.c=.o)

@@ -498,7 +498,7 @@ extern _Atomic int mtt_debug_level;
 /* reporter.c */
 void mtt_reporter_start(void);
 void mtt_heartbeat_write(void);   /* 60s 资源监控写独立文件 */
-void mtt_late_free_note(uint64_t stack_hash);  /* free hook 记录老化释放站点 hash（reporter.c 实现） */
+void mtt_late_free_note(uint64_t stack_hash, size_t size);  /* free hook 记录老化释放（栈 hash+size，跨栈周期匹配用） */
 
 /* stack_cache.c */
 uint64_t mtt_stack_hash_compute(void **frames, int frame_count);

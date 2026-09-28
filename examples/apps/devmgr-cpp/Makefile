@@ -14,7 +14,7 @@ else ifeq ($(ARCH),riscv64)
 endif
 
 CXX     := $(CROSS_COMPILE)g++
-CXXFLAGS := -Os -Wall -Wextra -fno-omit-frame-pointer -funwind-tables -std=c++17 $(ARCH_FLAGS)
+CXXFLAGS := -Os -Wall -std=c++17 $(ARCH_FLAGS)
 LDFLAGS  := -lpthread
 
 SRC := src/main.cpp src/device.cpp src/device_manager.cpp src/event_bus.cpp src/telemetry.cpp

@@ -423,7 +423,7 @@ void free(void *ptr)
             time_t threshold = atomic_load_explicit(&s->leak_threshold_sec, memory_order_relaxed);
             if (threshold > 0 && age_ms > (uint64_t)threshold * 1000) {
                 atomic_fetch_add_explicit(&s->free_expired_count, 1, memory_order_relaxed);
-                mtt_late_free_note(mtt_stack_hash_compute(e->stack, e->stack_frames));
+                mtt_late_free_note(mtt_stack_hash_compute(e->stack, e->stack_frames), e->size);
             }
         }
         mtt_entry_remove(s, ptr);
