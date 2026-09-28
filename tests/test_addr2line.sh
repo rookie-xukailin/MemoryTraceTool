@@ -33,8 +33,11 @@ while IFS= read -r frame; do
 
     # 主程序帧才做 addr2line（libc/libstdc++ 帧无源码语义）
     case "$lib" in
-        *libc*|*libstdc*|*ld-linux*|*libgcc*) continue ;;
+        libc.so|libc.so.*|libc-*.so|libstdc++.so|libstdc++.so.*|\
+        ld-linux*|libgcc_s.so|libgcc_s.so.*|linux-vdso*|ld-musl*|libc.musl*) continue ;;
     esac
+    # 0x0 偏移（vDSO/匿名映射）无意义，跳过
+    [ "$off" = "0x0" ] && continue
     # 库名映射到被测 binary（同目录）
     target="$BIN"
     [ -f "$lib" ] && target="$lib"
@@ -49,19 +52,14 @@ while IFS= read -r frame; do
         fail=$((fail+1))
         continue
     fi
-    okmsg="  PASS addr2line($off) -> $func"
-    if [ -n "$EXPECT_LINE" ] && [ "$off" = "$(echo "$frame" | sed -n 's/.*(\([^()+]*\)+\(0x[0-9a-fA-F]*\)).*/\2/p')" ]; then
-        case "$line" in
-            *":0"|*":?") echo "  FAIL addr2line($off): no source line ($line) — binary lacks -g?"; fail=$((fail+1)); continue ;;
-        esac
-        okmsg="$okmsg at $line"
-    fi
-    echo "$okmsg"
+    echo "  PASS addr2line($off) -> $func"
     pass=$((pass+1))
 done < "$FRAMES"
 
 echo "---"
 echo "addr2line roundtrip: $pass passed, $fail failed"
+# 零验证放行洞：一帧都没校验到 = 格式漂移/全被 skip，必须 FAIL
+[ "$pass" -gt 0 ] || { echo "FAIL: zero frames validated (format drift or all skipped)"; exit 1; }
 [ "$fail" -eq 0 ] || exit 1
 
 # 泄漏点函数名断言：取第一个业务帧（跳过工具内部帧 mtt_/capture_stack/backtrace）
@@ -74,7 +72,18 @@ while IFS= read -r frame; do
     if [ -n "$off" ]; then biz_off="$off"; break; fi
 done < "$FRAMES"
 [ -n "$biz_off" ] || { echo "FAIL: no business frame in stack dump"; exit 1; }
-main_func=$(addr2line -e "$BIN" -f -C "$biz_off" 2>/dev/null | head -1)
+main_out=$(addr2line -e "$BIN" -f -C "$biz_off" 2>/dev/null)
+main_func=$(echo "$main_out" | head -1)
+main_line=$(echo "$main_out" | tail -1)
+# -g 构建时业务帧必须解析出源码行（用户验收：找回原文=函数+行号）
+if [ -n "$EXPECT_LINE" ]; then
+    case "$main_line" in
+        *":0"|*":?"|"??:0")
+            echo "FAIL: leak frame has no source line ($main_line) — build lacks -g"
+            exit 1 ;;
+    esac
+    echo "  leak site source line: $main_line"
+fi
 case "$main_func" in
     "$EXPECT_FUNC"*|*"$EXPECT_FUNC"*)
         echo "PASS: leak site resolves to expected function '$EXPECT_FUNC'"

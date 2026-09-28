@@ -239,7 +239,7 @@ test_addr2line: $(SHARED_LIB) tests/test_addr2line.c tests/test_addr2line.sh | $
 	MTT_LEAK_THRESHOLD_SEC=2 MTT_DEBUG=0 MTT_ARCHIVE=0 \
 		MTT_REPORT_FILE=/tmp/mtt_addr2line.json \
 		$(RUN) $(OUTPUT_DIR)/test_addr2line
-	./tests/test_addr2line.sh $(OUTPUT_DIR)/test_addr2line leak_site_alloc
+	./tests/test_addr2line.sh $(OUTPUT_DIR)/test_addr2line leak_site_alloc "" 
 
 test_all: test test_stability test_blacklist_fast test_fork test_leak_class test_integrity test_archive test_addr2line
 

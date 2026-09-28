@@ -186,14 +186,17 @@ static mtt_site_hist_t* site_hist_get(uint64_t hash, int create)
  * 再按同 size 认领（每条证据只认领一次）。池持久（跨扫描保留），
  * 容量满覆盖最旧。仅 reporter 线程访问。 */
 #define MTT_PENDING_EV_MAX 2048
+#define MTT_PENDING_EV_TTL 1440  /* 证据有效期（扫描数，1440×60s≈24h 滚动窗口） */
 typedef struct {
     uint64_t hash;
     size_t   size;
     uint8_t  consumed;
+    uint32_t born_scan;  /* 证据产生时的扫描序号（TTL 过期用） */
 } pending_ev_t;
 static pending_ev_t g_pending_ev[MTT_PENDING_EV_MAX];
 static size_t g_pending_head = 0;   /* 下一写入位（环形） */
 static size_t g_pending_live = 0;   /* 有效数（<= MAX） */
+static uint64_t g_ev_scan_base = 0; /* 池条目 born_scan 的基准（scan_seq 增量） */
 
 /** drain late-free 环 → 待认领池（仅 reporter 线程调用） */
 static void late_free_drain(void)
@@ -211,6 +214,7 @@ static void late_free_drain(void)
         g_pending_ev[g_pending_head].hash = h;
         g_pending_ev[g_pending_head].size = sz;
         g_pending_ev[g_pending_head].consumed = 0;
+        g_pending_ev[g_pending_head].born_scan = (uint32_t)g_ev_scan_base;
         g_pending_head = (g_pending_head + 1) % MTT_PENDING_EV_MAX;
         if (g_pending_live < MTT_PENDING_EV_MAX) g_pending_live++;
     }
@@ -281,30 +285,50 @@ static void classify_site(mtt_leak_site_t *site, int classic)
         int has_prior = (hist != NULL) && (hist->scans_seen >= 1);
         int exceeds_peak = has_prior && (site->count > hist->peak_count);
 
-        /* 释放证据认领：
-         * 1) 精确：历史表本 hash 已有 late_free（同一调用栈闭环）；
-         * 2) 兜底：待认领池中找同 size 的未消费证据 —— 周期作用域内存
-         *    "清理路径释放、初始化路径重建"两端调用栈不同，全栈 hash
-         *    断链时以分配 size 认领（每条证据只认领一次，误配受控）。
-         * 认领后写回站点自身的历史条目，长期有效。 */
-        if (hist != NULL && hist->late_free_count == 0 && site->count > 0) {
+        /* 释放证据认领 v2（两趟 + 按峰值补齐 + TTL）：
+         * 历史表 late_free_count 按 peak_count 补齐（每个曾存活的槽位都
+         * 观察到一次释放），允许跨多轮扫描逐步闭环；门 = late_free < peak，
+         * 超过峰值的证据不认领（防慢性误放走真泄漏）。
+         * 第一趟精确 hash（本站点自己的释放）；第二趟同 size 兜底（跨栈
+         * 周期：清理/初始化路径栈不同），只认领其原生站点未记录的证据。
+         * TTL 1440 轮（≈24h）外证据过期。 */
+        if (hist != NULL && site->count > 0 &&
+            hist->late_free_count < (uint32_t)hist->peak_count) {
+            int claimed = 0;
+            /* TTL 过期标记 */
             for (size_t pi = 0; pi < MTT_PENDING_EV_MAX; pi++) {
-                if (g_pending_ev[pi].consumed ||
-                    g_pending_ev[pi].hash == 0 ||
-                    g_pending_ev[pi].size != site->per_leak_size)
+                if (g_pending_ev[pi].hash == 0) continue;
+                if ((uint32_t)g_ev_scan_base - g_pending_ev[pi].born_scan
+                    > MTT_PENDING_EV_TTL)
+                    g_pending_ev[pi].consumed = 1;
+            }
+            /* 第一趟：精确 hash */
+            for (size_t pi = 0; pi < MTT_PENDING_EV_MAX &&
+                 hist->late_free_count < (uint32_t)hist->peak_count; pi++) {
+                if (g_pending_ev[pi].consumed || g_pending_ev[pi].hash == 0)
                     continue;
-                int hash_known = 0;
-                /* 该证据 hash 若正是本站点 hash，属精确匹配路径（上面已处理）；
-                 * 只认领"hash 未知"的证据，避免同 size 的精确站点误领 */
+                if (g_pending_ev[pi].hash == site->stack_hash &&
+                    g_pending_ev[pi].size == site->per_leak_size) {
+                    g_pending_ev[pi].consumed = 1;
+                    hist->late_free_count++;
+                    claimed++;
+                }
+            }
+            /* 第二趟：同 size 兜底（跨栈） */
+            for (size_t pi = 0; pi < MTT_PENDING_EV_MAX &&
+                 hist->late_free_count < (uint32_t)hist->peak_count; pi++) {
+                if (g_pending_ev[pi].consumed || g_pending_ev[pi].hash == 0)
+                    continue;
+                if (g_pending_ev[pi].size != site->per_leak_size)
+                    continue;
                 mtt_site_hist_t *ev_hist = site_hist_get(
                     g_pending_ev[pi].hash, 0);
                 if (ev_hist != NULL && ev_hist->late_free_count > 0)
-                    hash_known = 1;   /* 证据已被其原生站点记录 */
-                if (hash_known) continue;
+                    continue;   /* 证据已被其原生站点记录 */
                 g_pending_ev[pi].consumed = 1;
                 hist->late_free_count++;
-                if (hist->late_free_count == 1) {
-                    /* 首次认领：诊断输出便于观察跨栈匹配 */
+                claimed++;
+                if (claimed == 1) {
                     char dbuf[128];
                     int dlen = snprintf(dbuf, sizeof(dbuf),
                         "[MTT] classify: site %llx claimed same-size(%zu) "
@@ -314,7 +338,6 @@ static void classify_site(mtt_leak_site_t *site, int classic)
                     if (dlen > 0 && dlen < (int)sizeof(dbuf))
                         MTT_DIAG_LOG(dbuf, (size_t)dlen);
                 }
-                break; /* 每站点每轮至多认领一条 */
             }
         }
 
@@ -901,6 +924,7 @@ static void scan_and_report_locked(void)
                 site = site->next;
             }
         }
+        g_ev_scan_base++;   /* 证据池 TTL 计数基准 */
 
         /* 累加嫌疑站点 total_size → s->leak_bytes_total（时序图红线）。
          * 只计 probable/possible：确认周期作用域（session_scoped）与
@@ -1942,6 +1966,7 @@ void mtt_reporter_reset_for_fork(void)
     memset(g_pending_ev, 0, sizeof(g_pending_ev));
     g_pending_head = 0;
     g_pending_live = 0;
+    g_ev_scan_base = 0;
     atomic_store_explicit(&g_late_free_head, 0, memory_order_relaxed);
     g_reporter.scan_seq = 0;
     g_reporter.archive_path[0] = '\0';
