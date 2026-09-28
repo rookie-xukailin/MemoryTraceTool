@@ -204,7 +204,36 @@ test_fork: $(SHARED_LIB) tests/test_fork.c | $(OUTPUT_DIR)
 		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS) -lpthread
 	$(RUN) $(OUTPUT_DIR)/test_fork
 
-test_all: test test_stability test_blacklist_fast test_fork
+# 泄漏四级分类验证测试(long_lived/session_scoped/probable + classic 回退)
+# 注意:MTT_* 环境变量必须在 exec 前注入 —— 进程内 setenv 会先触发
+# libc malloc → hook → 懒初始化,环境变量按默认值解析导致测试失效。
+test_leak_class: $(SHARED_LIB) tests/test_leak_class.c | $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_leak_class tests/test_leak_class.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS) -lpthread
+	rm -f /tmp/mtt_tlc_smart.json /tmp/mtt_tlc_classic.json
+	MTT_LEAK_THRESHOLD_SEC=2 MTT_DEBUG=0 MTT_ARCHIVE=0 \
+		MTT_REPORT_FILE=/tmp/mtt_tlc_smart.json \
+		$(RUN) $(OUTPUT_DIR)/test_leak_class
+	MTT_LEAK_THRESHOLD_SEC=2 MTT_DEBUG=0 MTT_ARCHIVE=0 MTT_CLASSIC_LEAK=1 \
+		MTT_REPORT_FILE=/tmp/mtt_tlc_classic.json \
+		$(RUN) $(OUTPUT_DIR)/test_leak_class classic
+
+# 数据完整性验证测试(池耗尽 skipped_overcap 计数)
+test_integrity: $(SHARED_LIB) tests/test_integrity.c | $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_integrity tests/test_integrity.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS) -lpthread
+	MTT_POOL_ENTRIES=1024 MTT_LEAK_THRESHOLD_SEC=2 MTT_DEBUG=0 MTT_ARCHIVE=0 \
+		$(RUN) $(OUTPUT_DIR)/test_integrity
+
+# 扫描历史归档验证测试(JSONL 追加写)
+test_archive: $(SHARED_LIB) tests/test_archive.c | $(OUTPUT_DIR)
+	$(CC) $(CFLAGS) $(INC_PUBLIC) -o $(OUTPUT_DIR)/test_archive tests/test_archive.c \
+		-L$(OUTPUT_DIR) -lmemorytracetool $(LDFLAGS) -lpthread
+	MTT_LEAK_THRESHOLD_SEC=2 MTT_DEBUG=0 \
+		MTT_REPORT_FILE=/tmp/mtt_test_archive.json \
+		$(RUN) $(OUTPUT_DIR)/test_archive
+
+test_all: test test_stability test_blacklist_fast test_fork test_leak_class test_integrity test_archive
 
 clean:
 	rm -rf $(BUILD_DIR) $(OUTPUT_DIR)
