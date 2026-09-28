@@ -102,6 +102,21 @@ LD_PRELOAD=/tmp/libmemorytracetool.so ./my_daemon
 - HTTP 服务器仅支持 GET 请求，不支持并发连接（单线程 accept）
 - time_t 在 ARM32 上为 4 字节（2038 年问题）
 
+## 测试纪律（2026-09 与用户约定，永久有效）
+
+1. **所有修改必须页面实测**：前端/交互改动一律真实打开页面（浏览器自动化
+   登录 + 截图 + 视觉确认），禁止只跑 node/静态检查就宣布通过。
+2. **addr2line 必须找回原文**：栈回溯验收标准——报告中的帧必须能通过
+   `addr2line -e <bin> -f -C <off>` 解析出函数名（有 -g 时含源码行），
+   找不回原文 = 失败。固化于 `make test_addr2line`（全平台套件共用）。
+3. **编译参数固定**（对齐真实工程参数表）：
+   - sensorhub-c（纯 C）: `-O2 -g -Wall -Werror -fsigned-char -fgnu89-inline
+     -funwind-tables -std=gnu11` + 链接 `-Wl,--export-dynamic`
+   - devmgr-cpp（纯 C++）: `-Os -Wall -std=c++17`（无 unwind 显式参数，平台隐式）
+   - gateway-mixed（C++调C .so）: C `-Os -Wall -Werror -fPIC -fsigned-char`，
+     C++ `-Os -Wall -fPIC -std=c++17`
+   - 其余参数交给平台默认；测试前必须 `make clean && make`（防产物架构污染）
+
 ## 线程模型
 
 - Application threads: 并发 alloc/free，64 分段锁
