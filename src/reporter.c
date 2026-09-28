@@ -1406,8 +1406,18 @@ static void scan_and_report_locked(void)
                                     const char *sym = se->resolved[k];
                                     if (sym == NULL || sym[0] == '\0')
                                         continue;
-                                    fprintf(jf, "%s\"%s\"",
-                                            fw ? "," : "", sym);
+                                    /* JSON 转义（"/\ 与控制字符），与 /api 路径一致 */
+                                    fprintf(jf, "%s\"", fw ? "," : "");
+                                    for (const char *p = sym; *p; p++) {
+                                        unsigned char ch = (unsigned char)*p;
+                                        if (ch == '"' || ch == '\\')
+                                            fputc('\\', jf);
+                                        if (ch < 0x20)
+                                            fprintf(jf, "\\u%04x", ch);
+                                        else
+                                            fputc(ch, jf);
+                                    }
+                                    fputc('"', jf);
                                     fw = 1;
                                 }
                             }

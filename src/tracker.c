@@ -1149,6 +1149,7 @@ static void get_process_name(char *buf, size_t size)
 
 /* 前置声明：init 早期 sigaction 用（定义见 mtt_signal_thread_start 附近） */
 static void mtt_sigusr1_noop(int sig);
+static sigset_t g_usr1_oldset;   /* MTT_TAKEOVER_USR1=0 时保存的原 SIGUSR1 掩码 */
 
 void mtt_ensure_init(void)
 {
@@ -1216,6 +1217,7 @@ void mtt_ensure_init(void)
     if (want_pool_entries > MTT_POOL_ENTRIES_MAX) want_pool_entries = MTT_POOL_ENTRIES_MAX;
     int      want_debug    = MTT_DEBUG_DEFAULT;
     int      want_classic_leak = 0;   /* MTT_CLASSIC_LEAK=1 → 纯时间两级判定回退 */
+    int      takeover_usr1 = 1;       /* SIGUSR1 接管开关（MTT_TAKEOVER_USR1=0 退避） */
     size_t   want_ll_suspect   = MTT_LONG_LIVED_SUSPECT_DEFAULT; /* long_lived 嫌疑阈值(字节) */
 
     {
@@ -1520,14 +1522,13 @@ void mtt_ensure_init(void)
         /* MTT_TAKEOVER_USR1=0：跳过 SIGUSR1 接管（业务进程自带 SIGUSR1
          * handler 时的退路）。代价：kill -USR1 即时报告降级为不可用，
          * 周期扫描(60s)与 peak 触发扫描不受影响。 */
-        int takeover = 1;
         {
             const char *env_takeover = getenv("MTT_TAKEOVER_USR1");
             if (env_takeover != NULL && strcmp(env_takeover, "0") == 0)
-                takeover = 0;
+                takeover_usr1 = 0;
         }
 
-        if (takeover) {
+        if (takeover_usr1) {
             /* 接管前检查业务已有 handler：BMC 守护进程常用 SIGUSR1 做
              * 日志轮转等内部控制（snmpd 等）。双向冲突都要告警：
              *   - 业务先注册 → 被我们覆盖 → 业务内部控制丢失（WARN 让用户
@@ -1564,13 +1565,15 @@ void mtt_ensure_init(void)
                 MTT_LOG_INFO(ibuf, (size_t)ilen);
         }
 
-        /* 屏蔽始终执行：即使不接管，屏蔽可保护后续创建的工具线程
-         * 不被业务信号处理路径打断（RT 信号未阻塞，业务不受影响）；
-         * 不接管时 signal 线程的 sigtimedwait 只等业务发来的 SIGUSR1，
-         * 行为无害（收到即触发扫描，与 handler 并存时最多双触发）。 */
+        /* 屏蔽：保护后续创建的工具线程（reporter/HTTP）不被信号打断。
+         * takeover=0 时在 signal 线程启动后恢复 init 线程原掩码——否则
+         * 之后创建的全部业务线程继承屏蔽，业务 handler 被 sigtimedwait
+         * 饿死（退路自毁，二轮走读 P1）。工具线程已继承屏蔽不受影响。 */
         sigset_t block_set;
         sigemptyset(&block_set);
         sigaddset(&block_set, MTT_SIGNAL_REPORT);
+        if (!takeover_usr1)
+            pthread_sigmask(SIG_BLOCK, NULL, &g_usr1_oldset); /* 保存原掩码 */
         pthread_sigmask(SIG_BLOCK, &block_set, NULL);
     }
 
@@ -1606,6 +1609,12 @@ void mtt_ensure_init(void)
     /* 启动信号处理线程（SIGUSR1 触发即时报告） */
     mtt_signal_thread_start();
     mtt_log_stage(14, "signal thread started");
+
+    /* 退路模式：恢复 init 线程原掩码——此后创建的业务线程不再继承
+     * 屏蔽，业务的 SIGUSR1 handler 正常工作；工具线程（已创建）保持
+     * 屏蔽，signal 线程与业务 handler 双消费者并存（各取所需）。 */
+    if (!takeover_usr1)
+        pthread_sigmask(SIG_SETMASK, &g_usr1_oldset, NULL);
 
     if (ctx != NULL) {
         ctx->in_hook = saved_hook;
