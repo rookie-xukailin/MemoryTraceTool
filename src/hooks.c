@@ -133,6 +133,17 @@ static inline void mtt_hook_dec_depth(void)
         ctx->hook_depth = 0;
 }
 
+/* 线程槽位满（512 上限）计数：数据完整性可见性。
+ * 此前该路径只打 S25 日志（MTT_DEBUG=2 才可见），用户无从得知
+ * "线程太多导致该线程的分配全部未跟踪"。state 是静态零初始化单例，
+ * init 完成前原子递增也安全。 */
+static inline void mtt_note_slot_full(void)
+{
+    mtt_state_t *s = mtt_state_get();
+    if (s != NULL)
+        atomic_fetch_add_explicit(&s->skipped_slots, 1, memory_order_relaxed);
+}
+
 /**
  * LD_PRELOAD 拦截的 malloc。
  *
@@ -165,6 +176,7 @@ void* malloc(size_t size)
     if (ctx == NULL) {
         /* 槽位满(512 上限):降级透传,不追踪。
          * MTT_DEBUG=2 时输出 S25,定位"线程太多导致泄漏丢失"场景 */
+        mtt_note_slot_full();
         mtt_log_stage(25, "malloc ctx==NULL (slot full) size=%zu, NOT tracking", size);
         mtt_resolve_raw_allocators();
         return (raw_malloc != NULL) ? raw_malloc(size) : NULL;
@@ -337,6 +349,7 @@ void free(void *ptr)
     mtt_per_thread_t *ctx = mtt_thread_get_cached();
     if (ctx == NULL) {
         /* 槽位满：降级直接释放,不维护 entry */
+        mtt_note_slot_full();
         mtt_log_stage(25, "free ctx==NULL (slot full), NOT untracking");
         mtt_resolve_raw_allocators();
         if (raw_free != NULL) raw_free(ptr);
@@ -397,14 +410,21 @@ void free(void *ptr)
         else
             atomic_store_explicit(&s->current_bytes, 0, memory_order_relaxed);
         atomic_fetch_add_explicit(&s->free_count, 1, memory_order_relaxed);
-        /* 临时分配检测：寿命<1秒→大概率非泄漏（借鉴 heaptrack 临时分配检测） */
-        if (mtt_now_sec() - e->timestamp <= 1)
-            atomic_fetch_add_explicit(&s->temp_alloc_count, 1, memory_order_relaxed);
-        /* 延迟释放追踪：若释放时已超泄漏阈值→曾是"可疑泄漏"但后来释放了（借鉴 libleak late-free） */
+        /* 临时分配检测：寿命<1秒→大概率非泄漏（借鉴 heaptrack 临时分配检测）。
+         * 老化判定用单调时钟差值（免疫 NTP 跳变）。 */
         {
+            uint64_t age_ms = mtt_now_mono_ms() - e->mono_ts;
+            if (age_ms <= 1000)
+                atomic_fetch_add_explicit(&s->temp_alloc_count, 1, memory_order_relaxed);
+            /* 延迟释放追踪：若释放时已超泄漏阈值→曾是"可疑泄漏"但后来释放了
+             * （借鉴 libleak late-free）。这是周期作用域内存（如收到重启 RPC
+             * 信号后释放）的关键证据：上报栈 hash 供 reporter 分级为 session_scoped。
+             * 栈 hash 仅在超阈值时计算（xxHash ≤64 指针 ≈ 百纳秒级）。 */
             time_t threshold = atomic_load_explicit(&s->leak_threshold_sec, memory_order_relaxed);
-            if (threshold > 0 && (mtt_now_sec() - e->timestamp) > threshold)
+            if (threshold > 0 && age_ms > (uint64_t)threshold * 1000) {
                 atomic_fetch_add_explicit(&s->free_expired_count, 1, memory_order_relaxed);
+                mtt_late_free_note(mtt_stack_hash_compute(e->stack, e->stack_frames));
+            }
         }
         mtt_entry_remove(s, ptr);
     }
@@ -434,6 +454,7 @@ void* calloc(size_t count, size_t size)
     mtt_per_thread_t *ctx = mtt_thread_get_cached();
     if (ctx == NULL) {
         /* 槽位满：降级,不追踪 */
+        mtt_note_slot_full();
         mtt_log_stage(25, "calloc ctx==NULL (slot full) size=%zu, NOT tracking",
                       (size_t)(count * size));
         mtt_resolve_raw_allocators();
@@ -510,6 +531,7 @@ void* realloc(void *ptr, size_t size)
     mtt_per_thread_t *ctx = mtt_thread_get_cached();
     if (ctx == NULL) {
         /* 槽位满：降级,不追踪 */
+        mtt_note_slot_full();
         mtt_log_stage(25, "realloc ctx==NULL (slot full) size=%zu, NOT tracking", size);
         mtt_resolve_raw_allocators();
         if (raw_realloc != NULL) return raw_realloc(ptr, size);

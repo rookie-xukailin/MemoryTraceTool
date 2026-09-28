@@ -144,6 +144,17 @@ extern int g_max_stack_frames;
 #define MTT_STARTUP_GRACE_DEFAULT   3   /* 默认启动宽限期（秒），首次 g_raw_ready 或超时后结束 */
 #define MTT_TEMP_ALLOC_THRESHOLD_MS 100 /* 临时分配阈值（毫秒级，用 alloc_seq 近似） */
 
+/* 四级泄漏分类（依据跨扫描站点历史 + late-free 证据，reporter.c 维护）。
+ * MTT_CLASSIC_LEAK=1 时回退旧的纯时间两级判定（probable/possible）。 */
+#define MTT_CONF_POSSIBLE       0  /* 未老化，或历史观测不足 → 待观察 */
+#define MTT_CONF_PROBABLE       1  /* 已老化且存活数超过历史峰值（只增不减）→ 真泄漏特征 */
+#define MTT_CONF_SESSION_SCOPED 2  /* 观察到过老化释放（周期作用域内存，如收到重启 RPC 信号释放）→ 非泄漏 */
+#define MTT_CONF_LONG_LIVED     3  /* 已老化但数量稳定且从未观察到释放 → 长存活稳定分配（信息级） */
+
+/* late-free 证据环形缓冲（free hook 生产者 → reporter 扫描线程消费者）。
+ * 记录"释放时已超阈值"的分配栈 hash，作为周期作用域识别的证据。 */
+#define MTT_LATE_FREE_RING_SIZE 8192
+
 /* 离线报告 */
 #define MTT_REPORT_FILE_DEFAULT NULL     /* 默认不启用离线 JSON 报告 */
 #define MTT_REPORT_HTML_DEFAULT NULL     /* 默认不启用离线 HTML 报告 */
@@ -208,7 +219,8 @@ _Static_assert(sizeof(mtt_aligned_mutex_t) == MTT_CACHELINE_SIZE,
 typedef struct mtt_entry {
     void            *ptr;                           /* 返回给调用者的内存指针（哈希键） */
     size_t           size;                          /* 分配字节数 */
-    time_t           timestamp;                     /* 分配时刻 Unix 时间戳 */
+    time_t           timestamp;                     /* 分配时刻 Unix 时间戳（墙钟，仅展示用） */
+    uint64_t         mono_ts;                       /* 分配时刻单调时钟（毫秒，判定老化用，免疫 NTP 跳变） */
     uint64_t         alloc_num;                     /* 全局单调递增的分配序号（64-bit 防回绕） */
     void            *stack[MTT_STACK_DEPTH];        /* backtrace 返回的调用栈帧地址 */
     int              stack_frames;                  /* 实际栈帧数 */
@@ -270,8 +282,10 @@ typedef struct {
     _Atomic size_t      sample_bytes_accum;         /* 字节采样累加器（按分配大小累加） */
     _Atomic size_t      skipped_sampled;            /* 因采样跳过的分配次数 */
     _Atomic size_t      skipped_overcap;            /* 因超容量上限跳过的记录次数 */
+    _Atomic size_t      skipped_slots;              /* 因线程槽位满(512)未跟踪的 alloc/free 次数 */
     _Atomic int         peak_updated;               /* peak_bytes 刚更新时为1（reporter 秒级检查） */
     _Atomic time_t      leak_threshold_sec;          /* 泄漏阈值（秒）：存活超过此值→probable leak */
+    _Atomic int         classic_leak;                /* 1=回退纯时间两级判定（MTT_CLASSIC_LEAK=1） */
     _Atomic time_t      startup_until;              /* 启动阶段结束时间：此时刻之前不追踪 */
     _Atomic size_t      temp_alloc_count;           /* 临时分配计数（短生命周期） */
     _Atomic size_t      expired_alloc_count;        /* 过期但未释放的分配计数 */
@@ -367,6 +381,32 @@ static inline time_t mtt_now_sec(void)
     return time(NULL);
 }
 
+#ifndef CLOCK_MONOTONIC_COARSE
+#define CLOCK_MONOTONIC_COARSE 6
+#endif
+
+/**
+ * 获取单调时钟毫秒数（CLOCK_MONOTONIC_COARSE，VDSO 无 syscall）。
+ *
+ * 用于分配老化判定（is_expired / temp-alloc / late-free）：
+ * 单调时钟不受 NTP 校时跳变影响 — BMC 启动后首次 NTP 同步可能
+ * 把墙钟回拨/前跳，若用墙钟差值算 age 会出现"年轻分配瞬间变老"
+ * （伪泄漏）或"老分配变年轻"（漏报）。墙钟时间戳(timestamp/first_seen/
+ * last_seen)仅用于展示，判定一律用本函数的差值。
+ *
+ * 失败回退 CLOCK_MONOTONIC；两者皆失败返回 0（Linux 上不会发生）。
+ */
+static inline uint64_t mtt_now_mono_ms(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC_COARSE, &ts) == 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (uint64_t)ts.tv_sec * UINT64_C(1000)
+             + (uint64_t)(ts.tv_nsec / 1000000);
+    }
+    return 0;
+}
+
 /* ======================================================================== *
  *                  共享函数声明（跨模块调用）                                  *
  * ======================================================================== */
@@ -458,6 +498,7 @@ extern _Atomic int mtt_debug_level;
 /* reporter.c */
 void mtt_reporter_start(void);
 void mtt_heartbeat_write(void);   /* 60s 资源监控写独立文件 */
+void mtt_late_free_note(uint64_t stack_hash);  /* free hook 记录老化释放站点 hash（reporter.c 实现） */
 
 /* stack_cache.c */
 uint64_t mtt_stack_hash_compute(void **frames, int frame_count);

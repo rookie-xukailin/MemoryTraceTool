@@ -24,7 +24,9 @@ typedef struct mtt_leak_site {
     size_t    per_leak_size;   /* 单次泄漏大小（字节） */
     size_t    total_size;      /* 累计泄漏大小（count × per_leak_size） */
     size_t    diff_size;       /* 与上次扫描的总大小差值（借鉴 jemalloc --base） */
-    int       is_expired;      /* 是否存活超过阈值（1=probable leak, 0=possible leak） */
+    int       is_expired;      /* 是否存活超过阈值（1=老化；兼容字段，语义=aged） */
+    int       conf;            /* 四级分类 MTT_CONF_*（probable/session_scoped/long_lived/possible） */
+    uint32_t  late_free_count; /* 该站点历史上观察到的老化释放次数（周期作用域证据） */
     struct mtt_leak_site *next; /* 哈希碰撞链表 */
 } mtt_leak_site_t;
 
@@ -64,6 +66,10 @@ typedef struct {
     size_t           *prev_diff_sizes;           /* 上次站点 total_size 数组 */
     size_t            prev_diff_count;           /* 上次站点数量 */
     time_t            prev_scan_time;            /* 上次扫描时间 */
+
+    /* 扫描历史归档（JSONL 追加写，压测后可回溯每轮扫描） */
+    char              archive_path[768];         /* <log_dir>/<pid>_<name>.archive.jsonl */
+    uint64_t          scan_seq;                  /* 扫描序号（归档行首字段，fork 后重置） */
 } mtt_reporter_t;
 
 /* ---- API ---- */
@@ -105,5 +111,9 @@ void mtt_reporter_reset_for_fork(void);
  * @return 报告器全局状态指针（永不为 NULL）
  */
 mtt_reporter_t* mtt_reporter_get(void);
+
+/** 四级分类 → 短字符串（"probable"/"session_scoped"/"long_lived"/"possible"）。
+ *  reporter 文本报告与 HTTP JSON 共用，保证两处输出一致。 */
+const char* mtt_conf_str(int conf);
 
 #endif /* MTT_REPORTER_H */

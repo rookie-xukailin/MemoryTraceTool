@@ -1013,7 +1013,9 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
         }
 
         if (e == NULL) {
-            /* 所有桶都空：跳过本次记录，调用方会更新 skipped_overcap */
+            /* 所有桶都空：池子耗尽，跳过本次记录。
+             * 此处计数（此前仅在调用方漏计，导致"数据残缺但报告看似正常"） */
+            atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
             return NULL;
         }
 
@@ -1025,6 +1027,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
         e->size          = size;
         e->alloc_num     = 0;
         e->timestamp     = mtt_now_sec();
+        e->mono_ts       = mtt_now_mono_ms();
         e->next          = NULL;
         e->stack_frames  = 0;
         /* e->stack 已被上面 memset(e, 0, sizeof(*e)) 清零，无需重复 memset */
@@ -1038,7 +1041,12 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
     if (raw_malloc == NULL) return NULL;
 
     mtt_entry_t *e = (mtt_entry_t*)raw_malloc(sizeof(mtt_entry_t));
-    if (e == NULL) return NULL;
+    if (e == NULL) {
+        /* raw_malloc 失败（极端内存压力）：同样计入 skipped，保持可见性 */
+        if (s != NULL)
+            atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
+        return NULL;
+    }
 
     /* 先清零整个结构体，防止 raw_malloc 返回未初始化内存导致
      * 字段（尤其是 timestamp/first_seen）在后续快照→泄漏站点→缓存复制
@@ -1049,6 +1057,7 @@ mtt_entry_t* mtt_entry_new(void *ptr, size_t size)
     e->size          = size;
     e->alloc_num     = 0;
     e->timestamp     = mtt_now_sec();
+    e->mono_ts       = mtt_now_mono_ms();
     e->next          = NULL;
     e->stack_frames  = 0;
     /* e->stack 已被上面 memset(e, 0, sizeof(*e)) 清零，无需重复 memset */
@@ -1138,6 +1147,9 @@ static void get_process_name(char *buf, size_t size)
  */
 /* fork handler 注册已移除,改由 hooks.c fork() 拦截接管 */
 
+/* 前置声明：init 早期 sigaction 用（定义见 mtt_signal_thread_start 附近） */
+static void mtt_sigusr1_noop(int sig);
+
 void mtt_ensure_init(void)
 {
     /* 尽早读 MTT_DEBUG 并设置 mtt_debug_level,让后续阶段日志能按等级输出。
@@ -1203,6 +1215,7 @@ void mtt_ensure_init(void)
     if (want_pool_entries < MTT_POOL_ENTRIES_MIN) want_pool_entries = MTT_POOL_ENTRIES_MIN;
     if (want_pool_entries > MTT_POOL_ENTRIES_MAX) want_pool_entries = MTT_POOL_ENTRIES_MAX;
     int      want_debug    = MTT_DEBUG_DEFAULT;
+    int      want_classic_leak = 0;   /* MTT_CLASSIC_LEAK=1 → 纯时间两级判定回退 */
 
     {
         const char *env_disable = getenv("MTT_DISABLE");
@@ -1249,6 +1262,14 @@ void mtt_ensure_init(void)
             int lt = atoi(env_thresh);
             if (lt >= 0)
                 want_leak_threshold = (time_t)lt;
+        }
+
+        /* 泄漏判定回退开关（MTT_CLASSIC_LEAK=1 → 纯时间两级判定，
+         * 不做增长趋势/late-free 分类，用于新旧行为 A/B 对比） */
+        {
+            const char *env_classic = getenv("MTT_CLASSIC_LEAK");
+            if (env_classic != NULL && strcmp(env_classic, "1") == 0)
+                want_classic_leak = 1;
         }
 
         /* 跳过启动阶段（MTT_SKIP_STARTUP_SEC=N，进程启动 N 秒后再开始追踪） */
@@ -1387,6 +1408,7 @@ void mtt_ensure_init(void)
     atomic_store_explicit(&s->total_bytes,     0, memory_order_relaxed);
     atomic_store_explicit(&s->skipped_sampled, 0, memory_order_relaxed);
     atomic_store_explicit(&s->skipped_overcap, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->skipped_slots,  0, memory_order_relaxed);
     atomic_store_explicit(&s->sample_period,      want_sample, memory_order_relaxed);
     atomic_store_explicit(&s->sample_counter,     0, memory_order_relaxed);
     atomic_store_explicit(&s->sample_rate,        want_srate, memory_order_relaxed);
@@ -1395,6 +1417,7 @@ void mtt_ensure_init(void)
     atomic_store_explicit(&s->disabled,           want_disabled, memory_order_relaxed);
     atomic_store_explicit(&s->peak_updated,       0, memory_order_relaxed);
     atomic_store_explicit(&s->leak_threshold_sec, want_leak_threshold, memory_order_relaxed);
+    atomic_store_explicit(&s->classic_leak,       want_classic_leak, memory_order_relaxed);
     atomic_store_explicit(&s->temp_alloc_count,   0, memory_order_relaxed);
     atomic_store_explicit(&s->expired_alloc_count, 0, memory_order_relaxed);
     atomic_store_explicit(&s->free_expired_count,  0, memory_order_relaxed);
@@ -1469,6 +1492,31 @@ void mtt_ensure_init(void)
         }
         mtt_log_stage(17, "tracking disabled (blacklist self-match), skipping background threads");
         return;
+    }
+
+    /* SIGUSR1 全线程安全化（必须在创建任何工具线程之前）：
+     * 旧实现只在 mtt_signal_thread_start 里对当前线程屏蔽 SIGUSR1，
+     * 但 reporter/HTTP 线程先于该屏蔽被创建、不屏蔽该信号 —— 进程定向
+     * kill -USR1 被投递到这些线程时执行默认动作（终止进程），
+     * "即时报告"特性带致命竞态。
+     *
+     * 修复分两层：
+     *   1) 空 handler 兜底 —— init 之前就已存在的业务线程永远无法被我们
+     *      屏蔽，信号投递到它们时降级为无害 no-op（信号线程错过本次触发）；
+     *   2) 在本线程（触发 init 的业务线程）屏蔽 SIGUSR1 —— 之后创建的所有
+     *      线程（reporter/HTTP/signal 及本线程派生的业务线程）继承屏蔽
+     *      掩码，进程定向信号只能被 signal 线程的 sigtimedwait 消费。 */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = mtt_sigusr1_noop;
+        sa.sa_flags = SA_RESTART;
+        sigaction(MTT_SIGNAL_REPORT, &sa, NULL);
+
+        sigset_t block_set;
+        sigemptyset(&block_set);
+        sigaddset(&block_set, MTT_SIGNAL_REPORT);
+        pthread_sigmask(SIG_BLOCK, &block_set, NULL);
     }
 
     /* 启动周期报告线程（锁外，避免 pthread_create 内部 malloc → 递归） */
@@ -1605,6 +1653,7 @@ void mtt_fork_child(void)
     atomic_store(&s->sample_bytes_accum, 0);
     atomic_store(&s->skipped_sampled, 0);
     atomic_store(&s->skipped_overcap, 0);
+    atomic_store(&s->skipped_slots, 0);
     atomic_store(&s->pool_used, 0);
     atomic_store(&s->peak_updated, 0);
     atomic_store(&s->peak_bytes, 0);
@@ -1649,6 +1698,14 @@ void mtt_fork_child(void)
 
 /** 信号线程运行标志（非 static，atexit 处理器需要停止它） */
 _Atomic int g_signal_thread_running = 0;
+
+/** SIGUSR1 空 handler：init 前已存在且未屏蔽该信号的线程收到
+ *  进程定向信号时，降级为无害 no-op（而非默认动作终止进程）。
+ *  真正的触发由 signal 线程的 sigtimedwait 完成（见 mtt_signal_thread_start）。 */
+static void mtt_sigusr1_noop(int sig)
+{
+    (void)sig;
+}
 
 /** 信号处理线程主函数。使用 sigtimedwait() 每秒超时检查 running 标志。 */
 static void* mtt_signal_thread_fn(void *arg)
@@ -1776,15 +1833,24 @@ void* mtt_malloc(size_t size)
     atomic_fetch_add_explicit(&s->total_bytes,   size, memory_order_relaxed);
 
     /* CAS 更新峰值 */
-    size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
-    size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
-    while (cur > old_peak) {
-        if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
-                memory_order_relaxed, memory_order_relaxed))
-            break;
+    {
+        int peak_changed = 0;
+        size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
+        size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
+        while (cur > old_peak) {
+            if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                peak_changed = 1;
+                break;
+            }
+        }
+        /* 通知 reporter 线程：峰值已更新（借鉴 jemalloc prof_gdump）。
+         * 必须以 peak_changed 为条件 —— 此前为无条件置位，API 路径下
+         * 每次 mtt_malloc 都会把 reporter 的 60s 等待打断成秒级扫描
+         * （hooks.c 路径一直有此守卫，两处行为现已对齐）。 */
+        if (peak_changed)
+            atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
     }
-    /* 通知 reporter 线程：峰值已更新（借鉴 jemalloc prof_gdump） */
-    atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
 
     mtt_entry_add(s, e);
     mtt_stripe_unlock(s, ptr);
@@ -1825,6 +1891,18 @@ void mtt_free(void *ptr)
         else
             atomic_store_explicit(&s->current_bytes, 0, memory_order_relaxed);
         atomic_fetch_add_explicit(&s->free_count, 1, memory_order_relaxed);
+        /* 与 hooks.c free 路径对齐：临时分配统计 + 老化释放证据上报。
+         * 老化判定用单调时钟差值（免疫 NTP 跳变），栈 hash 仅在超阈值时计算。 */
+        {
+            uint64_t age_ms = mtt_now_mono_ms() - e->mono_ts;
+            if (age_ms <= 1000)
+                atomic_fetch_add_explicit(&s->temp_alloc_count, 1, memory_order_relaxed);
+            time_t threshold = atomic_load_explicit(&s->leak_threshold_sec, memory_order_relaxed);
+            if (threshold > 0 && age_ms > (uint64_t)threshold * 1000) {
+                atomic_fetch_add_explicit(&s->free_expired_count, 1, memory_order_relaxed);
+                mtt_late_free_note(mtt_stack_hash_compute(e->stack, e->stack_frames));
+            }
+        }
         mtt_entry_remove(s, ptr);
     }
     mtt_stripe_unlock(s, ptr);
@@ -1918,14 +1996,20 @@ void* mtt_realloc(void *ptr, size_t size)
                         atomic_fetch_add_explicit(&s->current_bytes, size, memory_order_relaxed);
                         atomic_fetch_add_explicit(&s->total_bytes, size, memory_order_relaxed);
 
-                        size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
-                        size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
-                        while (cur > old_peak) {
-                            if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
-                                    memory_order_relaxed, memory_order_relaxed))
-                                break;
+                        {
+                            int peak_changed = 0;
+                            size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
+                            size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
+                            while (cur > old_peak) {
+                                if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
+                                        memory_order_relaxed, memory_order_relaxed)) {
+                                    peak_changed = 1;
+                                    break;
+                                }
+                            }
+                            if (peak_changed)
+                                atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
                         }
-                        atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
                         mtt_entry_add(s, new_e);
                     } else {
                         atomic_fetch_add_explicit(&s->skipped_overcap, 1, memory_order_relaxed);
@@ -1984,14 +2068,20 @@ void* mtt_realloc(void *ptr, size_t size)
     atomic_fetch_add_explicit(&s->current_bytes, size, memory_order_relaxed);
     atomic_fetch_add_explicit(&s->total_bytes,   size, memory_order_relaxed);
 
-    size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
-    size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
-    while (cur > old_peak) {
-        if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
-                memory_order_relaxed, memory_order_relaxed))
-            break;
+    {
+        int peak_changed = 0;
+        size_t cur = atomic_load_explicit(&s->current_bytes, memory_order_relaxed);
+        size_t old_peak = atomic_load_explicit(&s->peak_bytes, memory_order_relaxed);
+        while (cur > old_peak) {
+            if (atomic_compare_exchange_weak_explicit(&s->peak_bytes, &old_peak, cur,
+                    memory_order_relaxed, memory_order_relaxed)) {
+                peak_changed = 1;
+                break;
+            }
+        }
+        if (peak_changed)
+            atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
     }
-    atomic_store_explicit(&s->peak_updated, 1, memory_order_relaxed);
 
     mtt_entry_add(s, new_e);
     mtt_stripe_unlock(s, new_ptr);
