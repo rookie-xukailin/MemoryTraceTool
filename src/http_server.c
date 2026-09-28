@@ -76,6 +76,18 @@ static const char g_dashboard_html[] =
 ".unit-toggle .unit-btn:last-child{border-right:none}\n"
 ".unit-toggle .unit-btn.active{background:var(--accent);color:#fff}\n"
 ".stop-btn{font-size:.75rem;padding:4px 10px;border:1px solid var(--warn);border-radius:4px;background:var(--bg2);color:var(--warn);cursor:pointer}\n"
+".lg-bar{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}\n"
+".lg-btn{font-size:.72rem;padding:3px 10px;border:1px solid var(--border);border-radius:10px;background:var(--bg2);color:var(--text);cursor:pointer}\n"
+".lg-btn.on{color:var(--text);font-weight:600;box-shadow:inset 0 -2px 0 var(--lgc,var(--accent))}\n"
+"th.sorth{cursor:pointer;user-select:none;white-space:nowrap}\n"
+"th.sorth:hover{color:var(--accent)}\n"
+".cf{font-size:.72rem;padding:1px 8px;border-radius:8px;border:1px solid var(--border);white-space:nowrap}\n"
+".cf-probable{color:var(--warn);border-color:var(--warn)}\n"
+".cf-possible{color:var(--orange);border-color:var(--orange)}\n"
+".cf-session_scoped{color:var(--green);border-color:var(--green)}\n"
+".cf-long_lived{color:#6e7681}\n"
+".fil-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px;font-size:.75rem;color:#6e7681}\n"
+".chart-hint{margin-top:6px;font-size:.72rem;color:#6e7681}\n"
 "</style>\n"
 "</head>\n"
 "<body>\n"
@@ -84,14 +96,29 @@ static const char g_dashboard_html[] =
 "<div class=\"subtitle\" id=\"info\">加载中...</div>\n"
 "<div class=\"card\">\n"
 "  <h2>堆内存趋势 <span class=\"unit-toggle\" id=\"unitToggle\"><button class=\"unit-btn\" data-unit=\"kb\">KB</button><button class=\"unit-btn\" data-unit=\"mb\">MB</button></span><span class=\"refresh\" id=\"refreshLabel\">每 5 秒刷新</span></h2>\n"
+"  <div class=\"lg-bar\" id=\"legend\"></div>\n"
 "  <div class=\"stats\" id=\"stats\"></div>\n"
-"  <canvas id=\"chart\" width=\"800\" height=\"400\"></canvas>\n"
+"  <canvas id=\"chart\" width=\"800\" height=\"400\" style=\"cursor:default\"></canvas>\n"
+"  <div class=\"chart-hint\">滚轮缩放（以光标为中心）· 按住拖拽平移 · 双击复位 <button class=\"toggle-btn\" id=\"resetViewBtn\" style=\"margin-left:8px\">复位视图</button></div>\n"
 "  <div class=\"tooltip\" id=\"tip\"></div>\n"
 "</div>\n"
 "<div class=\"card\">\n"
-"  <h2>泄漏站点排行（按泄漏次数降序）</h2>\n"
+"  <h2>泄漏站点排行（点击列头排序）</h2>\n"
+"  <div class=\"fil-bar\" id=\"leakFilters\">\n"
+"    <span>最后发现：</span>\n"
+"    <button class=\"toggle-btn\" data-ls=\"0\">全部</button>\n"
+"    <button class=\"toggle-btn\" data-ls=\"300\">5分钟内</button>\n"
+"    <button class=\"toggle-btn\" data-ls=\"900\">15分钟内</button>\n"
+"    <button class=\"toggle-btn\" data-ls=\"3600\">1小时内</button>\n"
+"    <span style=\"margin-left:12px\">分类：</span>\n"
+"    <button class=\"toggle-btn\" data-cf=\"all\">全部</button>\n"
+"    <button class=\"toggle-btn\" data-cf=\"suspect\">疑似泄漏</button>\n"
+"    <button class=\"toggle-btn\" data-cf=\"session\">周期作用域</button>\n"
+"    <button class=\"toggle-btn\" data-cf=\"long\">长存活</button>\n"
+"    <button class=\"toggle-btn\" data-gr=\"1\">仅看增长</button>\n"
+"  </div>\n"
 "  <table>\n"
-"    <thead><tr><th>#</th><th>次数</th><th>单次</th><th>总占用</th><th>置信度</th><th>首次</th><th>最后</th></tr></thead>\n"
+"    <thead><tr><th>#</th><th class=\"sorth\" onclick=\"sortBy('count')\">次数 <span id=\"si-count\"></span></th><th class=\"sorth\" onclick=\"sortBy('per_leak_size')\">单次 <span id=\"si-per_leak_size\"></span></th><th class=\"sorth\" onclick=\"sortBy('total_size')\">总占用 <span id=\"si-total_size\"></span></th><th class=\"sorth\" onclick=\"sortBy('diff_size')\">增长 <span id=\"si-diff_size\"></span></th><th class=\"sorth\" onclick=\"sortBy('conf')\">置信度 <span id=\"si-conf\"></span></th><th class=\"sorth\" onclick=\"sortBy('first_seen')\">首次 <span id=\"si-first_seen\"></span></th><th class=\"sorth\" onclick=\"sortBy('last_seen')\">最后 <span id=\"si-last_seen\"></span></th></tr></thead>\n"
 "    <tbody id=\"leaks-tbody\"></tbody>\n"
 "  </table>\n"
 "  <div style=\"margin-top:12px;text-align:center;font-size:.85rem;color:#6e7681\">\n"
@@ -104,7 +131,16 @@ static const char g_dashboard_html[] =
 "<script>\n"
 "var data=null,chartCanvas=document.getElementById('chart'),ctx=chartCanvas.getContext('2d'),tip=document.getElementById('tip');\n"
 "var expandedHashes=new Set(); /* 记录展开的泄漏站点 hash，刷新后恢复 */\n"
-"var curPage=1, PAGE_SIZE=50, allLeaks=[];\n"
+"var curPage=1, PAGE_SIZE=50, allLeaks=[], viewLeaksArr=[];\n"
+"/* ---- 时间轴视窗（平移/缩放）与多曲线 ---- */\n"
+"var PAD={top:28,right:28,bottom:48,left:64};\n"
+"var view={t0:0,t1:0,follow:true}; /* follow=true 自动跟随最新（全量视图） */\n"
+"var SERIES=[\n"
+" {k:'talloc',c:'#22c55e',n:'累计分配',on:1},\n"
+" {k:'cur',c:'#58a6ff',n:'当前未释放',on:1},\n"
+" {k:'peak',c:'#d29922',n:'历史峰值',on:1},\n"
+" {k:'rss',c:'#bc8cff',n:'RSS',on:0},\n"
+" {k:'leak',c:'#f85149',n:'已识别泄漏',on:0}];\n"
 "function fb(b){if(b==null)return'0 B';if(b>=1048576)return(b/1048576).toFixed(2)+' MB';if(b>=1024)return(b/1024).toFixed(2)+' KB';return b+' B'}\n"
 "/* 千分位格式化:不用 toLocaleString()(旧版浏览器/嵌入式 webview 会输出\n    带 7 位小数的 0.0000000,导致 Y 轴刻度异常),自实现兼容 */\n"
 "function fmtInt(n){n=Math.round(n);var s=String(n);return s.replace(/\\B(?=(\\d{3})+(?!\\d))/g,',')}\n"
@@ -112,19 +148,45 @@ static const char g_dashboard_html[] =
 "function fy(b){if(b==null||b<0)b=0;if(yUnit==='mb')return b>=1048576?(b/1048576).toFixed(2)+' MB':(b/1024).toFixed(1)+' KB';return b>=1024?fmtInt(b/1024)+' KB':fmtInt(b)+' B'}\n"
 "(function(){var t=document.getElementById('unitToggle');if(!t)return;var btns=t.querySelectorAll('.unit-btn');btns.forEach(function(b){if(b.dataset.unit===yUnit)b.classList.add('active');b.onclick=function(){yUnit=b.dataset.unit;try{localStorage.setItem('mtt_yunit',yUnit)}catch(e){}btns.forEach(function(x){x.classList.toggle('active',x.dataset.unit===yUnit)});draw()}})})();\n"
 "function ft(t){if(!t||t<=0)return'N/A';return new Date(t*1000).toLocaleTimeString()}\n"
+"/* 图例：点击开关曲线（状态仅存内存，刷新页面恢复默认） */\n"
+"function buildLegend(){\n"
+"  var lg=document.getElementById('legend');if(!lg)return;var h='',i;\n"
+"  for(i=0;i<SERIES.length;i++){var sr=SERIES[i];h+='<button class=\"lg-btn'+(sr.on?' on':'')+'\" data-i=\"'+i+'\" style=\"--lgc:'+sr.c+'\">'+sr.n+'</button>';}\n"
+"  lg.innerHTML=h;\n"
+"  var btns=lg.querySelectorAll('.lg-btn');\n"
+"  for(i=0;i<btns.length;i++){(function(b){b.onclick=function(){var k=+b.getAttribute('data-i');SERIES[k].on=SERIES[k].on?0:1;buildLegend();draw();};})(btns[i]);}\n"
+"}\n"
+"/* 视窗夹紧：下限 60s 跨度，不超出数据时间范围（右端尽量吸住最新点） */\n"
+"function clampView(ts){\n"
+"  var lo=ts[0].ts,hi=ts[ts.length-1].ts;\n"
+"  if(view.t1-view.t0<60){view.t0=hi-60;view.t1=hi;}\n"
+"  if(view.t0<lo){view.t1=Math.min(hi,view.t1+(lo-view.t0));view.t0=lo;}\n"
+"  if(view.t1>hi){view.t0=Math.max(lo,view.t0-(view.t1-hi));view.t1=hi;}\n"
+"}\n"
+"function visSlice(ts){\n"
+"  var a=[],i;\n"
+"  if(view.t0>=view.t1){view.t0=ts[0].ts;view.t1=ts[ts.length-1].ts;}\n"
+"  for(i=0;i<ts.length;i++){if(ts[i].ts>=view.t0&&ts[i].ts<=view.t1)a.push(ts[i]);}\n"
+"  if(a.length===0)a=[ts[0],ts[ts.length-1]];\n"
+"  return a;\n"
+"}\n"
 "function draw(){\n"
 "  if(!data||!data.time_series||data.time_series.length===0)return;\n"
-"  var ts=data.time_series,W=chartCanvas.width,H=chartCanvas.height;\n"
+"  var ts=data.time_series;\n"
+"  if(view.follow){view.t0=ts[0].ts;view.t1=ts[ts.length-1].ts;}\n"
+"  clampView(ts);\n"
+"  var vis=visSlice(ts);\n"
+"  var W=chartCanvas.width,H=chartCanvas.height;\n"
 "  ctx.clearRect(0,0,W,H);\n"
-"  var pad={top:28,right:28,bottom:48,left:64};\n"
-"  var pw=W-pad.left-pad.right,ph=H-pad.top-pad.bottom;\n"
-"  /* Y 轴范围:只用 total_alloc(单调累计,其他线不再画)(留 20% 顶部) */\n"
-"  var curMax=1;\n"
-"  for(var i=0;i<ts.length;i++){if(ts[i].talloc!=null&&ts[i].talloc>curMax)curMax=ts[i].talloc;}\n"
+"  var pw=W-PAD.left-PAD.right,ph=H-PAD.top-PAD.bottom;\n"
+"  var span=view.t1-view.t0;if(span<1)span=1;\n"
+"  function x(t){return PAD.left+((t-view.t0)/span)*pw}\n"
+"  /* Y 轴范围:可见切片内所有启用曲线的最大值(留 20% 顶部) */\n"
+"  var curMax=1,si,i;\n"
+"  for(si=0;si<SERIES.length;si++){if(!SERIES[si].on)continue;for(i=0;i<vis.length;i++){var vv=vis[i][SERIES[si].k];if(vv!=null&&vv>curMax)curMax=vv;}}\n"
 "  var maxB=curMax*1.2;\n"
 "  if(maxB<1024)maxB=1024;  /* 下限 1KB:避免全 0 时出现 0.x 小数刻度 */\n"
-"  function x(i){return pad.left+(i/Math.max(1,ts.length-1))*pw}\n"
-"  function y(v){return pad.top+ph-(v/maxB)*ph}\n"
+"  function y(v){return PAD.top+ph-(v/maxB)*ph}\n"
 "  var txtColor=getComputedStyle(document.documentElement).getPropertyValue('--text').trim();\n"
 "  var borderColor=getComputedStyle(document.documentElement).getPropertyValue('--border').trim();\n"
 "  /* 整齐刻度步长:取 1/2/5×10^n 中最接近 maxB/4 的值,避免小数刻度 */\n"
@@ -134,32 +196,67 @@ static const char g_dashboard_html[] =
 "  if(rawStep/step>=5)step*=5;else if(rawStep/step>=2)step*=2;\n"
 "  /* grid: 极浅,不抢戏 */\n"
 "  ctx.strokeStyle=borderColor;ctx.globalAlpha=0.35;ctx.lineWidth=1;\n"
-"  for(var v=0;v<=maxB;v+=step){var yy=y(v);ctx.beginPath();ctx.moveTo(pad.left,yy);ctx.lineTo(W-pad.right,yy);ctx.stroke()}\n"
+"  for(var v=0;v<=maxB;v+=step){var yy=y(v);ctx.beginPath();ctx.moveTo(PAD.left,yy);ctx.lineTo(W-PAD.right,yy);ctx.stroke()}\n"
 "  ctx.globalAlpha=1;\n"
 "  /* Y labels: 按 yUnit(KB/MB)切换 */\n"
 "  ctx.fillStyle=txtColor;ctx.globalAlpha=0.65;ctx.font='10px -apple-system,BlinkMacSystemFont,sans-serif';ctx.textAlign='right';\n"
-"  for(var v=0;v<=maxB;v+=step){var yy=y(v);ctx.fillText(fy(v),pad.left-8,yy+3)}\n"
+"  for(var v2=0;v2<=maxB;v2+=step){var yy2=y(v2);ctx.fillText(fy(v2),PAD.left-8,yy2+3)}\n"
 "  ctx.globalAlpha=1;\n"
-"  /* total_alloc line: 累计堆申请字节(monotonic,唯一一条线) */\n"
-"  ctx.beginPath();\n"
-"  if(ts.length>0&&ts[0].talloc!=null){\n"
-"    ctx.moveTo(x(0),y(ts[0].talloc));\n"
-"    for(var i=1;i<ts.length;i++){if(ts[i].talloc==null)continue;var mx=(x(i-1)+x(i))/2,my=(y(ts[i-1].talloc)+y(ts[i].talloc))/2;ctx.quadraticCurveTo(x(i-1),y(ts[i-1].talloc),mx,my)}\n"
-"    ctx.lineTo(x(ts.length-1),y(ts[ts.length-1].talloc));\n"
-"    ctx.strokeStyle='#22c55e';ctx.lineWidth=2;ctx.lineJoin='round';ctx.lineCap='round';ctx.stroke();\n"
+"  /* 多曲线:cur/peak/rss/leak/talloc,按可见切片绘制 */\n"
+"  for(si=0;si<SERIES.length;si++){\n"
+"    if(!SERIES[si].on)continue;\n"
+"    ctx.beginPath();var started=false;\n"
+"    for(i=0;i<vis.length;i++){var val=vis[i][SERIES[si].k];if(val==null)continue;var xx=x(vis[i].ts),yyy=y(val);if(!started){ctx.moveTo(xx,yyy);started=true;}else ctx.lineTo(xx,yyy);}\n"
+"    if(started){ctx.strokeStyle=SERIES[si].c;ctx.lineWidth=1.6;ctx.lineJoin='round';ctx.lineCap='round';ctx.stroke();}\n"
 "  }\n"
-"  /* legend: 绿色圆点 + total_alloc */\n"
-"  ctx.font='11px -apple-system,BlinkMacSystemFont,sans-serif';ctx.textAlign='left';\n"
-"  ctx.fillStyle='#22c55e';ctx.beginPath();ctx.arc(pad.left+8,16,3.5,0,2*Math.PI);ctx.fill();\n"
-"  ctx.fillStyle=txtColor;ctx.fillText('total_alloc',pad.left+16,20);\n"
-"  /* X labels */\n"
-"  var steps=Math.min(8,ts.length);\n"
+"  /* X labels: 按视窗时间均匀取 8 个刻度 */\n"
+"  var steps=Math.min(8,Math.max(2,Math.round(span/60)+1));\n"
 "  ctx.fillStyle=txtColor;ctx.globalAlpha=0.65;ctx.font='10px -apple-system,BlinkMacSystemFont,sans-serif';ctx.textAlign='center';\n"
-"  for(var i=0;i<=steps;i++){var idx=Math.floor((ts.length-1)*i/steps);if(idx>=ts.length)idx=ts.length-1;var xx=x(idx);ctx.fillText(ft(ts[idx].ts),xx,H-pad.bottom+18)}\n"
+"  for(i=0;i<=steps;i++){var tt=view.t0+span*i/steps;ctx.fillText(ft(tt),x(tt),H-PAD.bottom+18)}\n"
 "  ctx.globalAlpha=1;\n"
-"  /* hover */\n"
-"  chartCanvas.onmousemove=function(e){var r=chartCanvas.getBoundingClientRect();var sx=chartCanvas.width/r.width;var mx=(e.clientX-r.left)*sx;for(var i=0;i<ts.length;i++){if(Math.abs(mx-x(i))<5){var pt=ts[i];tip.style.display='block';tip.style.left=(e.clientX+15)+'px';tip.style.top=(e.clientY-30)+'px';tip.textContent=ft(pt.ts)+' | total_alloc:'+fb(pt.talloc!=null?pt.talloc:0);return}}tip.style.display='none'}\n"
+"  /* hover: 可见切片内最近点,提示所有启用曲线的值 */\n"
+"  chartCanvas.onmousemove=function(e){\n"
+"    var r=chartCanvas.getBoundingClientRect();var sx=chartCanvas.width/r.width;var mx=(e.clientX-r.left)*sx;\n"
+"    var best=null,bestD=1e9;\n"
+"    for(var i2=0;i2<vis.length;i2++){var d=Math.abs(x(vis[i2].ts)-mx);if(d<bestD){bestD=d;best=vis[i2];}}\n"
+"    if(best&&bestD<8){\n"
+"      var parts=[ft(best.ts)];\n"
+"      for(var s2=0;s2<SERIES.length;s2++){if(!SERIES[s2].on)continue;var pv=best[SERIES[s2].k];parts.push(SERIES[s2].n+':'+fb(pv!=null?pv:0));}\n"
+"      tip.style.display='block';tip.style.left=(e.clientX+15)+'px';tip.style.top=(e.clientY-30)+'px';tip.textContent=parts.join(' | ');return;\n"
+"    }\n"
+"    tip.style.display='none';\n"
+"  };\n"
 "}\n"
+"/* ---- 平移/缩放交互（一次性绑定） ---- */\n"
+"(function(){\n"
+"  function evX(e){var r=chartCanvas.getBoundingClientRect();var sx=chartCanvas.width/r.width;return (e.clientX-r.left)*sx;}\n"
+"  function evT(ex){var pw=chartCanvas.width-PAD.left-PAD.right;if(pw<=0)return view.t0;var f=(ex-PAD.left)/pw;if(f<0)f=0;if(f>1)f=1;return view.t0+f*(view.t1-view.t0);}\n"
+"  chartCanvas.addEventListener('wheel',function(e){\n"
+"    e.preventDefault();\n"
+"    if(!data||!data.time_series||data.time_series.length<2)return;\n"
+"    var ts=data.time_series;\n"
+"    var t=evT(evX(e));\n"
+"    var f=(e.deltaY>0)?1.25:0.8; /* 滚轮下=放大区间(缩小视图),上=缩小区间(放大视图) */\n"
+"    var nt0=t-(t-view.t0)*f,nt1=t+(view.t1-t)*f;\n"
+"    var full=ts[ts.length-1].ts-ts[0].ts;\n"
+"    if(nt1-nt0>=full){nt0=ts[0].ts;nt1=ts[ts.length-1].ts;}\n"
+"    if(nt1-nt0<60){var m=(nt0+nt1)/2;nt0=m-30;nt1=m+30;}\n"
+"    view.t0=nt0;view.t1=nt1;\n"
+"    view.follow=(nt0<=ts[0].ts+1&&nt1>=ts[ts.length-1].ts-1);\n"
+"    draw();\n"
+"  },{passive:false});\n"
+"  var dragging=false,startX=0,st0=0,st1=0;\n"
+"  chartCanvas.addEventListener('mousedown',function(e){dragging=true;startX=evX(e);st0=view.t0;st1=view.t1;chartCanvas.style.cursor='grabbing';e.preventDefault();});\n"
+"  window.addEventListener('mousemove',function(e){\n"
+"    if(!dragging)return;\n"
+"    var ex=evX(e);var pw=chartCanvas.width-PAD.left-PAD.right;if(pw<=0)return;\n"
+"    var span2=st1-st0;var dt=-(ex-startX)/pw*span2;\n"
+"    view.t0=st0+dt;view.t1=st1+dt;view.follow=false;draw();\n"
+"  });\n"
+"  window.addEventListener('mouseup',function(){if(dragging){dragging=false;chartCanvas.style.cursor='default';}});\n"
+"  chartCanvas.addEventListener('dblclick',function(){view.follow=true;draw();});\n"
+"  var rb=document.getElementById('resetViewBtn');if(rb)rb.onclick=function(){view.follow=true;draw();};\n"
+"})();\n"
 "function renderStats(st){\n"
 "  var s=st||{};\n"
 "  var p=(window.__lastData&&window.__lastData.pool)||{};\n"
@@ -180,34 +277,114 @@ static const char g_dashboard_html[] =
 "  } else {\n"
 "    poolHtml='<div class=\"val\">-</div><div class=\"lbl\">工具内存池</div>';\n"
 "  }\n"
+"  var skOvc=s.skipped_overcap||0,skSlot=s.skipped_slots||0;\n"
+"  var warnHtml='';\n"
+"  if(skOvc>0||skSlot>0){\n"
+"    warnHtml='<div class=\"stat\" style=\"border-color:var(--warn)\"><div class=\"val\" style=\"color:var(--warn)\">'+fmtInt(skOvc+skSlot)+'</div><div class=\"lbl\">数据不完整 — 池耗尽:'+fmtInt(skOvc)+' 线程槽满:'+fmtInt(skSlot)+'</div></div>';\n"
+"  }\n"
 "  document.getElementById('stats').innerHTML=\n"
 "    '<div class=\"stat\"><div class=\"val\">'+fb(s.current_bytes||0)+'</div><div class=\"lbl\">当前未释放</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+fb(s.peak_bytes||0)+'</div><div class=\"lbl\">历史峰值</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+(s.alloc_count||0).toLocaleString()+'</div><div class=\"lbl\">累计分配</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+(s.free_count||0).toLocaleString()+'</div><div class=\"lbl\">累计释放</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+(s.leak_count||0).toLocaleString()+'</div><div class=\"lbl\">疑似泄漏</div></div>'+\n"
+"    '<div class=\"stat\"><div class=\"val\">'+fmtInt(s.late_free||0)+'</div><div class=\"lbl\">老化释放(周期证据)</div></div>'+\n"
 "    '<div class=\"stat\"><div class=\"val\">'+fb(s.total_allocated||0)+'</div><div class=\"lbl\">累计分配总量</div></div>'+\n"
-"    '<div class=\"stat\">'+poolHtml+'</div>';\n"
+"    '<div class=\"stat\">'+poolHtml+'</div>'+\n"
+"    warnHtml;\n"
 "}\n"
 "function alCmd(frame){var m=frame.match(/\\((.+)\\+(0x[0-9a-fA-F]+)\\)$/);if(m)return'addr2line -e '+m[1]+' -f -C '+m[2];return''}\n"
+"/* ---- 泄漏表排序/筛选（状态跨刷新保持） ---- */\n"
+"var sortKey='',sortDir=-1,filtLS=0,filtConf='all',filtGrow=false;\n"
+"(function(){try{\n"
+"  var v=localStorage.getItem('mtt_sort');if(v)sortKey=v;\n"
+"  var d=localStorage.getItem('mtt_sortdir');if(d==='1'||d==='-1')sortDir=parseInt(d,10);\n"
+"  var f=localStorage.getItem('mtt_filt');\n"
+"  if(f){var o=JSON.parse(f);filtLS=o.ls||0;filtConf=o.cf||'all';filtGrow=!!o.gr;}\n"
+"}catch(e){}})();\n"
+"function saveViewPref(){try{\n"
+"  localStorage.setItem('mtt_sort',sortKey);\n"
+"  localStorage.setItem('mtt_sortdir',String(sortDir));\n"
+"  localStorage.setItem('mtt_filt',JSON.stringify({ls:filtLS,cf:filtConf,gr:filtGrow}));\n"
+"}catch(e){}}\n"
+"function confOf(l){return l.conf||(l.is_expired?'probable':'possible');}\n"
+"function confLabel(c){return c==='probable'?'probable leak':c==='session_scoped'?'session-scoped':c==='long_lived'?'long-lived':'possible leak';}\n"
+"function viewLeaks(){\n"
+"  var now=Math.floor(Date.now()/1000),arr=[],i;\n"
+"  for(i=0;i<allLeaks.length;i++){\n"
+"    var l=allLeaks[i],c=confOf(l);\n"
+"    if(filtLS>0&&l.last_seen&&now-l.last_seen>filtLS)continue;\n"
+"    if(filtConf==='suspect'&&c!=='probable'&&c!=='possible')continue;\n"
+"    if(filtConf==='session'&&c!=='session_scoped')continue;\n"
+"    if(filtConf==='long'&&c!=='long_lived')continue;\n"
+"    if(filtGrow&&!(l.diff_size>0))continue;\n"
+"    arr.push(l);\n"
+"  }\n"
+"  if(sortKey){\n"
+"    var key=sortKey;\n"
+"    arr.sort(function(a,b){\n"
+"      var va,vb;\n"
+"      if(key==='conf'){va=confOf(a);vb=confOf(b);}\n"
+"      else{va=a[key]||0;vb=b[key]||0;}\n"
+"      if(va<vb)return -sortDir;\n"
+"      if(va>vb)return sortDir;\n"
+"      return 0;\n"
+"    });\n"
+"  }\n"
+"  return arr;\n"
+"}\n"
+"function sortBy(k){\n"
+"  if(sortKey===k)sortDir=-sortDir;\n"
+"  else{sortKey=k;sortDir=-1;}\n"
+"  saveViewPref();updateSortInd();curPage=1;renderLeaks(allLeaks);\n"
+"}\n"
+"function updateSortInd(){\n"
+"  var ks=['count','per_leak_size','total_size','diff_size','conf','first_seen','last_seen'],i;\n"
+"  for(i=0;i<ks.length;i++){\n"
+"    var el=document.getElementById('si-'+ks[i]);\n"
+"    if(el)el.textContent=(sortKey===ks[i])?(sortDir<0?'\\u25BC':'\\u25B2'):'';\n"
+"  }\n"
+"}\n"
+"/* 筛选条交互 */\n"
+"(function(){\n"
+"  var bar=document.getElementById('leakFilters');if(!bar)return;\n"
+"  var lsB=bar.querySelectorAll('[data-ls]'),cfB=bar.querySelectorAll('[data-cf]'),grB=bar.querySelector('[data-gr]');\n"
+"  function paint(){\n"
+"    var i;\n"
+"    for(i=0;i<lsB.length;i++){lsB[i].classList.toggle('active',parseInt(lsB[i].getAttribute('data-ls'),10)===filtLS);}\n"
+"    for(i=0;i<cfB.length;i++){cfB[i].classList.toggle('active',cfB[i].getAttribute('data-cf')===filtConf);}\n"
+"    if(grB)grB.classList.toggle('active',filtGrow);\n"
+"  }\n"
+"  function apply(){paint();saveViewPref();curPage=1;renderLeaks(allLeaks);}\n"
+"  var i;\n"
+"  for(i=0;i<lsB.length;i++){(function(b){b.onclick=function(){filtLS=parseInt(b.getAttribute('data-ls'),10);apply();};})(lsB[i]);}\n"
+"  for(i=0;i<cfB.length;i++){(function(b){b.onclick=function(){filtConf=b.getAttribute('data-cf');apply();};})(cfB[i]);}\n"
+"  if(grB)grB.onclick=function(){filtGrow=!filtGrow;apply();};\n"
+"  paint();\n"
+"})();\n"
 "function renderLeaks(leaks){\n"
 "  allLeaks=leaks||[];\n"
-"  var total=Math.ceil(allLeaks.length/PAGE_SIZE)||1;\n"
+"  viewLeaksArr=viewLeaks();\n"
+"  var arr=viewLeaksArr;\n"
+"  var total=Math.ceil(arr.length/PAGE_SIZE)||1;\n"
 "  if(curPage>total)curPage=total;\n"
 "  if(curPage<1)curPage=1;\n"
 "  var tbody=document.getElementById('leaks-tbody');\n"
-"  if(!allLeaks.length){tbody.innerHTML='<tr><td colspan=\"7\" style=\"text-align:center;color:#6e7681\">暂无泄漏数据</td></tr>';document.getElementById('pageInfo').textContent='';document.getElementById('prevPageBtn').disabled=document.getElementById('nextPageBtn').disabled=true;return}\n"
-"  var startIdx=(curPage-1)*PAGE_SIZE, endIdx=Math.min(startIdx+PAGE_SIZE, allLeaks.length);\n"
+"  if(!allLeaks.length){tbody.innerHTML='<tr><td colspan=\"8\" style=\"text-align:center;color:#6e7681\">暂无泄漏数据</td></tr>';document.getElementById('pageInfo').textContent='';document.getElementById('prevPageBtn').disabled=document.getElementById('nextPageBtn').disabled=true;return}\n"
+"  if(!arr.length){tbody.innerHTML='<tr><td colspan=\"8\" style=\"text-align:center;color:#6e7681\">当前筛选条件下无匹配站点</td></tr>';document.getElementById('pageInfo').textContent='0 / '+(allLeaks.length)+' 条';document.getElementById('prevPageBtn').disabled=document.getElementById('nextPageBtn').disabled=true;return}\n"
+"  var startIdx=(curPage-1)*PAGE_SIZE, endIdx=Math.min(startIdx+PAGE_SIZE, arr.length);\n"
 "  var rows='';\n"
 "  for(var i=startIdx;i<endIdx;i++){\n"
-"    var l=allLeaks[i],h=l.hash||'',conf=l.is_expired?'probable leak':'possible leak';\n"
+"    var l=arr[i],h=l.hash||'',c=confOf(l);\n"
 "    var diff=l.diff_size>0?' class=\"diff-high\"':'';\n"
-"    rows+='<tr class=\"leak-row\"'+diff+' onclick=\"(function(){var s=document.getElementById(\\'s'+i+'\\');if(!s)return;var opened=s.classList.toggle(\\'open\\');var h=\\''+h+'\\';if(opened)expandedHashes.add(h);else expandedHashes.delete(h);})()\">'+\n"
+"    rows+='<tr class=\"leak-row\"'+diff+' data-idx=\"'+i+'\">'+\n"
 "      '<td>'+(i+1)+'</td><td>'+l.count.toLocaleString()+'</td>'+\n"
 "      '<td>'+fb(l.per_leak_size)+'</td><td><b>'+fb(l.total_size)+'</b></td>'+\n"
-"      '<td>'+conf+'</td><td>'+ft(l.first_seen)+'</td><td>'+ft(l.last_seen)+'</td></tr>';\n"
+"      '<td>'+(l.diff_size>0?'+'+fb(l.diff_size):'-')+'</td>'+\n"
+"      '<td><span class=\"cf cf-'+c+'\">'+confLabel(c)+'</span></td>'+\n"
+"      '<td>'+ft(l.first_seen)+'</td><td>'+ft(l.last_seen)+'</td></tr>';\n"
 "    if(l.stack&&l.stack.length>0){\n"
-"      rows+='<tr class=\"stack-row\" id=\"s'+i+'\"><td colspan=\"7\" class=\"stack-cell\">';\n"
+"      rows+='<tr class=\"stack-row\" id=\"s'+i+'\"><td colspan=\"8\" class=\"stack-cell\">';\n"
 "      for(var j=0;j<l.stack.length;j++){\n"
 "        var cmd=alCmd(l.stack[j]);\n"
 "        rows+='<div>'+(j===0?'<b>&rarr; ':'  ')+l.stack[j]+'</div>';\n"
@@ -215,32 +392,52 @@ static const char g_dashboard_html[] =
 "      }\n"
 "      rows+='</td></tr>';\n"
 "    } else {\n"
-"      rows+='<tr class=\"stack-row\" id=\"s'+i+'\"><td colspan=\"7\" class=\"stack-cell\"><div style=\"color:#6e7681\">未捕获栈回溯 — hash='+h+' size='+l.per_leak_size+'B count='+l.count+(l.is_expired?' (probable leak)':'')+'</div></td></tr>';\n"
+"      rows+='<tr class=\"stack-row\" id=\"s'+i+'\"><td colspan=\"8\" class=\"stack-cell\"><div style=\"color:#6e7681\">未捕获栈回溯 — hash='+h+' size='+l.per_leak_size+'B count='+l.count+' conf='+c+(l.late_free?' late_free='+l.late_free:'')+'</div></td></tr>';\n"
 "    }\n"
 "  }\n"
 "  tbody.innerHTML=rows;\n"
 "  /* 分页控件 */\n"
-"  document.getElementById('pageInfo').textContent='第 '+curPage+' / '+total+' 页 (共 '+allLeaks.length+' 条,当前 '+(endIdx-startIdx)+' 条)';\n"
+"  document.getElementById('pageInfo').textContent='第 '+curPage+' / '+total+' 页 (筛选 '+(arr.length)+' / 共 '+allLeaks.length+' 条,当前 '+(endIdx-startIdx)+' 条)';\n"
 "  document.getElementById('prevPageBtn').disabled=(curPage<=1);\n"
 "  document.getElementById('nextPageBtn').disabled=(curPage>=total);\n"
 "  /* 恢复展开状态 */\n"
 "  var newHashes=new Set();\n"
-"  for(var i=startIdx;i<endIdx;i++){var lh=allLeaks[i].hash||'';if(expandedHashes.has(lh)){var sr=document.getElementById('s'+i);if(sr){sr.classList.add('open');newHashes.add(lh);}}}\n"
+"  for(var k=startIdx;k<endIdx;k++){var lh=arr[k].hash||'';if(expandedHashes.has(lh)){var sr=document.getElementById('s'+k);if(sr){sr.classList.add('open');newHashes.add(lh);}}}\n"
 "  expandedHashes=newHashes;\n"
 "}\n"
-"function changePage(delta){var total=Math.ceil(allLeaks.length/PAGE_SIZE)||1;var np=curPage+delta;if(np<1||np>total)return;curPage=np;renderLeaks(allLeaks);}\n"
+"/* 行点击展开（事件委托，兼容无 closest 的嵌入式 webview） */\n"
+"(function(){\n"
+"  var tbody=document.getElementById('leaks-tbody');if(!tbody)return;\n"
+"  tbody.onclick=function(ev){\n"
+"    var el=ev.target;\n"
+"    while(el&&el!==tbody&&el.tagName!=='TR')el=el.parentNode;\n"
+"    if(!el||el===tbody)return;\n"
+"    var idxStr=el.getAttribute('data-idx');\n"
+"    if(!idxStr)return;\n"
+"    var idx=parseInt(idxStr,10);\n"
+"    var sr=document.getElementById('s'+idx);\n"
+"    if(!sr)return;\n"
+"    var opened=sr.classList.toggle('open');\n"
+"    var l=viewLeaksArr[idx];\n"
+"    var hh=l&&l.hash?String(l.hash):'';\n"
+"    if(opened&&hh)expandedHashes.add(hh);\n"
+"    else if(hh)expandedHashes.delete(hh);\n"
+"  };\n"
+"})();\n"
+"function changePage(delta){var total=Math.ceil(viewLeaksArr.length/PAGE_SIZE)||1;var np=curPage+delta;if(np<1||np>total)return;curPage=np;renderLeaks(allLeaks);}\n"
 "function refresh(){\n"
 "  document.getElementById('refreshLabel').textContent='刷新中...';\n"
-"  fetch('/api/data').then(function(r){return r.json()}).then(function(d){\n"
+"  fetch('/api/data?ts=3600').then(function(r){return r.json()}).then(function(d){\n"
 "    data=d;window.__lastData=d;\n"
 "    document.getElementById('info').textContent='PID: '+d.pid+' | '+d.proc_name+' | 会话: '+ft(d.session_start)+' | 上次扫描: '+ft(d.last_scan);\n"
-"    renderStats(d.stats);draw();renderLeaks(d.leaks);\n"
+"    renderStats(d.stats);draw();renderLeaks(d.leaks);updateSortInd();\n"
 "    document.getElementById('refreshLabel').textContent='已刷新 — '+new Date().toLocaleTimeString();\n"
 "  }).catch(function(err){\n"
 "    console.error('fetch failed:',err);\n"
 "    document.getElementById('refreshLabel').textContent='刷新失败，稍后重试';\n"
 "  })\n"
 "}\n"
+"buildLegend();\n"
 "refresh();setInterval(refresh,5000);\n"
 "</script>\n"
 "</body>\n"
@@ -305,10 +502,12 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
     int off = snprintf(buf, sizeof(buf),
         "{\"hash\":\"0x%llx\",\"count\":%zu,\"per_leak_size\":%zu,"
         "\"total_size\":%zu,\"diff_size\":%zu,\"is_expired\":%d,"
+        "\"conf\":\"%s\",\"late_free\":%u,"
         "\"first_seen\":%lld,\"last_seen\":%lld,\"stack\":[",
         (unsigned long long)site->stack_hash, site->count,
         site->per_leak_size, site->total_size,
         site->diff_size, site->is_expired,
+        mtt_conf_str(site->conf), site->late_free_count,
         (long long)site->first_seen, (long long)site->last_seen);
     /* 防御：snprintf 可能返回 >= sizeof(buf)（truncation 情况），
      * cap 到 (sizeof(buf)-1) 避免读取 buf 越界。正常情况下输出远小于 4096。 */
@@ -431,8 +630,8 @@ static void write_leak_json(mtt_leak_site_t *site, mtt_stack_entry_t *se, int fd
     MTT_DIAG_WRITE(fd, "]}", 2);
 }
 
-/** 处理 GET /api/data */
-static void handle_api_data(int client_fd)
+/** 处理 GET /api/data（可选 ?ts=N 指定时序点数，默认 360，上限 3600） */
+static void handle_api_data(int client_fd, int ts_points)
 {
     mtt_per_thread_t *ctx = mtt_thread_get();
     mtt_reporter_t *rep = mtt_reporter_get();
@@ -451,6 +650,9 @@ static void handle_api_data(int client_fd)
     size_t frees      = (s != NULL) ? atomic_load_explicit(&s->free_count, memory_order_relaxed) : 0;
     size_t total_alloc = (s != NULL) ? atomic_load_explicit(&s->total_bytes, memory_order_relaxed) : 0;
     size_t leak_count = (allocs > frees) ? (allocs - frees) : 0;
+    size_t late_free_n = (s != NULL) ? atomic_load_explicit(&s->free_expired_count, memory_order_relaxed) : 0;
+    size_t sk_ovc = (s != NULL) ? atomic_load_explicit(&s->skipped_overcap, memory_order_relaxed) : 0;
+    size_t sk_slot = (s != NULL) ? atomic_load_explicit(&s->skipped_slots, memory_order_relaxed) : 0;
 
     /* entry 池指标（工具自身内存占用可视化） */
     size_t pool_used      = (s != NULL) ? atomic_load_explicit(&s->pool_used, memory_order_relaxed) : 0;
@@ -493,10 +695,13 @@ static void handle_api_data(int client_fd)
     len = snprintf(buf, sizeof(buf),
         ",\"session_start\":%lld,\"last_scan\":%lld,"
         "\"stats\":{\"current_bytes\":%zu,\"peak_bytes\":%zu,\"alloc_count\":%zu,"
-        "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu,\"rss_bytes\":%zu},"
+        "\"free_count\":%zu,\"leak_count\":%zu,\"total_allocated\":%zu,"
+        "\"rss_bytes\":%zu,\"late_free\":%zu,"
+        "\"skipped_overcap\":%zu,\"skipped_slots\":%zu},"
         "\"pool\":{\"used\":%zu,\"capacity\":%zu,\"bytes_used\":%zu,\"bytes_total\":%zu,\"mode\":%d}",
         (long long)session_ts, (long long)time(NULL),
         cur_bytes, peak_bytes, allocs, frees, leak_count, total_alloc, rss_bytes,
+        late_free_n, sk_ovc, sk_slot,
         pool_used, pool_capacity, pool_bytes_used, pool_bytes_total, pool_mode);
     if (len < 0) len = 0;
     else if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
@@ -504,12 +709,13 @@ static void handle_api_data(int client_fd)
 
     /* 时序数据 */
     MTT_DIAG_WRITE(client_fd, ",\"time_series\":[", 16);
-    if (mtt_ts_is_ready() && raw_malloc != NULL) {
-        mtt_ts_point_t *ts_buf = (mtt_ts_point_t*)raw_malloc(360 * sizeof(mtt_ts_point_t));
+    if (mtt_ts_is_ready() && raw_malloc != NULL && ts_points > 0) {
+        mtt_ts_point_t *ts_buf = (mtt_ts_point_t*)raw_malloc(
+            (size_t)ts_points * sizeof(mtt_ts_point_t));
         if (ts_buf != NULL) {
-            memset(ts_buf, 0, 360 * sizeof(mtt_ts_point_t));
+            memset(ts_buf, 0, (size_t)ts_points * sizeof(mtt_ts_point_t));
             uint32_t ts_count = 0;
-            mtt_ts_get_range(0, ts_buf, 360, &ts_count);
+            mtt_ts_get_range(0, ts_buf, (uint32_t)ts_points, &ts_count);
             int wrote_first = 0;
             for (uint32_t i = 0; i < ts_count; i++) {
                 if (ts_buf[i].timestamp == 0) continue;
@@ -681,14 +887,33 @@ static void* http_thread_fn(void *arg)
         memset(path, 0, sizeof(path));
         if (!parse_request(req_buf, path, sizeof(path))) {
             handle_404(client_fd);
-        } else if (strcmp(path, "/") == 0) {
-            handle_root(client_fd);
-        } else if (strcmp(path, "/api/data") == 0) {
-            handle_api_data(client_fd);
-        } else if (strcmp(path, "/api/leaks") == 0) {
-            handle_api_leaks(client_fd);
         } else {
-            handle_404(client_fd);
+            /* 剥离 query string（?ts=N 等），路径匹配只看 ? 之前部分 */
+            char *query = strchr(path, '?');
+            if (query != NULL) {
+                *query = '\0';
+                query++;
+            }
+            if (strcmp(path, "/") == 0) {
+                handle_root(client_fd);
+            } else if (strcmp(path, "/api/data") == 0) {
+                /* ?ts=N：时序点数，默认 360，范围 [60, 3600]（1Hz 环上限） */
+                int ts_points = 360;
+                if (query != NULL) {
+                    const char *p = strstr(query, "ts=");
+                    if (p != NULL) {
+                        int v = atoi(p + 3);
+                        if (v > 0) ts_points = v;
+                    }
+                }
+                if (ts_points < 60) ts_points = 60;
+                if (ts_points > 3600) ts_points = 3600;
+                handle_api_data(client_fd, ts_points);
+            } else if (strcmp(path, "/api/leaks") == 0) {
+                handle_api_leaks(client_fd);
+            } else {
+                handle_404(client_fd);
+            }
         }
         close(client_fd);
     }
