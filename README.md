@@ -29,10 +29,26 @@ scp output/libmemorytracetool.so root@<bmc>:/tmp/
 MTT_HTTP_PORT=8080 LD_PRELOAD=/tmp/libmemorytracetool.so <daemon_path> &
 ```
 
-- 浏览器打开 `http://<bmc-ip>:8080`：堆内存趋势图（current/peak/RSS）、泄漏站点排行（可展开完整调用栈）、统计卡片
+- 浏览器打开 `http://<bmc-ip>:8080`：堆内存趋势图（累计分配/当前未释放/峰值/RSS/已识别泄漏五条曲线，滚轮缩放、拖拽平移、双击复位）、泄漏站点排行（可展开完整调用栈，表头点击排序、按最后发现时间/置信度/增长筛选）、统计卡片（含数据完整性告警）
 - `kill -USR1 $(pidof <daemon>)` 触发即时报告，不用等 60s 扫描周期
 - 每帧格式 `func+0xOFFSET (libname)`，用 `addr2line -e <daemon>.debug -f -C 0xOFFSET` 定位源码行
-- `Growth > 0` → 正在泄漏；`is_expired = 1` → probable leak
+- `Growth > 0` → 正在泄漏；置信度见下方"泄漏四级分类"
+
+## 泄漏四级分类（2026-09 起）
+
+判定不再只看"活得久"，而是综合**老化（单调时钟，免疫 NTP 跳变）+ 跨扫描存活数趋势 + 该站点是否观察到过释放**：
+
+| 分类 | 含义 | 判定依据 |
+|------|------|---------|
+| `probable` | 真泄漏特征 | 已老化且存活数超过历史峰值（只增不减），从未释放 |
+| `session_scoped` | 周期作用域，**非泄漏** | 观察到过"超阈值后释放"（如收到主机重启 RPC 信号后释放），当前存活数不超过历史峰值 |
+| `long_lived` | 长存活稳定，信息级 | 已老化但数量稳定、从未观察到释放（单例/缓存；一次性泄漏与此无法区分，人工复核） |
+| `possible` | 待观察 | 未老化，或首次出现在扫描中（首扫不判 probable，压掉周期开头的误报） |
+
+- 压测场景收益：重启主机压力测试中"申请后长期持有、收到重启 RPC 信号才释放"的内存不再被当作泄漏刷屏——文本报告将其移入"Long-lived allocations"精简信息区（单行摘要 + 栈顶 1 帧），`.folded` 火焰图只包含疑似泄漏站点
+- 报告/JSON/仪表盘中 `conf` 字段为上述四级；`late_free` 为该站点观察到的老化释放次数（周期作用域证据）
+- `MTT_CLASSIC_LEAK=1` 回退旧的纯时间两级判定（存活超阈值一律 probable），用于新旧行为 A/B 对比
+- 扫描历史：`/var/log/mtt/<pid>_<name>.archive.jsonl` 每次扫描追加一行站点级快照（count/size/conf/late_free/增长），覆盖写报告只保留最新一次，归档让数小时压测后可回溯每一轮；单文件 8MB 轮转保留 2 代，`MTT_ARCHIVE=0` 关闭
 
 ## 延时敏感场景（RPC 等）：建议开启采样
 
@@ -53,14 +69,16 @@ MTT_SAMPLE_RATE=15 LD_PRELOAD=/tmp/libmemorytracetool.so <daemon_path>
 |------|------|------|
 | `MTT_HTTP_PORT` | 0 | Web 仪表盘端口（0=禁用） |
 | `MTT_DISABLE` | 0 | 设为 1 完全禁用追踪 |
-| `MTT_LEAK_THRESHOLD_SEC` | 300 | 存活超过此秒数 → probable leak |
+| `MTT_LEAK_THRESHOLD_SEC` | 300 | 老化阈值：存活超过此秒数 → 进入分类候选（判定见"泄漏四级分类"） |
+| `MTT_CLASSIC_LEAK` | 0 | 设为 1 回退纯时间两级判定（超阈值一律 probable） |
+| `MTT_ARCHIVE` | 1 | 扫描历史 JSONL 归档（0=关闭）。`/var/log/mtt/<pid>_<name>.archive.jsonl`，8MB 轮转×2 代 |
 | `MTT_SKIP_STARTUP_SEC` | 0 | 进程启动后跳过 N 秒不追踪 |
 | `MTT_MAX_STACK_FRAMES` | 64 | 栈回溯深度 [1, 64]。调大栈更深但更慢，性能敏感场景建议 4-8 |
 | `MTT_UNWINDER` | auto | `auto`（libunwind 优先，崩溃自动降级）/ `libunwind` / `backtrace` |
 | `MTT_SAMPLE_RATE` | 0 | 字节采样率：2^N 字节平均采样一次（0=全量追踪）。>=1KB 必追踪，只对 <1KB 小对象采样 |
 | `MTT_LIB_BLACKLIST` | 无 | 逗号分隔库名，reporter 按符号过滤，只影响 leak 报告显示 |
 | `MTT_LIB_BLACKLIST_FAST` | 无 | 库地址范围快速黑名单：命中跳过抓栈省 CPU（该库内调用链不可见）。适合 lmdb/XML 等库内海量 malloc 拖慢业务的场景 |
-| `MTT_POOL_ENTRIES` | 自动 | 工具自身 entry 池容量，默认按 20MB 目标内存反推，可设 [1024, 131072] |
+| `MTT_POOL_ENTRIES` | 自动 | 工具自身 entry 池容量，默认按 20MB 目标内存反推，可设 [1024, 131072]。entry 增加 8B 单调时间戳后容量约降 1.4%，可用此变量调回 |
 | `MTT_DEBUG` | 1 | 0=静默（只留 leak 报告 + heartbeat），2=全量调试日志 |
 
 ## 测试
@@ -68,6 +86,9 @@ MTT_SAMPLE_RATE=15 LD_PRELOAD=/tmp/libmemorytracetool.so <daemon_path>
 ```bash
 make test               # 基础功能 36 用例
 make test_stability     # 并发压力 18 用例
+make test_leak_class    # 四级分类：长持有/周期作用域/增长泄漏 + classic 回退
+make test_integrity     # 池耗尽计数可见性
+make test_archive       # 扫描历史 JSONL 归档
 ```
 
 ## ARM32 缺陷与使用建议
@@ -83,5 +104,7 @@ make test_stability     # 并发压力 18 用例
 
 ## 已知限制
 
-- entry 池满后新分配静默跳过追踪（`MTT_POOL_ENTRIES` 可调）
+- entry 池满后新分配跳过追踪，但**计入 `Skipped (overflow)` 并在报告头/心跳/仪表盘显示**——数据残缺时可见（线程槽满同理计入 `Skipped (slots)`）
+- 一次性泄漏（申请后持有到进程结束、从不释放）与单例缓存在事件层面无法区分，归入 `long_lived` 人工复核；持续增长的泄漏才会标 `probable`
+- 老化判定用单调时钟（CLOCK_MONOTONIC_COARSE），NTP 校时跳变不影响判定；报告中的时间展示仍是墙钟，跳变后可能回拨
 - 业务变慢排查顺序：`MTT_DEBUG=0` 关诊断 → 目标加 unwind tables 重编 → 仍慢则 `MTT_SAMPLE_RATE=15`（约每 32KB 采一次）

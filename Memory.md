@@ -79,13 +79,24 @@ LD_PRELOAD=/tmp/libmemorytracetool.so ./my_daemon
 | MTT_SAMPLE | 0 | 旧模式：每 N 次 alloc 记录 1 次 |
 | MTT_SAMPLE_RATE | 0 | 字节采样率：2^N 字节平均采样一次（0=全量追踪） |
 | MTT_HTTP_PORT | 0 | Web 仪表盘端口（0=禁用） |
-| MTT_LEAK_THRESHOLD_SEC | 300 | 存活超过此秒数→probable leak |
+| MTT_LEAK_THRESHOLD_SEC | 300 | 老化阈值：存活超过此秒数→进入四级分类候选 |
 | MTT_SKIP_STARTUP_SEC | 0 | 启动后跳过 N 秒不追踪 |
+| MTT_CLASSIC_LEAK | 0 | 设为 1 回退纯时间两级判定（新旧行为 A/B 对比） |
+| MTT_ARCHIVE | 1 | 扫描历史 JSONL 归档开关（/var/log/mtt/<pid>_<name>.archive.jsonl） |
+| MTT_MAX_STACK_FRAMES | 64 | 栈回溯深度 [1, 64] |
+| MTT_UNWINDER | auto | auto / libunwind / backtrace |
+| MTT_POOL_ENTRIES | 自动 | entry 池容量 [1024, 131072]，默认按 20MB 反推 |
+| MTT_LIB_BLACKLIST / MTT_LIB_BLACKLIST_FAST | 无 | 符号过滤 / 地址范围跳过抓栈 |
 
 ## 已知限制
 
-- backtrace() 是 glibc 扩展，musl/bionic 上栈回溯不可用（仍按大小统计）
-- 哈希表最大 65536 条活跃分配，超出静默跳过
+- 泄漏判定为四级分类（probable / session_scoped / long_lived / possible），
+  综合老化 + 跨扫描存活数趋势 + late-free 证据；一次性泄漏与单例缓存
+  无法在事件层面区分，归入 long_lived 人工复核
+- 栈回溯优先 libunwind（已内嵌静态链接 v1.8.2），glibc backtrace 兜底；
+  musl/bionic 无 backtrace 时降级 FP chain
+- 哈希表最大 131072 条活跃分配（池受 MTT_POOL_ENTRIES 约束），
+  超出跳过并计入 Skipped (overflow)，报告头/心跳/仪表盘可见
 - ARM32 需要 -latomic（64-bit 原子操作）
 - /proc/self/exe 不可用时进程名显示 "unknown"
 - HTTP 服务器仅支持 GET 请求，不支持并发连接（单线程 accept）
